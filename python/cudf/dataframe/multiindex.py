@@ -9,7 +9,6 @@ from collections.abc import Sequence
 from cudf.dataframe import columnops
 from cudf.comm.serialize import register_distributed_serializer
 from cudf.dataframe.index import Index, StringIndex
-from cudf.utils import utils
 
 
 class MultiIndex(Index):
@@ -43,10 +42,8 @@ class MultiIndex(Index):
             column_names = list(range(len(codes)))
         else:
             column_names = names
-
-        if len(levels) == 0:
-            raise ValueError('Must pass non-zero number of levels/codes')
-
+        if len(codes) == 0:
+            raise ValueError('MultiIndex codes can not be empty.')
         import cudf
         if not isinstance(codes, cudf.dataframe.dataframe.DataFrame) and\
                 not isinstance(codes[0], (Sequence,
@@ -60,10 +57,7 @@ class MultiIndex(Index):
                                       columnops.as_column(code))
         else:
             self.codes = codes
-
-        # converting levels to numpy array will produce a Float64Index
-        # (on empty levels)for levels mimicking the behavior of Pandas
-        self.levels = np.array(levels)
+        self.levels = levels
         self._validate_levels_and_codes(self.levels, self.codes)
         self.name = None
         self.names = names
@@ -204,10 +198,7 @@ class MultiIndex(Index):
     def __eq__(self, other):
         if not hasattr(other, 'levels'):
             return False
-        equal_levels = self.levels == other.levels
-        if isinstance(equal_levels, np.ndarray):
-            equal_levels = equal_levels.all()
-        return equal_levels and\
+        return self.levels == other.levels and\
             self.codes == other.codes and\
             self.names == other.names
 
@@ -227,10 +218,6 @@ class MultiIndex(Index):
             indices = np.array(indices)
         elif isinstance(indices, Series):
             indices = indices.to_gpu_array()
-        elif isinstance(indices, slice):
-            start, stop, step, sln = utils.standard_python_slice(len(self),
-                                                                 indices)
-            indices = np.arange(start, stop, step)
         codes = self.codes.take(indices)
         result = MultiIndex(self.levels, codes)
         result.names = self.names
@@ -250,8 +237,6 @@ class MultiIndex(Index):
 
     def __getitem__(self, index):
         match = self.take(index)
-        if isinstance(index, slice):
-            return match
         result = []
         for level, item in enumerate(match.codes):
             result.append(match.levels[level][match.codes[item][0]])
