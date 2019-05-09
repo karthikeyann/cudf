@@ -782,21 +782,19 @@ def test_csv_reader_byte_range(tmpdir, segment_bytes):
 @pytest.mark.parametrize('header_row, skip_rows, skip_blanks',
                          [(1, 0, True), ('infer', 2, True), (1, 4, True),
                           (3, 0, False), ('infer', 5, False)])
-@pytest.mark.parametrize('line_terminator', ['\n', '\r\n'])
-def test_csv_reader_blanks_and_comments(skip_rows, header_row, skip_blanks,
-                                        line_terminator):
+def test_csv_reader_blanks_and_comments(skip_rows, header_row, skip_blanks):
 
     lines = ['# first comment line',
-             line_terminator,
+             '\n',
              '# third comment line',
              '1,2,3',
              '4,5,6',
              '7,8,9',
-             line_terminator,
-             '# last comment line',
-             line_terminator,
+             '\n',
+             '# last comment line'
+             '\n',
              '1,1,1']
-    buffer = line_terminator.join(lines)
+    buffer = '\n'.join(lines)
 
     cu_df = read_csv(StringIO(buffer), comment='#', header=header_row,
                      skiprows=skip_rows, skip_blank_lines=skip_blanks)
@@ -992,18 +990,3 @@ def test_csv_reader_scientific_type_detection():
         assert(dt == 'float64')
     for col in df:
         assert(np.isclose(df[col][0], expected[int(col)]))
-
-
-@pytest.mark.parametrize('line_terminator', ['\n', '\r\n'])
-def test_csv_blank_first_row(line_terminator):
-
-    lines = ['colA,colB',
-             '',
-             '1, 1.1',
-             '2, 2.2']
-    buffer = line_terminator.join(lines)
-
-    cu_df = read_csv(StringIO(buffer))
-
-    assert(cu_df.shape == (2, 2))
-    assert(all(cu_df.columns == ['colA', 'colB']))
