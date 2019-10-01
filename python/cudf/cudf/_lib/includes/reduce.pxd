@@ -19,6 +19,7 @@ cdef extern from "cudf/reduction.hpp" namespace "cudf::reduction" nogil:
         MEAN,
         VAR,
         STD,
+        MEDIAN,
 
 cdef extern from "cudf/reduction.hpp" nogil:
 

@@ -33,6 +33,7 @@ _REDUCTION_OP = {
     'mean': cpp_reduce.MEAN,
     'var': cpp_reduce.VAR,
     'std': cpp_reduce.STD,
+    'median': cpp_reduce.MEDIAN,
 }
 
 _SCAN_OP = {

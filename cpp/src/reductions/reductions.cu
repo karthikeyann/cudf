@@ -15,6 +15,7 @@
  */
 
 #include "reduction_functions.cuh"
+gdf_scalar median(const gdf_column col);
 
 namespace cudf{
 
@@ -55,6 +56,9 @@ gdf_scalar reduce(const gdf_column *col,
         break;
     case cudf::reduction::STD:
         scalar = cudf::reduction::standard_deviation(*col, output_dtype, ddof);
+        break;
+    case cudf::reduction::MEDIAN:
+        scalar = median(*col);
         break;
     default:
         CUDF_FAIL("Unsupported reduction operator");

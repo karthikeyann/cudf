@@ -46,6 +46,7 @@ enum operators {
   MEAN,           ///< Computes the arithmetic mean of the values in the column
   VAR,            ///< Computes the variance of the values in the column
   STD,            ///< Computes the standard deviation of the values in the column
+  MEDIAN,         ///< Computes the median of the values in the column
 };
 }  // namespace reduction
 
