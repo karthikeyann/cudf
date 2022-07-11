@@ -8,7 +8,7 @@ import cudf
 from cython.operator cimport dereference
 from libc.stdint cimport uint8_t
 from libcpp.memory cimport unique_ptr
-from libcpp.string cimport string
+from libcpp.string cimport stod, string
 from libcpp.utility cimport move
 from libcpp.vector cimport vector
 
@@ -35,6 +35,19 @@ PARQUET_META_TYPE_MAP = {
     str(cudf_dtype): str(pandas_dtype)
     for cudf_dtype, pandas_dtype in np_dtypes_to_pandas_dtypes.items()
 }
+
+
+def stod_to_list(file):
+    num_lines = sum(1 for line in open(file))
+    cdef double value
+    ret_val = []
+    cdef string s
+    for i, line in enumerate(open(file)):
+        s = line.strip().encode('UTF-8')
+        value = stod(s)
+        ret_val.append(value)
+    return ret_val
+
 
 cdef table_view table_view_from_columns(columns) except*:
     """Create a cudf::table_view from an iterable of Columns."""
