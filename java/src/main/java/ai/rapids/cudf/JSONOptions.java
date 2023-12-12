@@ -72,7 +72,7 @@ public final class JSONOptions extends ColumnFilterOptions {
 
     private boolean recoverWithNull = false;
 
-    private boolean mixedTypesAsStrings = true;
+    private boolean mixedTypesAsStrings = false;
 
     /**
      * Whether to parse dates as DD/MM versus MM/DD
