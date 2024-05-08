@@ -16,6 +16,7 @@
 
 #include "io/fst/lookup_tables.cuh"
 
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/io/detail/json.hpp>
 #include <cudf/types.hpp>
 
@@ -301,6 +302,7 @@ rmm::device_uvector<SymbolT> normalize_single_quotes(rmm::device_uvector<SymbolT
                                                      rmm::cuda_stream_view stream,
                                                      rmm::mr::device_memory_resource* mr)
 {
+  CUDF_FUNC_RANGE();
   auto parser = fst::detail::make_fst(
     fst::detail::make_symbol_group_lut(normalize_quotes::qna_sgs),
     fst::detail::make_transition_table(normalize_quotes::qna_state_tt),

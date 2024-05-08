@@ -1570,6 +1570,7 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> ge
   // fixes the stack context for those excess characters. That is, that all those excess characters
   // will be interpreted in the root stack context
   if (recover_from_error) {
+    cudf::scoped_range rng{"recover_from_error"}; 
     auto fix_stack_of_excess_chars = fst::detail::make_fst(
       fst::detail::make_symbol_group_lookup_op(
         fix_stack_of_excess_chars::SymbolPairToSymbolGroupId{}),
@@ -1616,6 +1617,8 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> ge
   rmm::device_uvector<SymbolOffsetT> tokens_indices{
     max_token_out_count + delimiter_offset, stream, mr};
 
+  {
+  cudf::scoped_range rng{"json_to_tokens_fst"}; 
   json_to_tokens_fst.Transduce(zip_in,
                                static_cast<SymbolOffsetT>(json_in.size()),
                                tokens.data() + delimiter_offset,
@@ -1623,12 +1626,15 @@ std::pair<rmm::device_uvector<PdaTokenT>, rmm::device_uvector<SymbolOffsetT>> ge
                                num_written_tokens.data(),
                                tokenizer_pda::start_state,
                                stream);
+    stream.synchronize();
+  }
 
   auto const num_total_tokens = num_written_tokens.value(stream) + delimiter_offset;
   tokens.resize(num_total_tokens, stream);
   tokens_indices.resize(num_total_tokens, stream);
 
   if (delimiter_offset == 1) {
+    cudf::scoped_range rng{"process_token_stream"};
     tokens.set_element(0, token_t::LineEnd, stream);
     auto [filtered_tokens, filtered_tokens_indices] =
       process_token_stream(tokens, tokens_indices, stream);
