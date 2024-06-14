@@ -1610,6 +1610,7 @@ Java_ai_rapids_cudf_Table_readAndInferJSONFromDataSource(JNIEnv* env,
                                                          jboolean normalize_whitespace,
                                                          jboolean mixed_types_as_string,
                                                          jboolean keep_quotes,
+                                                         jboolean allow_leading_zeros,
                                                          jlong ds_handle)
 {
   JNI_NULL_CHECK(env, ds_handle, "no data source handle given", 0);
@@ -1629,6 +1630,7 @@ Java_ai_rapids_cudf_Table_readAndInferJSONFromDataSource(JNIEnv* env,
         .normalize_single_quotes(static_cast<bool>(normalize_single_quotes))
         .normalize_whitespace(static_cast<bool>(normalize_whitespace))
         .mixed_types_as_string(mixed_types_as_string)
+        .numeric_leading_zeros(allow_leading_zeros)
         .keep_quotes(keep_quotes);
 
     auto result =
@@ -1649,7 +1651,8 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_Table_readAndInferJSON(JNIEnv* env,
                                                                    jboolean normalize_single_quotes,
                                                                    jboolean normalize_whitespace,
                                                                    jboolean mixed_types_as_string,
-                                                                   jboolean keep_quotes)
+                                                                   jboolean keep_quotes,
+                                                                   jboolean allow_leading_zeros)
 {
   JNI_NULL_CHECK(env, buffer, "buffer cannot be null", 0);
   if (buffer_length <= 0) {
@@ -1671,6 +1674,7 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_Table_readAndInferJSON(JNIEnv* env,
         .recovery_mode(recovery_mode)
         .normalize_single_quotes(static_cast<bool>(normalize_single_quotes))
         .normalize_whitespace(static_cast<bool>(normalize_whitespace))
+        .numeric_leading_zeros(allow_leading_zeros)
         .mixed_types_as_string(mixed_types_as_string)
         .keep_quotes(keep_quotes);
 
@@ -1777,6 +1781,7 @@ Java_ai_rapids_cudf_Table_readJSONFromDataSource(JNIEnv* env,
                                                  jboolean normalize_whitespace,
                                                  jboolean mixed_types_as_string,
                                                  jboolean keep_quotes,
+                                                 jboolean allow_leading_zeros,
                                                  jlong ds_handle)
 {
   JNI_NULL_CHECK(env, ds_handle, "no data source handle given", 0);
@@ -1811,6 +1816,7 @@ Java_ai_rapids_cudf_Table_readJSONFromDataSource(JNIEnv* env,
         .normalize_single_quotes(static_cast<bool>(normalize_single_quotes))
         .normalize_whitespace(static_cast<bool>(normalize_whitespace))
         .mixed_types_as_string(mixed_types_as_string)
+        .numeric_leading_zeros(allow_leading_zeros)
         .keep_quotes(keep_quotes);
 
     if (!n_types.is_null()) {
@@ -1861,7 +1867,8 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_Table_readJSON(JNIEnv* env,
                                                            jboolean normalize_single_quotes,
                                                            jboolean normalize_whitespace,
                                                            jboolean mixed_types_as_string,
-                                                           jboolean keep_quotes)
+                                                           jboolean keep_quotes,
+                                                           jboolean allow_leading_zeros)
 {
   bool read_buffer = true;
   if (buffer == 0) {
@@ -1910,6 +1917,7 @@ JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_Table_readJSON(JNIEnv* env,
         .normalize_single_quotes(static_cast<bool>(normalize_single_quotes))
         .normalize_whitespace(static_cast<bool>(normalize_whitespace))
         .mixed_types_as_string(mixed_types_as_string)
+        .numeric_leading_zeros(allow_leading_zeros)
         .keep_quotes(keep_quotes);
 
     if (!n_types.is_null()) {

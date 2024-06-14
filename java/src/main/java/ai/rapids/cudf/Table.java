@@ -254,7 +254,8 @@ public final class Table implements AutoCloseable {
                                         boolean normalizeSingleQuotes,
                                         boolean normalizeWhitespace,
                                         boolean mixedTypesAsStrings,
-                                        boolean keepStringQuotes) throws CudfException;
+                                        boolean keepStringQuotes,
+                                        boolean allowLeadingZeros) throws CudfException;
 
   private static native long readJSONFromDataSource(int[] numChildren, String[] columnNames,
                                       int[] dTypeIds, int[] dTypeScales,
@@ -264,6 +265,7 @@ public final class Table implements AutoCloseable {
                                       boolean normalizeWhitespace,
                                       boolean mixedTypesAsStrings,
                                       boolean keepStringQuotes,
+                                      boolean allowLeadingZeros,
                                       long dsHandle) throws CudfException;
 
   private static native long readAndInferJSONFromDataSource(boolean dayFirst, boolean lines,
@@ -272,7 +274,9 @@ public final class Table implements AutoCloseable {
                                       boolean normalizeWhitespace,
                                       boolean mixedTypesAsStrings,
                                       boolean keepStringQuotes,
+                                      boolean allowLeadingZeros,
                                       long dsHandle) throws CudfException;
+
   private static native long readAndInferJSON(long address, long length,
                                               boolean dayFirst,
                                               boolean lines,
@@ -280,7 +284,8 @@ public final class Table implements AutoCloseable {
                                               boolean normalizeSingleQuotes,
                                               boolean normalizeWhitespace,
                                               boolean mixedTypesAsStrings,
-                                              boolean keepStringQuotes) throws CudfException;
+                                              boolean keepStringQuotes,
+                                              boolean allowLeadingZeros) throws CudfException;
 
   /**
    * Read in Parquet formatted data.
@@ -1271,7 +1276,8 @@ public final class Table implements AutoCloseable {
                     opts.isNormalizeSingleQuotes(),
                     opts.isNormalizeWhitespace(),
                     opts.isMixedTypesAsStrings(),
-                opts.keepStringQuotes()))) {
+                    opts.keepStringQuotes(),
+                    opts.leadingZerosAllowed()))) {
 
       return gatherJSONColumns(schema, twm, -1);
     }
@@ -1349,7 +1355,9 @@ public final class Table implements AutoCloseable {
         opts.isDayFirst(), opts.isLines(), opts.isRecoverWithNull(),
         opts.isNormalizeSingleQuotes(),
         opts.isNormalizeWhitespace(),
-        opts.isMixedTypesAsStrings(), opts.keepStringQuotes()));
+        opts.isMixedTypesAsStrings(),
+        opts.keepStringQuotes(),
+        opts.leadingZerosAllowed()));
   }
 
   /**
@@ -1367,6 +1375,7 @@ public final class Table implements AutoCloseable {
           opts.isNormalizeWhitespace(),
           opts.isMixedTypesAsStrings(),
           opts.keepStringQuotes(),
+          opts.leadingZerosAllowed(),
           dsHandle));
         return twm;
       } finally {
@@ -1412,7 +1421,8 @@ public final class Table implements AutoCloseable {
             buffer.getAddress() + offset, len, opts.isDayFirst(), opts.isLines(),
             opts.isRecoverWithNull(), opts.isNormalizeSingleQuotes(),
             opts.isNormalizeWhitespace(),
-            opts.isMixedTypesAsStrings(), opts.keepStringQuotes()))) {
+            opts.isMixedTypesAsStrings(), opts.keepStringQuotes(),
+            opts.leadingZerosAllowed()))) {
       return gatherJSONColumns(schema, twm, emptyRowCount);
     }
   }
@@ -1442,7 +1452,8 @@ public final class Table implements AutoCloseable {
         schema.getFlattenedColumnNames(), schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(), opts.isDayFirst(),
         opts.isLines(), opts.isRecoverWithNull(), opts.isNormalizeSingleQuotes(),
         opts.isNormalizeWhitespace(),
-        opts.isMixedTypesAsStrings(), opts.keepStringQuotes(), dsHandle))) {
+        opts.isMixedTypesAsStrings(), opts.keepStringQuotes(),
+        opts.leadingZerosAllowed(), dsHandle))) {
       return gatherJSONColumns(schema, twm, emtpyRowCount);
     } finally {
       DataSourceHelper.destroyWrapperDataSource(dsHandle);

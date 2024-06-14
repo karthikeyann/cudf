@@ -34,6 +34,7 @@ public final class JSONOptions extends ColumnFilterOptions {
   private final boolean normalizeWhitespace;
   private final boolean mixedTypesAsStrings;
   private final boolean keepStringQuotes;
+  private final boolean allowLeadingZeros;
 
   private JSONOptions(Builder builder) {
     super(builder);
@@ -44,6 +45,7 @@ public final class JSONOptions extends ColumnFilterOptions {
     normalizeWhitespace = builder.normalizeWhitespace;
     mixedTypesAsStrings = builder.mixedTypesAsStrings;
     keepStringQuotes = builder.keepQuotes;
+    allowLeadingZeros = builder.allowLeadingZeros;
   }
 
   public boolean isDayFirst() {
@@ -75,6 +77,10 @@ public final class JSONOptions extends ColumnFilterOptions {
     return keepStringQuotes;
   }
 
+  public boolean leadingZerosAllowed() {
+    return allowLeadingZeros;
+  }
+
   @Override
   String[] getIncludeColumnNames() {
     throw new UnsupportedOperationException("JSON reader didn't support column prune");
@@ -85,6 +91,7 @@ public final class JSONOptions extends ColumnFilterOptions {
   }
 
   public static final class Builder  extends ColumnFilterOptions.Builder<JSONOptions.Builder> {
+    public boolean allowLeadingZeros = false;
     private boolean dayFirst = false;
     private boolean lines = true;
 
@@ -96,9 +103,19 @@ public final class JSONOptions extends ColumnFilterOptions {
     private boolean keepQuotes = false;
 
     /**
+     * Should leading zeros on numbers be allowed or not.
+     */
+    public Builder withLeadingZeros(boolean allowLeadingZeros) {
+      this.allowLeadingZeros = allowLeadingZeros;
+      return this;
+    }
+
+    // TODO need to finish this for other configs...
+
+    /**
      * Whether to parse dates as DD/MM versus MM/DD
      * @param dayFirst true: DD/MM, false, MM/DD
-     * @return
+     * @return builder for chaining
      */
     public Builder withDayFirst(boolean dayFirst) {
       this.dayFirst = dayFirst;
