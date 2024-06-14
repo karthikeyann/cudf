@@ -437,6 +437,7 @@ public class TableTest extends CudfTestBase {
     }
   }
 
+  @Test
   void testReadSingleQuotesJSONFileKeepQuotes() throws IOException {
     Schema schema = Schema.builder()
         .column(DType.STRING, "A")
@@ -451,6 +452,42 @@ public class TableTest extends CudfTestBase {
         .build();
          MultiBufferDataSource source = sourceFrom(TEST_JSON_SINGLE_QUOTES_FILE);
          Table table = Table.readJSON(schema, opts, source)) {
+      assertTablesAreEqual(expected, table);
+    }
+  }
+
+  private static final byte[] JSON_VALIDATION_BUFFER = (
+      "{\"a\":true}\n" +
+      "{\"a\":false}\n" +
+      "{\"a\":null}\n" +
+      "{\"a\":true, \"b\":truee}\n" +
+      "{\"a\":true, \"b\":\"nulll\"}\n" +
+      "{\"a\": 1}\n" +
+      "{\"a\": 0}\n" +
+      "{\"a\": -}\n" +
+      "{\"a\": -0}\n" +
+      "{\"a\": -01}\n" +
+      "{\"a\": 01}\n" +
+      "{\"a\": -0.1}\n"
+  ).getBytes(StandardCharsets.UTF_8);
+
+  @Test
+  void testJSONValidation() throws IOException {
+    Schema schema = Schema.builder()
+        .column(DType.STRING, "a")
+        .build();
+    JSONOptions opts = JSONOptions.builder()
+        .withLines(true)
+        .withMixedTypesAsStrings(true)
+        .withNormalizeWhitespace(true)
+        .withLeadingZeros(false)
+        .withRecoverWithNull(true)
+        .build();
+    try (Table expected = new Table.TestBuilder()
+        .column("true", "false", null, null, "true", "1", "0", null, "-0", null, null, "-0.1")
+        .build();
+         MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
+         Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
       assertTablesAreEqual(expected, table);
     }
   }

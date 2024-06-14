@@ -52,22 +52,137 @@ struct write_if {
   }
 };
 
+enum class number_state {
+  start = 0,
+  saw_neg, // not a complete state
+  leading_zero,
+  whole,
+  fraction,
+  start_exponent, // not a complete state
+  after_sign_exponent, // not a complete state
+  exponent
+};
+
 void validate_token_stream(device_span<char const> d_input,
                            device_span<PdaTokenT> tokens,
                            device_span<SymbolOffsetT> token_indices,
                            cudf::io::json_reader_options const& options,
                            rmm::cuda_stream_view stream)
 {
-  if (getenv("SPARK_JSON")) {
+  //if (getenv("SPARK_JSON")) {
+  if (true) {
     using token_t = cudf::io::json::token_t;
     auto validate_tokens =
       [data = d_input.data(),
        allow_numeric_leading_zeros =
-         options.is_allowed_numeric_leading_zeros()] __device__(SymbolOffsetT start,
+         options.is_allowed_numeric_leading_zeros()] __device__(int32_t i, 
+                                                                SymbolOffsetT start,
                                                                 SymbolOffsetT end) -> bool {
-      // Leading zeros.
-      if (!allow_numeric_leading_zeros and data[start] == '0') return false;
-      return true;
+      // This validates an unquoted value. A value must match https://www.json.org/json-en.html
+      // but the leading and training whitespace should already have been removed, and is not
+      // a string
+      for (SymbolOffsetT idx = start; idx < end; idx++) {
+        printf("%i/%i VALUE CHAR %i/%i => '%c'\n", threadIdx.x, i, idx, end, data[idx]);
+      }
+
+      // TODO do I need to worry about an empty value???
+      auto len = end - start;
+      auto c = data[start];
+      if ('n' == c) {
+        return (4 == len) && data[start + 1] == 'u' && data[start + 2] == 'l' && data[start + 3] == 'l';
+      } else if ('t' == c) {
+        return (4 == len) && data[start + 1] == 'r' && data[start + 2] == 'u' && data[start + 3] == 'e';
+      } else if ('f' == c) {
+        return (5 == len) && data[start + 1] == 'a' && data[start + 2] == 'l' && data[start + 3] == 's' && data[start + 4] == 'e';
+      } else if ('-' == c || c <= '9' && 'c' >= '0') {
+        // number
+        auto num_state = number_state::start;
+        for (auto at = start; at < end; at++) {
+          c = data[at];
+          switch (num_state) {
+            case number_state::start:
+              if ('-' == c) {
+                num_state = number_state::saw_neg;
+              } else if ('0' == c) {
+                num_state = number_state::leading_zero;
+              } else if (c >= '1' && c <= '9') {
+                num_state = number_state::whole;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::saw_neg:
+              if ('0' == c) {
+                num_state = number_state::leading_zero;
+              } else if (c >= '1' && c <= '9') {
+                num_state = number_state::whole;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::leading_zero:
+              if (allow_numeric_leading_zeros && c >= '0' && c <= '9') {
+                num_state = number_state::whole;
+              } else if ('.' == c) {
+                num_state = number_state::fraction;
+              } else if ('e' == c || 'E' == c) {
+                num_state = number_state::start_exponent;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::whole:
+              if (c >= '0' && c <= '9') {
+                num_state = number_state::whole;
+              } else if ('.' == c) {
+                num_state = number_state::fraction;
+              } else if ('e' == c || 'E' == c) {
+                num_state = number_state::start_exponent;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::fraction:
+              if (c >= '0' && c <= '9') {
+                num_state = number_state::fraction;
+              } else if ('e' == c || 'E' == c) {
+                num_state = number_state::start_exponent;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::start_exponent:
+              if ('-' == c || '-' == c) {
+                num_state = number_state::after_sign_exponent;
+              } else if (c >= '0' && c <= '9') {
+                num_state = number_state::exponent;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::after_sign_exponent:
+              if (c >= '0' && c <= '9') {
+                num_state = number_state::exponent;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::exponent:
+              if (c >= '0' && c <= '9') {
+                num_state = number_state::exponent;
+              } else {
+                return false;
+              }
+              break;
+          }
+        }
+        return num_state != number_state::after_sign_exponent &&
+          num_state != number_state::start_exponent &&
+          num_state != number_state::saw_neg;
+      } else {
+        printf("%i/%i OTHER\n", threadIdx.x, i);
+        return false;
+      }
     };
     auto num_tokens = tokens.size();
     auto count_it   = thrust::make_counting_iterator(0);
@@ -75,7 +190,7 @@ void validate_token_stream(device_span<char const> d_input,
                       token_indices = token_indices.begin(),
                       validate_tokens] __device__(auto i) -> bool {
       if (tokens[i] == token_t::ValueEnd) {
-        return !validate_tokens(token_indices[i - 1], token_indices[i]);
+        return !validate_tokens(i, token_indices[i - 1], token_indices[i]);
       }
       return false;
     };

@@ -1443,10 +1443,10 @@ public final class Table implements AutoCloseable {
    * @param schema the schema of the data. You may use Schema.INFERRED to infer the schema.
    * @param opts various JSON parsing options.
    * @param ds the DataSource to read from.
-   * @param emtpyRowCount the number of rows to return if no columns were read.
+   * @param emptyRowCount the number of rows to return if no columns were read.
    * @return the data parsed as a table on the GPU.
    */
-  public static Table readJSON(Schema schema, JSONOptions opts, DataSource ds, int emtpyRowCount) {
+  public static Table readJSON(Schema schema, JSONOptions opts, DataSource ds, int emptyRowCount) {
     long dsHandle = DataSourceHelper.createWrapperDataSource(ds);
     try (TableWithMeta twm = new TableWithMeta(readJSONFromDataSource(schema.getFlattenedNumChildren(),
         schema.getFlattenedColumnNames(), schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(), opts.isDayFirst(),
@@ -1454,7 +1454,7 @@ public final class Table implements AutoCloseable {
         opts.isNormalizeWhitespace(),
         opts.isMixedTypesAsStrings(), opts.keepStringQuotes(),
         opts.leadingZerosAllowed(), dsHandle))) {
-      return gatherJSONColumns(schema, twm, emtpyRowCount);
+      return gatherJSONColumns(schema, twm, emptyRowCount);
     } finally {
       DataSourceHelper.destroyWrapperDataSource(dsHandle);
     }
