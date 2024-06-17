@@ -35,6 +35,8 @@ public final class JSONOptions extends ColumnFilterOptions {
   private final boolean mixedTypesAsStrings;
   private final boolean keepStringQuotes;
   private final boolean allowLeadingZeros;
+  private final boolean strictValidation;
+  private final boolean allowNonNumericNumbers;
 
   private JSONOptions(Builder builder) {
     super(builder);
@@ -45,7 +47,9 @@ public final class JSONOptions extends ColumnFilterOptions {
     normalizeWhitespace = builder.normalizeWhitespace;
     mixedTypesAsStrings = builder.mixedTypesAsStrings;
     keepStringQuotes = builder.keepQuotes;
+    strictValidation = builder.strictValidation;
     allowLeadingZeros = builder.allowLeadingZeros;
+    allowNonNumericNumbers = builder.allowNonNumericNumbers;
   }
 
   public boolean isDayFirst() {
@@ -77,8 +81,16 @@ public final class JSONOptions extends ColumnFilterOptions {
     return keepStringQuotes;
   }
 
+  public boolean strictValidation() {
+    return strictValidation;
+  }
+
   public boolean leadingZerosAllowed() {
     return allowLeadingZeros;
+  }
+
+  public boolean nonNumericNumbersAllowed() {
+    return allowNonNumericNumbers;
   }
 
   @Override
@@ -91,7 +103,9 @@ public final class JSONOptions extends ColumnFilterOptions {
   }
 
   public static final class Builder  extends ColumnFilterOptions.Builder<JSONOptions.Builder> {
-    public boolean allowLeadingZeros = false;
+    private boolean strictValidation = false;
+    private boolean allowNonNumericNumbers = false;
+    private boolean allowLeadingZeros = false;
     private boolean dayFirst = false;
     private boolean lines = true;
 
@@ -103,10 +117,28 @@ public final class JSONOptions extends ColumnFilterOptions {
     private boolean keepQuotes = false;
 
     /**
-     * Should leading zeros on numbers be allowed or not.
+     * Should json validation be strict or not
      */
-    public Builder withLeadingZeros(boolean allowLeadingZeros) {
-      this.allowLeadingZeros = allowLeadingZeros;
+    public Builder withStrictValidation(boolean isAllowed) {
+      strictValidation = isAllowed;
+      return this;
+    }
+
+    /**
+     * Should leading zeros on numbers be allowed or not. Strict validation
+     * must be enabled for this to have any effect.
+     */
+    public Builder withLeadingZeros(boolean isAllowed) {
+      allowLeadingZeros = isAllowed;
+      return this;
+    }
+
+    /**
+     * Should non-numeric numbers be allowed or not Strict validation
+     * must be enabled for this to have any effect.
+     */
+    public Builder withNonNumericNumbers(boolean isAllowed) {
+      allowNonNumericNumbers = isAllowed;
       return this;
     }
 

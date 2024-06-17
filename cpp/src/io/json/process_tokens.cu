@@ -60,7 +60,9 @@ enum class number_state {
   fraction,
   start_exponent, // not a complete state
   after_sign_exponent, // not a complete state
-  exponent
+  exponent,
+  infinity_partial, // not a complete state and includes a counter
+  infinity
 };
 
 void validate_token_stream(device_span<char const> d_input,
@@ -69,8 +71,7 @@ void validate_token_stream(device_span<char const> d_input,
                            cudf::io::json_reader_options const& options,
                            rmm::cuda_stream_view stream)
 {
-  //if (getenv("SPARK_JSON")) {
-  if (true) {
+  if (options.is_strict_validation()) {
     using token_t = cudf::io::json::token_t;
     auto validate_tokens =
       [data = d_input.data(),
@@ -81,9 +82,9 @@ void validate_token_stream(device_span<char const> d_input,
       // This validates an unquoted value. A value must match https://www.json.org/json-en.html
       // but the leading and training whitespace should already have been removed, and is not
       // a string
-      for (SymbolOffsetT idx = start; idx < end; idx++) {
-        printf("%i/%i VALUE CHAR %i/%i => '%c'\n", threadIdx.x, i, idx, end, data[idx]);
-      }
+      //for (SymbolOffsetT idx = start; idx < end; idx++) {
+      //  printf("%i/%i VALUE CHAR %i/%i => '%c'\n", threadIdx.x, i, idx, end, data[idx]);
+      //}
 
       // TODO do I need to worry about an empty value???
       auto len = end - start;
@@ -180,7 +181,7 @@ void validate_token_stream(device_span<char const> d_input,
           num_state != number_state::start_exponent &&
           num_state != number_state::saw_neg;
       } else {
-        printf("%i/%i OTHER\n", threadIdx.x, i);
+        //printf("%i/%i OTHER\n", threadIdx.x, i);
         return false;
       }
     };
@@ -217,10 +218,10 @@ void validate_token_stream(device_span<char const> d_input,
                       count_it + num_tokens,
                       error.begin(),
                       predicate);  // in-place scan
-    printf("error:");
-    for (auto tk : cudf::detail::make_std_vector_sync(error, stream))
-      printf("%d ", tk);
-    printf("\n");
+    //printf("error:");
+    //for (auto tk : cudf::detail::make_std_vector_sync(error, stream))
+    //  printf("%d ", tk);
+    //printf("\n");
 
     thrust::transform_inclusive_scan(rmm::exec_policy(stream),
                                      count_it,
@@ -229,10 +230,10 @@ void validate_token_stream(device_span<char const> d_input,
                                      transform_op,
                                      binary_op);  // in-place scan
   }
-  printf("pre_process_token:");
-  for (auto tk : cudf::detail::make_std_vector_sync(device_span<PdaTokenT const>(tokens), stream))
-    printf("%d ", tk);
-  printf("\n");
+  //printf("pre_process_token:");
+  //for (auto tk : cudf::detail::make_std_vector_sync(device_span<PdaTokenT const>(tokens), stream))
+  //  printf("%d ", tk);
+  //printf("\n");
 
   // LE SB FB FE VB VE SE LE SB ER LE SB LB VB VE SE LE LE
   // 1   0  0  0  0  0  0  1  0  0  0  0  0  0  0  0  1  1

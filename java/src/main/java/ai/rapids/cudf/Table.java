@@ -255,7 +255,9 @@ public final class Table implements AutoCloseable {
                                         boolean normalizeWhitespace,
                                         boolean mixedTypesAsStrings,
                                         boolean keepStringQuotes,
-                                        boolean allowLeadingZeros) throws CudfException;
+                                        boolean strictValidation,
+                                        boolean allowLeadingZeros,
+                                        boolean allowNonNumericNumbers) throws CudfException;
 
   private static native long readJSONFromDataSource(int[] numChildren, String[] columnNames,
                                       int[] dTypeIds, int[] dTypeScales,
@@ -265,7 +267,9 @@ public final class Table implements AutoCloseable {
                                       boolean normalizeWhitespace,
                                       boolean mixedTypesAsStrings,
                                       boolean keepStringQuotes,
+                                      boolean strictValidation,
                                       boolean allowLeadingZeros,
+                                      boolean allowNonNumericNumbers,
                                       long dsHandle) throws CudfException;
 
   private static native long readAndInferJSONFromDataSource(boolean dayFirst, boolean lines,
@@ -274,7 +278,9 @@ public final class Table implements AutoCloseable {
                                       boolean normalizeWhitespace,
                                       boolean mixedTypesAsStrings,
                                       boolean keepStringQuotes,
+                                      boolean strictValidation,
                                       boolean allowLeadingZeros,
+                                      boolean allowNonNumericNumbers,
                                       long dsHandle) throws CudfException;
 
   private static native long readAndInferJSON(long address, long length,
@@ -285,7 +291,9 @@ public final class Table implements AutoCloseable {
                                               boolean normalizeWhitespace,
                                               boolean mixedTypesAsStrings,
                                               boolean keepStringQuotes,
-                                              boolean allowLeadingZeros) throws CudfException;
+                                              boolean strictValidation,
+                                              boolean allowLeadingZeros,
+                                              boolean allowNonNumericNumbers) throws CudfException;
 
   /**
    * Read in Parquet formatted data.
@@ -1277,7 +1285,9 @@ public final class Table implements AutoCloseable {
                     opts.isNormalizeWhitespace(),
                     opts.isMixedTypesAsStrings(),
                     opts.keepStringQuotes(),
-                    opts.leadingZerosAllowed()))) {
+                    opts.strictValidation(),
+                    opts.leadingZerosAllowed(),
+                    opts.nonNumericNumbersAllowed()))) {
 
       return gatherJSONColumns(schema, twm, -1);
     }
@@ -1357,7 +1367,9 @@ public final class Table implements AutoCloseable {
         opts.isNormalizeWhitespace(),
         opts.isMixedTypesAsStrings(),
         opts.keepStringQuotes(),
-        opts.leadingZerosAllowed()));
+        opts.strictValidation(),
+        opts.leadingZerosAllowed(),
+        opts.nonNumericNumbersAllowed()));
   }
 
   /**
@@ -1375,7 +1387,9 @@ public final class Table implements AutoCloseable {
           opts.isNormalizeWhitespace(),
           opts.isMixedTypesAsStrings(),
           opts.keepStringQuotes(),
+          opts.strictValidation(),
           opts.leadingZerosAllowed(),
+          opts.nonNumericNumbersAllowed(),
           dsHandle));
         return twm;
       } finally {
@@ -1418,11 +1432,17 @@ public final class Table implements AutoCloseable {
     try (TableWithMeta twm = new TableWithMeta(readJSON(
             schema.getFlattenedNumChildren(), schema.getFlattenedColumnNames(),
             schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(), null,
-            buffer.getAddress() + offset, len, opts.isDayFirst(), opts.isLines(),
-            opts.isRecoverWithNull(), opts.isNormalizeSingleQuotes(),
+            buffer.getAddress() + offset, len,
+            opts.isDayFirst(),
+            opts.isLines(),
+            opts.isRecoverWithNull(),
+            opts.isNormalizeSingleQuotes(),
             opts.isNormalizeWhitespace(),
-            opts.isMixedTypesAsStrings(), opts.keepStringQuotes(),
-            opts.leadingZerosAllowed()))) {
+            opts.isMixedTypesAsStrings(),
+            opts.keepStringQuotes(),
+            opts.strictValidation(),
+            opts.leadingZerosAllowed(),
+            opts.nonNumericNumbersAllowed()))) {
       return gatherJSONColumns(schema, twm, emptyRowCount);
     }
   }
@@ -1449,11 +1469,18 @@ public final class Table implements AutoCloseable {
   public static Table readJSON(Schema schema, JSONOptions opts, DataSource ds, int emptyRowCount) {
     long dsHandle = DataSourceHelper.createWrapperDataSource(ds);
     try (TableWithMeta twm = new TableWithMeta(readJSONFromDataSource(schema.getFlattenedNumChildren(),
-        schema.getFlattenedColumnNames(), schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(), opts.isDayFirst(),
-        opts.isLines(), opts.isRecoverWithNull(), opts.isNormalizeSingleQuotes(),
+        schema.getFlattenedColumnNames(), schema.getFlattenedTypeIds(), schema.getFlattenedTypeScales(),
+        opts.isDayFirst(),
+        opts.isLines(),
+        opts.isRecoverWithNull(),
+        opts.isNormalizeSingleQuotes(),
         opts.isNormalizeWhitespace(),
-        opts.isMixedTypesAsStrings(), opts.keepStringQuotes(),
-        opts.leadingZerosAllowed(), dsHandle))) {
+        opts.isMixedTypesAsStrings(),
+        opts.keepStringQuotes(),
+        opts.strictValidation(),
+        opts.leadingZerosAllowed(),
+        opts.nonNumericNumbersAllowed(),
+        dsHandle))) {
       return gatherJSONColumns(schema, twm, emptyRowCount);
     } finally {
       DataSourceHelper.destroyWrapperDataSource(dsHandle);
