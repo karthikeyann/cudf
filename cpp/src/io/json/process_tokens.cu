@@ -60,10 +60,25 @@ enum class number_state {
   fraction,
   start_exponent, // not a complete state
   after_sign_exponent, // not a complete state
-  exponent,
-  infinity_partial, // not a complete state and includes a counter
-  infinity
+  exponent
 };
+
+__device__ inline bool substr_eq(const char * data,
+    SymbolOffsetT const start,
+    SymbolOffsetT const end,
+    SymbolOffsetT const expected_len,
+    const char * expected) {
+  if (end - start != expected_len) {
+    return false;
+  } else {
+    for (auto idx = 0; idx < expected_len; idx++) {
+      if (data[start + idx] != expected[idx]) {
+        return false;
+      }
+    }
+  }
+  return true;
+}
 
 void validate_token_stream(device_span<char const> d_input,
                            device_span<PdaTokenT> tokens,
@@ -76,25 +91,33 @@ void validate_token_stream(device_span<char const> d_input,
     auto validate_tokens =
       [data = d_input.data(),
        allow_numeric_leading_zeros =
-         options.is_allowed_numeric_leading_zeros()] __device__(int32_t i, 
-                                                                SymbolOffsetT start,
-                                                                SymbolOffsetT end) -> bool {
+         options.is_allowed_numeric_leading_zeros(),
+       allow_nonnumeric = 
+         options.is_allowed_nonnumeric_numbers()] __device__(int32_t i, 
+                                                             SymbolOffsetT start,
+                                                             SymbolOffsetT end) -> bool {
       // This validates an unquoted value. A value must match https://www.json.org/json-en.html
       // but the leading and training whitespace should already have been removed, and is not
       // a string
-      //for (SymbolOffsetT idx = start; idx < end; idx++) {
-      //  printf("%i/%i VALUE CHAR %i/%i => '%c'\n", threadIdx.x, i, idx, end, data[idx]);
-      //}
+      for (SymbolOffsetT idx = start; idx < end; idx++) {
+        printf("%i VALUE CHAR %i/%i => '%c'\n", i, idx, end, data[idx]);
+      }
+      printf("\t%i VALUE CHAR END\n", i);
 
       // TODO do I need to worry about an empty value???
-      auto len = end - start;
       auto c = data[start];
       if ('n' == c) {
-        return (4 == len) && data[start + 1] == 'u' && data[start + 2] == 'l' && data[start + 3] == 'l';
+        return substr_eq(data, start, end, 4, "null");
       } else if ('t' == c) {
-        return (4 == len) && data[start + 1] == 'r' && data[start + 2] == 'u' && data[start + 3] == 'e';
+        return substr_eq(data, start, end, 4, "true");
       } else if ('f' == c) {
-        return (5 == len) && data[start + 1] == 'a' && data[start + 2] == 'l' && data[start + 3] == 's' && data[start + 4] == 'e';
+        return substr_eq(data, start, end, 5, "false");
+      } else if (allow_nonnumeric && c == 'N') {
+        return substr_eq(data, start, end, 3, "NaN");
+      } else if (allow_nonnumeric && c == 'I') {
+        return substr_eq(data, start, end, 3, "INF") || substr_eq(data, start, end, 8, "Infinity");
+      } else if (allow_nonnumeric && c == '+') {
+        return substr_eq(data, start, end, 9, "+Infinity");
       } else if ('-' == c || c <= '9' && 'c' >= '0') {
         // number
         auto num_state = number_state::start;
@@ -117,6 +140,8 @@ void validate_token_stream(device_span<char const> d_input,
                 num_state = number_state::leading_zero;
               } else if (c >= '1' && c <= '9') {
                 num_state = number_state::whole;
+              } else if (allow_nonnumeric && 'I' == c) {
+                return substr_eq(data, start, end, 4, "-INF") || substr_eq(data, start, end, 9, "-Infinity");
               } else {
                 return false;
               }
@@ -181,7 +206,7 @@ void validate_token_stream(device_span<char const> d_input,
           num_state != number_state::start_exponent &&
           num_state != number_state::saw_neg;
       } else {
-        //printf("%i/%i OTHER\n", threadIdx.x, i);
+        printf("%i OTHER %c\n", i, c);
         return false;
       }
     };

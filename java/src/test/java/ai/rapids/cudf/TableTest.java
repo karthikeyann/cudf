@@ -470,7 +470,16 @@ public class TableTest extends CudfTestBase {
 
       "{\"a\": 01}\n" +
       "{\"a\": -0.1}\n" +
-      "{\"a\": -00.1}\n"
+      "{\"a\": -00.1}\n" +
+      "{\"a\": NaN}\n" +
+      "{\"a\": INF}\n" +
+      "{\"a\": -INF}\n" +
+      "{\"a\": +Infinity}\n" +
+      "{\"a\": Infinity}\n" +
+      "{\"a\": -Infinity}\n" +
+      "{\"a\": INFinity}\n" +
+
+      "{\"a\":\"3710-11-10T02:46:58.732Z\"}\n"
   ).getBytes(StandardCharsets.UTF_8);
 
   @Test
@@ -479,17 +488,20 @@ public class TableTest extends CudfTestBase {
         .column(DType.STRING, "a")
         .build();
     JSONOptions opts = JSONOptions.builder()
-        .withLines(true)
+        .withRecoverWithNull(true)
         .withMixedTypesAsStrings(true)
         .withNormalizeWhitespace(true)
-        .withRecoverWithNull(true)
+        .withKeepQuotes(true)
+        .withNormalizeSingleQuotes(true)
         .withStrictValidation(false)
         .withLeadingZeros(false)
         .withNonNumericNumbers(false)
         .build();
     try (Table expected = new Table.TestBuilder()
-        .column("true", "false", null, "true", "true", "1", "0", "-", "-0", "-01",
-            "01", "-0.1", "-00.1")
+        .column(
+            "true", "false", null, "true", "true", "1", "0", "-", "-0", "-01",
+            "01", "-0.1", "-00.1", "NaN", "INF", "-INF", "+Infinity", "Infinity", "-Infinity", "INFinity",
+            "\"3710-11-10T02:46:58.732Z\"")
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -503,17 +515,20 @@ public class TableTest extends CudfTestBase {
         .column(DType.STRING, "a")
         .build();
     JSONOptions opts = JSONOptions.builder()
-        .withLines(true)
+        .withRecoverWithNull(true)
         .withMixedTypesAsStrings(true)
         .withNormalizeWhitespace(true)
-        .withRecoverWithNull(true)
+        .withKeepQuotes(true)
+        .withNormalizeSingleQuotes(true)
         .withStrictValidation(true)
         .withLeadingZeros(false)
         .withNonNumericNumbers(false)
         .build();
     try (Table expected = new Table.TestBuilder()
-        .column("true", "false", null, null, "true", "1", "0", null, "-0", null,
-            null, "-0.1", null)
+        .column(
+            "true", "false", null, null, "true", "1", "0", null, "-0", null,
+            null, "-0.1", null, null, null, null, null, null, null, null,
+            "\"3710-11-10T02:46:58.732Z\"")
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -527,17 +542,47 @@ public class TableTest extends CudfTestBase {
         .column(DType.STRING, "a")
         .build();
     JSONOptions opts = JSONOptions.builder()
-        .withLines(true)
+        .withRecoverWithNull(true)
         .withMixedTypesAsStrings(true)
         .withNormalizeWhitespace(true)
-        .withRecoverWithNull(true)
+        .withKeepQuotes(true)
+        .withNormalizeSingleQuotes(true)
         .withStrictValidation(true)
         .withLeadingZeros(true)
         .withNonNumericNumbers(false)
         .build();
     try (Table expected = new Table.TestBuilder()
-        .column("true", "false", null, null, "true", "1", "0", null, "-0", "-01",
-            "01", "-0.1", "-00.1")
+        .column(
+            "true", "false", null, null, "true", "1", "0", null, "-0", "-01",
+            "01", "-0.1", "-00.1", null, null, null, null, null, null, null,
+            "\"3710-11-10T02:46:58.732Z\"")
+        .build();
+         MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
+         Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
+      assertTablesAreEqual(expected, table);
+    }
+  }
+
+  @Test
+  void testJSONValidationNonNumeric() throws IOException {
+    Schema schema = Schema.builder()
+        .column(DType.STRING, "a")
+        .build();
+    JSONOptions opts = JSONOptions.builder()
+        .withRecoverWithNull(true)
+        .withMixedTypesAsStrings(true)
+        .withNormalizeWhitespace(true)
+        .withKeepQuotes(true)
+        .withNormalizeSingleQuotes(true)
+        .withStrictValidation(true)
+        .withLeadingZeros(false)
+        .withNonNumericNumbers(true)
+        .build();
+    try (Table expected = new Table.TestBuilder()
+        .column(
+            "true", "false", null, null, "true", "1", "0", null, "-0", null,
+            null, "-0.1", null, "NaN", "INF", "-INF", "+Infinity", "Infinity", "-Infinity", null,
+            "\"3710-11-10T02:46:58.732Z\"")
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
