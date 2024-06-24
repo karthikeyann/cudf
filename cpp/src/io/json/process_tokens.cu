@@ -115,9 +115,9 @@ void validate_token_stream(device_span<char const> d_input,
       } else if (allow_nonnumeric && c == 'N') {
         return substr_eq(data, start, end, 3, "NaN");
       } else if (allow_nonnumeric && c == 'I') {
-        return substr_eq(data, start, end, 3, "INF") || substr_eq(data, start, end, 8, "Infinity");
+        return substr_eq(data, start, end, 8, "Infinity");
       } else if (allow_nonnumeric && c == '+') {
-        return substr_eq(data, start, end, 9, "+Infinity");
+        return substr_eq(data, start, end, 4, "+INF") || substr_eq(data, start, end, 9, "+Infinity");
       } else if ('-' == c || c <= '9' && 'c' >= '0') {
         // number
         auto num_state = number_state::start;
