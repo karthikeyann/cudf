@@ -480,11 +480,21 @@ public class TableTest extends CudfTestBase {
       "{\"a\": -Infinity}\n" +
 
       "{\"a\": INFinity}\n" +
-      "{\"a\":\"3710-11-10T02:46:58.732Z\"}\n"
+      "{\"a\":\"3710-11-10T02:46:58.732Z\"}\n" +
+      "{\"a\":12.}\n" +
+      "{\"a\": -3.4e+38}\n" +
+      "{\"a\": -3.4e-38}\n" +
+      "{\"a\": 1.4e38}\n" +
+      "{\"a\": -3.4E+38}\n" +
+      "{\"a\": -3.4E-38}\n" +
+      "{\"a\": 1.4E38}\n" +
+      "{\"a\": -3.4E+}\n" +
+
+      "{\"a\": -3.4E-}\n"
   ).getBytes(StandardCharsets.UTF_8);
 
   @Test
-  void testJSONValidationNoStrict() throws IOException {
+  void testJSONValidationNoStrict() {
     Schema schema = Schema.builder()
         .column(DType.STRING, "a")
         .build();
@@ -502,7 +512,8 @@ public class TableTest extends CudfTestBase {
         .column(
             "true", "false", null, "true", "true", "1", "0", "-", "-0", "-01",
             "01", "-0.1", "-00.1", "NaN", "INF", "+INF", "-INF", "+Infinity", "Infinity", "-Infinity",
-            "INFinity", "\"3710-11-10T02:46:58.732Z\"")
+            "INFinity", "\"3710-11-10T02:46:58.732Z\"", "12.", "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", "-3.4E+",
+            "-3.4E-")
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -511,7 +522,7 @@ public class TableTest extends CudfTestBase {
   }
 
   @Test
-  void testJSONValidation() throws IOException {
+  void testJSONValidation() {
     Schema schema = Schema.builder()
         .column(DType.STRING, "a")
         .build();
@@ -529,7 +540,8 @@ public class TableTest extends CudfTestBase {
         .column(
             "true", "false", null, null, "true", "1", "0", null, "-0", null,
             null, "-0.1", null, null, null, null, null, null, null, null,
-            null, "\"3710-11-10T02:46:58.732Z\"")
+            null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
+            null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -538,7 +550,7 @@ public class TableTest extends CudfTestBase {
   }
 
   @Test
-  void testJSONValidationLeadingZeros() throws IOException {
+  void testJSONValidationLeadingZeros() {
     Schema schema = Schema.builder()
         .column(DType.STRING, "a")
         .build();
@@ -556,7 +568,8 @@ public class TableTest extends CudfTestBase {
         .column(
             "true", "false", null, null, "true", "1", "0", null, "-0", "-01",
             "01", "-0.1", "-00.1", null, null, null, null, null, null, null,
-            null, "\"3710-11-10T02:46:58.732Z\"")
+            null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
+            null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -565,7 +578,7 @@ public class TableTest extends CudfTestBase {
   }
 
   @Test
-  void testJSONValidationNonNumeric() throws IOException {
+  void testJSONValidationNonNumeric() {
     Schema schema = Schema.builder()
         .column(DType.STRING, "a")
         .build();
@@ -583,7 +596,8 @@ public class TableTest extends CudfTestBase {
         .column(
             "true", "false", null, null, "true", "1", "0", null, "-0", null,
             null, "-0.1", null, "NaN", null, "+INF", "-INF", "+Infinity", "Infinity", "-Infinity",
-            null, "\"3710-11-10T02:46:58.732Z\"")
+            null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
+            null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {

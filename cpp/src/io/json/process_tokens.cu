@@ -57,6 +57,7 @@ enum class number_state {
   saw_neg, // not a complete state
   leading_zero,
   whole,
+  saw_radix, // not a complete state
   fraction,
   start_exponent, // not a complete state
   after_sign_exponent, // not a complete state
@@ -99,10 +100,10 @@ void validate_token_stream(device_span<char const> d_input,
       // This validates an unquoted value. A value must match https://www.json.org/json-en.html
       // but the leading and training whitespace should already have been removed, and is not
       // a string
-      for (SymbolOffsetT idx = start; idx < end; idx++) {
-        printf("%i VALUE CHAR %i/%i => '%c'\n", i, idx, end, data[idx]);
-      }
-      printf("\t%i VALUE CHAR END\n", i);
+      //for (SymbolOffsetT idx = start; idx < end; idx++) {
+      //  printf("%i VALUE CHAR %i/%i => '%c'\n", i, idx, end, data[idx]);
+      //}
+      //printf("\t%i VALUE CHAR END\n", i);
 
       // TODO do I need to worry about an empty value???
       auto c = data[start];
@@ -150,7 +151,7 @@ void validate_token_stream(device_span<char const> d_input,
               if (allow_numeric_leading_zeros && c >= '0' && c <= '9') {
                 num_state = number_state::whole;
               } else if ('.' == c) {
-                num_state = number_state::fraction;
+                num_state = number_state::saw_radix;
               } else if ('e' == c || 'E' == c) {
                 num_state = number_state::start_exponent;
               } else {
@@ -161,6 +162,15 @@ void validate_token_stream(device_span<char const> d_input,
               if (c >= '0' && c <= '9') {
                 num_state = number_state::whole;
               } else if ('.' == c) {
+                num_state = number_state::saw_radix;
+              } else if ('e' == c || 'E' == c) {
+                num_state = number_state::start_exponent;
+              } else {
+                return false;
+              }
+              break;
+            case number_state::saw_radix:
+              if (c >= '0' && c <= '9') {
                 num_state = number_state::fraction;
               } else if ('e' == c || 'E' == c) {
                 num_state = number_state::start_exponent;
@@ -178,7 +188,7 @@ void validate_token_stream(device_span<char const> d_input,
               }
               break;
             case number_state::start_exponent:
-              if ('-' == c || '-' == c) {
+              if ('+' == c || '-' == c) {
                 num_state = number_state::after_sign_exponent;
               } else if (c >= '0' && c <= '9') {
                 num_state = number_state::exponent;
@@ -204,9 +214,10 @@ void validate_token_stream(device_span<char const> d_input,
         }
         return num_state != number_state::after_sign_exponent &&
           num_state != number_state::start_exponent &&
-          num_state != number_state::saw_neg;
+          num_state != number_state::saw_neg &&
+          num_state != number_state::saw_radix;
       } else {
-        printf("%i OTHER %c\n", i, c);
+        //printf("%i OTHER %c\n", i, c);
         return false;
       }
     };
