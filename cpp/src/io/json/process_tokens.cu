@@ -89,7 +89,7 @@ void validate_token_stream(device_span<char const> d_input,
 {
   if (options.is_strict_validation()) {
     using token_t = cudf::io::json::token_t;
-    auto validate_tokens =
+    auto validate_values =
       [data = d_input.data(),
        allow_numeric_leading_zeros =
          options.is_allowed_numeric_leading_zeros(),
@@ -221,13 +221,46 @@ void validate_token_stream(device_span<char const> d_input,
         return false;
       }
     };
+
+    auto validate_strings =
+      [data = d_input.data(),
+       allow_unquoted_control_chars = 
+         options.is_allowed_unquoted_control_chars()] __device__(int32_t i, 
+                                                                 SymbolOffsetT start,
+                                                                 SymbolOffsetT end) -> bool {
+      // This validates a quoted string. A string must match https://www.json.org/json-en.html
+      // but we already know that it has a starting and ending " and all white space has been
+      // stripped out.
+      //for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
+      //  printf("%i STR CHAR %i/%i => '%c'\n", i, idx, end, data[idx]);
+      //}
+      //printf("\t%i STR CHAR END\n", i);
+
+      for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
+        auto c = data[idx];
+        if (!allow_unquoted_control_chars && c >= 0 && c < 32) {
+          //printf("%i FOUND INVALID CHAR AT %i %i\n", i, idx, c);
+          return false;
+        //} else {
+        //  printf("%i FOUND GOOD CHAR AT %i '%c'\n", i, idx, c);
+        }
+      }
+      //printf("\t%i STR CHAR END\n", i);
+ 
+      return true;
+    };
+
     auto num_tokens = tokens.size();
     auto count_it   = thrust::make_counting_iterator(0);
     auto predicate  = [tokens        = tokens.begin(),
                       token_indices = token_indices.begin(),
-                      validate_tokens] __device__(auto i) -> bool {
+                      validate_values,
+                      validate_strings] __device__(auto i) -> bool {
       if (tokens[i] == token_t::ValueEnd) {
-        return !validate_tokens(i, token_indices[i - 1], token_indices[i]);
+        return !validate_values(i, token_indices[i - 1], token_indices[i]);
+      } else if (tokens[i] == token_t::FieldNameEnd ||
+          tokens[i] == token_t::StringEnd) {
+        return !validate_strings(i, token_indices[i - 1], token_indices[i]);
       }
       return false;
     };

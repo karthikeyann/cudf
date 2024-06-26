@@ -37,6 +37,7 @@ public final class JSONOptions extends ColumnFilterOptions {
   private final boolean allowLeadingZeros;
   private final boolean strictValidation;
   private final boolean allowNonNumericNumbers;
+  private final boolean allowUnquotedControlChars;
 
   private JSONOptions(Builder builder) {
     super(builder);
@@ -50,6 +51,7 @@ public final class JSONOptions extends ColumnFilterOptions {
     strictValidation = builder.strictValidation;
     allowLeadingZeros = builder.allowLeadingZeros;
     allowNonNumericNumbers = builder.allowNonNumericNumbers;
+    allowUnquotedControlChars = builder.allowUnquotedControlChars;
   }
 
   public boolean isDayFirst() {
@@ -93,6 +95,10 @@ public final class JSONOptions extends ColumnFilterOptions {
     return allowNonNumericNumbers;
   }
 
+  public boolean unquotedControlChars() {
+    return allowUnquotedControlChars;
+  }
+
   @Override
   String[] getIncludeColumnNames() {
     throw new UnsupportedOperationException("JSON reader didn't support column prune");
@@ -104,6 +110,7 @@ public final class JSONOptions extends ColumnFilterOptions {
 
   public static final class Builder  extends ColumnFilterOptions.Builder<JSONOptions.Builder> {
     private boolean strictValidation = false;
+    private boolean allowUnquotedControlChars = true;
     private boolean allowNonNumericNumbers = false;
     private boolean allowLeadingZeros = false;
     private boolean dayFirst = false;
@@ -134,11 +141,20 @@ public final class JSONOptions extends ColumnFilterOptions {
     }
 
     /**
-     * Should non-numeric numbers be allowed or not Strict validation
+     * Should non-numeric numbers be allowed or not. Strict validation
      * must be enabled for this to have any effect.
      */
     public Builder withNonNumericNumbers(boolean isAllowed) {
       allowNonNumericNumbers = isAllowed;
+      return this;
+    }
+
+    /**
+     * Should unquoted control chars be allowed in strings. Strict validation
+     * must be enabled for this to have any effect.
+     */
+    public Builder withUnquotedControlChars(boolean isAllowed) {
+      allowUnquotedControlChars = isAllowed;
       return this;
     }
 
