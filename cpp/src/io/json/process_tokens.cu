@@ -93,19 +93,12 @@ void validate_token_stream(device_span<char const> d_input,
       [data = d_input.data(),
        allow_numeric_leading_zeros =
          options.is_allowed_numeric_leading_zeros(),
-       allow_nonnumeric = 
-         options.is_allowed_nonnumeric_numbers()] __device__(int32_t i, 
-                                                             SymbolOffsetT start,
+       allow_nonnumeric =
+         options.is_allowed_nonnumeric_numbers()] __device__(SymbolOffsetT start,
                                                              SymbolOffsetT end) -> bool {
       // This validates an unquoted value. A value must match https://www.json.org/json-en.html
       // but the leading and training whitespace should already have been removed, and is not
       // a string
-      //for (SymbolOffsetT idx = start; idx < end; idx++) {
-      //  printf("%i VALUE CHAR %i/%i => '%c'\n", i, idx, end, data[idx]);
-      //}
-      //printf("\t%i VALUE CHAR END\n", i);
-
-      // TODO do I need to worry about an empty value???
       auto c = data[start];
       if ('n' == c) {
         return substr_eq(data, start, end, 4, "null");
@@ -217,7 +210,6 @@ void validate_token_stream(device_span<char const> d_input,
           num_state != number_state::saw_neg &&
           num_state != number_state::saw_radix;
       } else {
-        //printf("%i OTHER %c\n", i, c);
         return false;
       }
     };
@@ -225,28 +217,21 @@ void validate_token_stream(device_span<char const> d_input,
     auto validate_strings =
       [data = d_input.data(),
        allow_unquoted_control_chars = 
-         options.is_allowed_unquoted_control_chars()] __device__(int32_t i, 
-                                                                 SymbolOffsetT start,
+         options.is_allowed_unquoted_control_chars()] __device__(SymbolOffsetT start,
                                                                  SymbolOffsetT end) -> bool {
       // This validates a quoted string. A string must match https://www.json.org/json-en.html
       // but we already know that it has a starting and ending " and all white space has been
-      // stripped out.
-      //for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
-      //  printf("%i STR CHAR %i/%i => '%c'\n", i, idx, end, data[idx]);
-      //}
-      //printf("\t%i STR CHAR END\n", i);
+      // stripped out. Also the base CUDF validation makes sure escaped chars are correct
+      // so we only need to worry about unquoted control chars     
 
-      for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
-        auto c = data[idx];
-        if (!allow_unquoted_control_chars && c >= 0 && c < 32) {
-          //printf("%i FOUND INVALID CHAR AT %i %i\n", i, idx, c);
-          return false;
-        //} else {
-        //  printf("%i FOUND GOOD CHAR AT %i '%c'\n", i, idx, c);
+      if (!allow_unquoted_control_chars) {
+        for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
+          auto c = data[idx];
+          if (c >= 0 && c < 32) {
+            return false;
+          }
         }
       }
-      //printf("\t%i STR CHAR END\n", i);
- 
       return true;
     };
 
@@ -257,10 +242,10 @@ void validate_token_stream(device_span<char const> d_input,
                       validate_values,
                       validate_strings] __device__(auto i) -> bool {
       if (tokens[i] == token_t::ValueEnd) {
-        return !validate_values(i, token_indices[i - 1], token_indices[i]);
+        return !validate_values(token_indices[i - 1], token_indices[i]);
       } else if (tokens[i] == token_t::FieldNameEnd ||
           tokens[i] == token_t::StringEnd) {
-        return !validate_strings(i, token_indices[i - 1], token_indices[i]);
+        return !validate_strings(token_indices[i - 1], token_indices[i]);
       }
       return false;
     };
