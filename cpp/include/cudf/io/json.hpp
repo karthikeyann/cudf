@@ -325,7 +325,10 @@ class json_reader_options {
    *
    * @return true if leading zeros are allowed in numeric values
    */
-  [[nodiscard]] bool is_allowed_numeric_leading_zeros() const { return _allow_numeric_leading_zeros; }
+  [[nodiscard]] bool is_allowed_numeric_leading_zeros() const
+  {
+    return _allow_numeric_leading_zeros;
+  }
 
   /**
    * @brief Whether unquoted number values should be allowed NaN, +INF, -INF, +Infinity, Infinity, and 
@@ -745,6 +748,7 @@ class json_reader_options_builder {
    * be enabled for this to have any effect.
    *
    * @param val Boolean value to indicate whether leading zeros are allowed in numeric values
+   * @return this for chaining
    */
   json_reader_options_builder& numeric_leading_zeros(bool val)
   {
