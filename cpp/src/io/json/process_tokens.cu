@@ -64,6 +64,12 @@ enum class number_state {
   exponent
 };
 
+enum class string_state {
+  normal = 0,
+  escaped, // not a complete state
+  escaped_u // not a complete state
+};
+
 __device__ inline bool substr_eq(const char * data,
     SymbolOffsetT const start,
     SymbolOffsetT const end,
@@ -224,15 +230,55 @@ void validate_token_stream(device_span<char const> d_input,
       // stripped out. Also the base CUDF validation makes sure escaped chars are correct
       // so we only need to worry about unquoted control chars     
 
-      if (!allow_unquoted_control_chars) {
-        for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
-          auto c = data[idx];
-          if (c >= 0 && c < 32) {
-            return false;
-          }
+      auto state = string_state::normal;
+      auto u_count = 0;
+      for (SymbolOffsetT idx = start + 1; idx < end; idx++) {
+        auto c = data[idx];
+        if (!allow_unquoted_control_chars && c >= 0 && c < 32) {
+          return false;
+        }
+
+        switch (state) {
+          case string_state::normal:
+            if (c == '\\') {
+              state = string_state::escaped;
+            }
+            break;
+          case string_state::escaped:
+            // in Spark you can allow any char to be escaped, but CUDF
+            // validates it in some cases so we need to also validate it.
+            if (c == 'u') {
+              state = string_state::escaped_u;
+              u_count = 0;
+            } else if (c == '"' ||
+                c == '\\' ||
+                c == '/' ||
+                c == 'b' ||
+                c == 'f' ||
+                c == 'n' ||
+                c == 'r' ||
+                c == 't') {
+              state = string_state::normal;
+            } else {
+              return false;
+            }
+            break;
+          case string_state::escaped_u:
+            if ((c >= '0' && c <= '9') ||
+                (c >= 'a' && c <= 'f') ||
+                (c >= 'A' && c <= 'F')) {
+              u_count++;
+              if (u_count == 4) {
+                state = string_state::normal;
+                u_count = 0;
+              }
+            } else {
+              return false;
+            }
+            break;
         }
       }
-      return true;
+      return string_state::normal == state;
     };
 
     auto num_tokens = tokens.size();

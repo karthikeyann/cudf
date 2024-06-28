@@ -502,7 +502,8 @@ public class TableTest extends CudfTestBase {
       "{\"a\": \"\\u12\"}\n" +
 
       "{\"a\": \"\\z\"}\n" +
-      "{\"a\": \"\\r\"}\n"
+      "{\"a\": \"\\r\"}\n" +
+      "{\"a\": \"something\", \"b\": \"\\z\"}\n"
   ).getBytes(StandardCharsets.UTF_8);
 
   @Test
@@ -527,7 +528,7 @@ public class TableTest extends CudfTestBase {
             "01", "-0.1", "-00.1", "NaN", "INF", "+INF", "-INF", "+Infinity", "Infinity", "-Infinity",
             "INFinity", "\"3710-11-10T02:46:58.732Z\"", "12.", "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", "-3.4E+",
             "-3.4E-", "\"A\u0000B\"", "\"A\u0000B\"", "\"A\u0001B\"", "\"A\u0001B\"", "\"A\u001FB\"", "\"A\u001FB\"", "\"A B\"", "\"A B\"", null,
-            null, "\"\r\"")
+            null, "\"\r\"", "\"something\"")
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -557,7 +558,7 @@ public class TableTest extends CudfTestBase {
             null, "-0.1", null, null, null, null, null, null, null, null,
             null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
             null, "\"A\u0000B\"", "\"A\u0000B\"", "\"A\u0001B\"", "\"A\u0001B\"", "\"A\u001FB\"", "\"A\u001FB\"", "\"A B\"", "\"A B\"", null,
-            null, "\"\r\"")
+            null, "\"\r\"", null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -587,7 +588,7 @@ public class TableTest extends CudfTestBase {
             "01", "-0.1", "-00.1", null, null, null, null, null, null, null,
             null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
             null, "\"A\u0000B\"", "\"A\u0000B\"", "\"A\u0001B\"", "\"A\u0001B\"", "\"A\u001FB\"", "\"A\u001FB\"", "\"A B\"", "\"A B\"", null,
-            null, "\"\r\"")
+            null, "\"\r\"", null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -617,7 +618,7 @@ public class TableTest extends CudfTestBase {
             null, "-0.1", null, "NaN", null, "+INF", "-INF", "+Infinity", "Infinity", "-Infinity",
             null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
             null, "\"A\u0000B\"", "\"A\u0000B\"", "\"A\u0001B\"", "\"A\u0001B\"", "\"A\u001FB\"", "\"A\u001FB\"", "\"A B\"", "\"A B\"", null,
-            null, "\"\r\"")
+            null, "\"\r\"", null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
@@ -647,7 +648,7 @@ public class TableTest extends CudfTestBase {
             null, "-0.1", null, null, null, null, null, null, null, null,
             null, "\"3710-11-10T02:46:58.732Z\"", null, "-3.4e+38", "-3.4e-38", "1.4e38", "-3.4E+38", "-3.4E-38", "1.4E38", null,
             null, null, "\"A\u0000B\"", null, "\"A\u0001B\"", null, "\"A\u001FB\"", "\"A B\"", "\"A B\"", null,
-            null, "\"\r\"")
+            null, "\"\r\"", null)
         .build();
          MultiBufferDataSource source = sourceFrom(JSON_VALIDATION_BUFFER);
          Table table = Table.readJSON(schema, opts, source, (int)expected.getRowCount())) {
