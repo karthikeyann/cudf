@@ -162,7 +162,7 @@ reduce_to_column_tree(tree_meta_t& tree,
       return NC_ERR;
     });
   // 4. unique_copy parent_node_ids, ranges
-  rmm::device_uvector<TreeDepthT> column_levels(0, stream);  // not required
+  rmm::device_uvector<TreeDepthT> column_levels(num_columns, stream);  // required for CSR
   rmm::device_uvector<NodeIndexT> parent_col_ids(num_columns, stream);
   rmm::device_uvector<SymbolOffsetT> col_range_begin(num_columns, stream);  // Field names
   rmm::device_uvector<SymbolOffsetT> col_range_end(num_columns, stream);
@@ -179,10 +179,11 @@ reduce_to_column_tree(tree_meta_t& tree,
     thrust::make_zip_iterator(
       thrust::make_permutation_iterator(tree.parent_node_ids.begin(), unique_node_ids.begin()),
       thrust::make_permutation_iterator(tree.node_range_begin.begin(), unique_node_ids.begin()),
-      thrust::make_permutation_iterator(tree.node_range_end.begin(), unique_node_ids.begin())),
+      thrust::make_permutation_iterator(tree.node_range_end.begin(), unique_node_ids.begin()),
+      thrust::make_permutation_iterator(tree.node_levels.begin(), unique_node_ids.begin())),
     unique_node_ids.size(),
     thrust::make_zip_iterator(
-      parent_col_ids.begin(), col_range_begin.begin(), col_range_end.begin()));
+      parent_col_ids.begin(), col_range_begin.begin(), col_range_end.begin(), column_levels.begin()));
 
   // convert parent_node_ids to parent_col_ids
   thrust::transform(

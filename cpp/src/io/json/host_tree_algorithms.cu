@@ -390,7 +390,7 @@ void make_device_json_column(device_span<SymbolT const> input,
 #ifdef CSR_DEBUG_EQ
   auto [d_column_tree_csr, d_column_tree_properties] =
     cudf::io::json::experimental::detail::reduce_to_column_tree(
-      tree, col_ids, row_offsets, is_array_of_arrays, row_array_parent_col_id, stream);
+      d_column_tree, d_unique_col_ids, d_max_row_offsets, is_array_of_arrays, row_array_parent_col_id, stream);
 
   auto iseq = check_equality(
     d_column_tree, d_max_row_offsets, d_column_tree_csr, d_column_tree_properties, stream);
