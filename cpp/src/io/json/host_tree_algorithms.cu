@@ -44,6 +44,9 @@
 
 #include <algorithm>
 
+#ifndef CSR_DEBUG_EQ
+#define CSR_DEBUG_EQ
+#endif
 namespace cudf::io::json::detail {
 
 /**

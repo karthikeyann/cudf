@@ -48,9 +48,6 @@
 namespace cudf::io::json::detail {
 
 // DEBUG prints
-#ifndef CSR_DEBUG_EQ
-#define CSR_DEBUG_EQ
-#endif
 
 auto to_cat = [](auto v) -> std::string {
   switch (v) {
