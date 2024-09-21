@@ -185,6 +185,71 @@ struct device_json_column {
   }
 };
 
+namespace experimental {
+/*
+ * @brief Sparse graph adjacency matrix stored in Compressed Sparse Row (CSR) format.
+ */
+struct compressed_sparse_row {
+  rmm::device_uvector<NodeIndexT> rowidx;
+  rmm::device_uvector<NodeIndexT> colidx;
+};
+
+/*
+ * @brief Auxiliary column tree properties that are required to construct the device json
+ * column subtree, but not required for the final cudf column construction.
+ */
+struct column_tree_properties {
+  rmm::device_uvector<NodeT> categories;
+  rmm::device_uvector<size_type> max_row_offsets;
+  rmm::device_uvector<NodeIndexT> mapped_ids;
+};
+
+/*
+ * @brief Unverified column tree stored in Compressed Sparse Row (CSR) format. The device json
+ * column subtree - the subgraph that conforms to column tree properties - is extracted and further
+ * processed according to the JSON reader options passed. Only the final processed subgraph is
+ * annotated with information required to construct cuDF columns.
+ */
+struct column_tree {
+  // concatenated adjacency list
+  compressed_sparse_row adjacency;
+  // device_json_column properties
+  using row_offset_t = size_type;
+  // Indicator array for the device column subtree
+  // Stores the number of rows in the column if the node is part of device column subtree
+  // Stores zero otherwise
+  rmm::device_uvector<row_offset_t> subtree_nrows;
+  rmm::device_uvector<row_offset_t> string_offsets;
+  rmm::device_uvector<row_offset_t> string_lengths;
+  // Row offsets
+  rmm::device_uvector<row_offset_t> child_offsets;
+  // Validity bitmap
+  rmm::device_buffer validity;
+};
+
+namespace detail {
+/**
+ * @brief Reduce node tree into column tree by aggregating each property of column.
+ *
+ * @param tree json node tree to reduce (modified in-place, but restored to original state)
+ * @param col_ids column ids of each node (modified in-place, but restored to original state)
+ * @param row_offsets row offsets of each node (modified in-place, but restored to original state)
+ * @param stream The CUDA stream to which kernels are dispatched
+ * @return A tuple containing the column tree, identifier for each column and the maximum row index
+ * in each column
+ */
+CUDF_EXPORT
+std::tuple<compressed_sparse_row, column_tree_properties> reduce_to_column_tree(
+  tree_meta_t& tree,
+  device_span<NodeIndexT const> original_col_ids,
+  device_span<size_type const> row_offsets,
+  bool is_array_of_arrays,
+  NodeIndexT row_array_parent_col_id,
+  rmm::cuda_stream_view stream);
+
+}  // namespace detail
+}  // namespace experimental
+
 namespace detail {
 
 // TODO: return device_uvector instead of passing pre-allocated memory
@@ -314,12 +379,13 @@ get_array_children_indices(TreeDepthT row_array_children_level,
  * @return A tuple of column tree representation of JSON string, column ids of columns, and
  * max row offsets of columns
  */
+CUDF_EXPORT
 std::tuple<tree_meta_t, rmm::device_uvector<NodeIndexT>, rmm::device_uvector<size_type>>
 reduce_to_column_tree(tree_meta_t& tree,
-                      device_span<NodeIndexT> original_col_ids,
-                      device_span<NodeIndexT> sorted_col_ids,
-                      device_span<NodeIndexT> ordered_node_ids,
-                      device_span<size_type> row_offsets,
+                      device_span<NodeIndexT const> original_col_ids,
+                      device_span<NodeIndexT const> sorted_col_ids,
+                      device_span<NodeIndexT const> ordered_node_ids,
+                      device_span<size_type const> row_offsets,
                       bool is_array_of_arrays,
                       NodeIndexT const row_array_parent_col_id,
                       rmm::cuda_stream_view stream);
