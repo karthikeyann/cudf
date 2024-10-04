@@ -87,13 +87,26 @@ void validate_token_stream(device_span<char const> d_input,
 {
   CUDF_FUNC_RANGE();
   if (!options.is_strict_validation()) { return; }
+
+  rmm::device_uvector<bool> d_invalid(tokens.size(), stream);
+  thrust::fill(rmm::exec_policy_nosync(stream), d_invalid.begin(), d_invalid.end(), false);
   using token_t = cudf::io::json::token_t;
-  cudf::detail::optional_trie trie_na =
-    cudf::detail::create_serialized_trie(options.get_na_values(), stream);
-  auto trie_na_view    = cudf::detail::make_trie_view(trie_na);
+  auto literals = options.get_na_values();
+  literals.emplace_back("null");  // added these too to single trie
+  literals.emplace_back("true");
+  literals.emplace_back("false");
+  cudf::detail::optional_trie trie_literals =
+    cudf::detail::create_serialized_trie(literals, stream);
+  auto trie_literals_view = cudf::detail::make_trie_view(trie_literals);
+  std::vector<std::string> nonnumeric{"NaN", "Infinity", "+INF", "+Infinity", "-INF", "-Infinity"};
+  cudf::detail::optional_trie trie_nonnumeric =
+    cudf::detail::create_serialized_trie(nonnumeric, stream);
+  auto trie_nonnumeric_view = cudf::detail::make_trie_view(trie_nonnumeric);
+
   auto validate_values = cuda::proclaim_return_type<bool>(
     [data                        = d_input.data(),
-     trie_na                     = trie_na_view,
+     trie_literals               = trie_literals_view,
+     trie_nonnumeric             = trie_nonnumeric_view,
      allow_numeric_leading_zeros = options.is_allowed_numeric_leading_zeros(),
      allow_nonnumeric =
        options.is_allowed_nonnumeric_numbers()] __device__(SymbolOffsetT start,
@@ -101,24 +114,14 @@ void validate_token_stream(device_span<char const> d_input,
       // This validates an unquoted value. A value must match https://www.json.org/json-en.html
       // but the leading and training whitespace should already have been removed, and is not
       // a string
-      auto c               = data[start];
-      auto is_null_literal = serialized_trie_contains(trie_na, {data + start, end - start});
-      if (is_null_literal) {
-        return true;
-      } else if ('n' == c) {
-        return substr_eq(data, start, end, 4, "null");
-      } else if ('t' == c) {
-        return substr_eq(data, start, end, 4, "true");
-      } else if ('f' == c) {
-        return substr_eq(data, start, end, 5, "false");
-      } else if (allow_nonnumeric && c == 'N') {
-        return substr_eq(data, start, end, 3, "NaN");
-      } else if (allow_nonnumeric && c == 'I') {
-        return substr_eq(data, start, end, 8, "Infinity");
-      } else if (allow_nonnumeric && c == '+') {
-        return substr_eq(data, start, end, 4, "+INF") ||
-               substr_eq(data, start, end, 9, "+Infinity");
-      } else if ('-' == c || c <= '9' && 'c' >= '0') {
+      auto c          = data[start];
+      auto is_literal = serialized_trie_contains(trie_literals, {data + start, end - start});
+      if (is_literal) { return true; }
+      if (allow_nonnumeric) {
+        auto is_literal = serialized_trie_contains(trie_nonnumeric, {data + start, end - start});
+        if (is_literal) { return true; }
+      }
+      if ('-' == c || c <= '9' && 'c' >= '0') {
         // number
         auto num_state = number_state::START;
         for (auto at = start; at < end; at++) {
@@ -140,9 +143,6 @@ void validate_token_stream(device_span<char const> d_input,
                 num_state = number_state::LEADING_ZERO;
               } else if (c >= '1' && c <= '9') {
                 num_state = number_state::WHOLE;
-              } else if (allow_nonnumeric && 'I' == c) {
-                return substr_eq(data, start, end, 4, "-INF") ||
-                       substr_eq(data, start, end, 9, "-Infinity");
               } else {
                 return false;
               }
@@ -273,30 +273,41 @@ void validate_token_stream(device_span<char const> d_input,
 
   auto num_tokens = tokens.size();
   auto count_it   = thrust::make_counting_iterator(0);
-  auto predicate  = [tokens        = tokens.begin(),
-                    token_indices = token_indices.begin(),
-                    validate_values,
-                    validate_strings] __device__(auto i) -> bool {
+  auto predicate  = cuda::proclaim_return_type<bool>([tokens        = tokens.begin(),
+                                                     token_indices = token_indices.begin(),
+                                                     validate_values,
+                                                     validate_strings] __device__(auto i) -> bool {
     if (tokens[i] == token_t::ValueEnd) {
       return !validate_values(token_indices[i - 1], token_indices[i]);
     } else if (tokens[i] == token_t::FieldNameEnd || tokens[i] == token_t::StringEnd) {
       return !validate_strings(token_indices[i - 1], token_indices[i]);
     }
     return false;
-  };
+  });
+
+  auto conditional_invalidout_it =
+    cudf::detail::make_tabulate_output_iterator(cuda::proclaim_return_type<void>(
+      [d_invalid = d_invalid.begin()] __device__(size_type i, bool x) -> void {
+        if (x) d_invalid[i] = true;
+      }));
+  thrust::transform(rmm::exec_policy(stream),
+                    count_it,
+                    count_it + num_tokens,
+                    conditional_invalidout_it,
+                    predicate);
 
   using scan_type            = write_if::scan_type;
   auto conditional_write     = write_if{tokens.begin(), num_tokens};
   auto conditional_output_it = cudf::detail::make_tabulate_output_iterator(conditional_write);
-  auto transform_op          = cuda::proclaim_return_type<scan_type>(
-    [predicate, tokens = tokens.begin()] __device__(auto i) -> scan_type {
-      if (predicate(i)) return {token_t::ErrorBegin, tokens[i] == token_t::LineEnd};
-      return {static_cast<token_t>(tokens[i]), tokens[i] == token_t::LineEnd};
-    });
-  auto binary_op = cuda::proclaim_return_type<scan_type>(
+  auto binary_op             = cuda::proclaim_return_type<scan_type>(
     [] __device__(scan_type prev, scan_type curr) -> scan_type {
       auto op_result = (prev.first == token_t::ErrorBegin ? prev.first : curr.first);
       return scan_type((curr.second ? curr.first : op_result), prev.second | curr.second);
+    });
+  auto transform_op = cuda::proclaim_return_type<scan_type>(
+    [d_invalid = d_invalid.begin(), tokens = tokens.begin()] __device__(auto i) -> scan_type {
+      if (d_invalid[i]) return {token_t::ErrorBegin, tokens[i] == token_t::LineEnd};
+      return {static_cast<token_t>(tokens[i]), tokens[i] == token_t::LineEnd};
     });
 
   thrust::transform_inclusive_scan(rmm::exec_policy(stream),
