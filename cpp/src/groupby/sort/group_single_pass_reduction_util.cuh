@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <reductions/nested_type_minmax_util.cuh>
+#include "reductions/nested_type_minmax_util.cuh"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_factories.hpp>
@@ -25,13 +25,15 @@
 #include <cudf/detail/iterator.cuh>
 #include <cudf/detail/utilities/element_argminmax.cuh>
 #include <cudf/detail/valid_if.cuh>
+#include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/functional.h>
+#include <cuda/std/functional>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/reduce.h>
@@ -116,7 +118,7 @@ struct group_reduction_dispatcher {
                                      size_type num_groups,
                                      cudf::device_span<cudf::size_type const> group_labels,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
   {
     return group_reduction_functor<K, T>::invoke(values, num_groups, group_labels, stream, mr);
   }
@@ -149,7 +151,7 @@ struct group_reduction_functor<
                                         size_type num_groups,
                                         cudf::device_span<cudf::size_type const> group_labels,
                                         rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::device_async_resource_ref mr)
 
   {
     using SourceDType = device_storage_type_t<T>;
@@ -173,7 +175,7 @@ struct group_reduction_functor<
                             inp_iter,
                             thrust::make_discard_iterator(),
                             out_iter,
-                            thrust::equal_to{},
+                            cuda::std::equal_to{},
                             binop);
     };
 
@@ -199,10 +201,10 @@ struct group_reduction_functor<
       rmm::device_uvector<bool> validity(num_groups, stream);
       do_reduction(cudf::detail::make_validity_iterator(*d_values_ptr),
                    validity.begin(),
-                   thrust::logical_or{});
+                   cuda::std::logical_or{});
 
       auto [null_mask, null_count] =
-        cudf::detail::valid_if(validity.begin(), validity.end(), thrust::identity{}, stream, mr);
+        cudf::detail::valid_if(validity.begin(), validity.end(), cuda::std::identity{}, stream, mr);
       result->set_null_mask(std::move(null_mask), null_count);
     }
     return result;
@@ -218,7 +220,7 @@ struct group_reduction_functor<
                                         size_type num_groups,
                                         cudf::device_span<cudf::size_type const> group_labels,
                                         rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::device_async_resource_ref mr)
   {
     // This is be expected to be size_type.
     using ResultType = cudf::detail::target_type_t<T, K>;
@@ -236,7 +238,7 @@ struct group_reduction_functor<
                             inp_iter,
                             thrust::make_discard_iterator(),
                             out_iter,
-                            thrust::equal_to{},
+                            cuda::std::equal_to{},
                             binop);
     };
 
@@ -252,10 +254,10 @@ struct group_reduction_functor<
       auto validity           = rmm::device_uvector<bool>(num_groups, stream);
       do_reduction(cudf::detail::make_validity_iterator(*d_values_ptr),
                    validity.begin(),
-                   thrust::logical_or{});
+                   cuda::std::logical_or{});
 
       auto [null_mask, null_count] =
-        cudf::detail::valid_if(validity.begin(), validity.end(), thrust::identity{}, stream, mr);
+        cudf::detail::valid_if(validity.begin(), validity.end(), cuda::std::identity{}, stream, mr);
       result->set_null_mask(std::move(null_mask), null_count);
     }
 

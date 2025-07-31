@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -333,7 +333,7 @@ TEST_F(GroupbyReplaceNullsStructsTest, PrecedingFill)
   // Only null rows are replaced.
 
   SCW val =
-    this->data({{1, -1, 3, -1, -1, -1, 7}, {1, 0, 1, 0, 0, 0, 1}},
+    this->data({{1, -1, 3, -1, -1, -1, 7}, {true, false, true, false, false, false, true}},
                {{"x", "yy", "", "", "", "zz", ""}, {true, true, false, false, false, true, false}},
                LCW({{1, 2, 3}, {-1}, {}, {}, {42}, {}, {}}, Mask_t{1, 1, 0, 0, 1, 0, 0}.begin()),
                {1, 1, 0, 0, 1, 1, 0});
@@ -341,7 +341,7 @@ TEST_F(GroupbyReplaceNullsStructsTest, PrecedingFill)
   cudf::test::fixed_width_column_wrapper<K> expect_key{0, 0, 0, 1, 1, 1, 1};
 
   SCW expect_val = this->data(
-    {{-1, -1, -1, 1, 1, -1, -1}, {0, 0, 0, 1, 1, 0, 0}},
+    {{-1, -1, -1, 1, 1, -1, -1}, {false, false, false, true, true, false, false}},
     {{"yy", "yy", "", "x", "x", "zz", "zz"}, {true, true, false, true, true, true, true}},
     LCW({LCW{-1}, {-1}, {42}, {1, 2, 3}, {1, 2, 3}, {}, {}}, Mask_t{1, 1, 1, 1, 1, 0, 0}.begin()),
     {1, 1, 1, 1, 1, 1, 1});
@@ -358,7 +358,7 @@ TEST_F(GroupbyReplaceNullsStructsTest, FollowingFill)
   // Only null rows are replaced.
 
   SCW val =
-    this->data({{1, -1, 3, -1, -1, -1, 7}, {1, 0, 1, 0, 0, 0, 1}},
+    this->data({{1, -1, 3, -1, -1, -1, 7}, {true, false, true, false, false, false, true}},
                {{"x", "yy", "", "", "", "zz", ""}, {true, true, false, false, false, true, false}},
                LCW({{1, 2, 3}, {-1}, {}, {}, {42}, {}, {}}, Mask_t{1, 1, 0, 0, 1, 0, 0}.begin()),
                {1, 1, 0, 0, 1, 1, 0});
@@ -366,7 +366,7 @@ TEST_F(GroupbyReplaceNullsStructsTest, FollowingFill)
   cudf::test::fixed_width_column_wrapper<K> expect_key{0, 0, 0, 1, 1, 1, 1};
 
   SCW expect_val = this->data(
-    {{-1, -1, -1, 1, -1, -1, -1}, {0, 0, 0, 1, 0, 0, 0}},
+    {{-1, -1, -1, 1, -1, -1, -1}, {false, false, false, true, false, false, false}},
     {{"yy", "", "", "x", "zz", "zz", ""}, {true, false, false, true, true, true, false}},
     LCW({LCW{-1}, {42}, {42}, {1, 2, 3}, {}, {}, {}}, Mask_t{1, 1, 1, 1, 0, 0, 0}.begin()),
     {1, 1, 1, 1, 1, 1, 0});

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,23 +14,28 @@
  * limitations under the License.
  */
 
-#include <quantiles/tdigest/tdigest_util.cuh>
+#include "quantiles/tdigest/tdigest_util.cuh"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/iterator.cuh>
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/tdigest/tdigest.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/functional.hpp>
+#include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/lists/lists_column_view.hpp>
+#include <cudf/quantiles.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/advance.h>
+#include <cuda/functional>
+#include <cuda/std/iterator>
 #include <thrust/binary_search.h>
-#include <thrust/distance.h>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
 #include <thrust/functional.h>
@@ -39,8 +44,6 @@
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/reduce.h>
 #include <thrust/scan.h>
-
-#include <cuda/functional>
 
 using namespace cudf::tdigest;
 
@@ -68,13 +71,13 @@ struct make_centroid {
 
 // kernel for computing percentiles on input tdigest (mean, weight) centroid data.
 template <typename CentroidIter>
-__global__ void compute_percentiles_kernel(device_span<size_type const> tdigest_offsets,
-                                           column_device_view percentiles,
-                                           CentroidIter centroids_,
-                                           double const* min_,
-                                           double const* max_,
-                                           double const* cumulative_weight_,
-                                           double* output)
+CUDF_KERNEL void compute_percentiles_kernel(device_span<size_type const> tdigest_offsets,
+                                            column_device_view percentiles,
+                                            CentroidIter centroids_,
+                                            double const* min_,
+                                            double const* max_,
+                                            double const* cumulative_weight_,
+                                            double* output)
 {
   auto const tid = cudf::detail::grid_1d::global_thread_id();
 
@@ -106,12 +109,12 @@ __global__ void compute_percentiles_kernel(device_span<size_type const> tdigest_
     double const weighted_q = percentage * total_weight;
     if (weighted_q <= 1) {
       return *min_val;
-    } else if (weighted_q >= total_weight - 1) {
+    } else if (weighted_q > total_weight - 1) {
       return *max_val;
     }
 
     // determine what centroid this weighted quantile falls within.
-    size_type const centroid_index = static_cast<size_type>(thrust::distance(
+    size_type const centroid_index = static_cast<size_type>(cuda::std::distance(
       cumulative_weight,
       thrust::lower_bound(
         thrust::seq, cumulative_weight, cumulative_weight + tdigest_size, weighted_q)));
@@ -132,7 +135,7 @@ __global__ void compute_percentiles_kernel(device_span<size_type const> tdigest_
     double const diff = weighted_q + c.weight / 2 - cumulative_weight[centroid_index];
 
     // if we're completely within a centroid of weight 1, just return that.
-    if (c.weight == 1 && std::abs(diff) < 0.5) { return c.mean; }
+    if (c.weight == 1 && std::abs(diff) <= 0.5) { return c.mean; }
 
     // otherwise, interpolate between two centroids.
 
@@ -185,7 +188,7 @@ __global__ void compute_percentiles_kernel(device_span<size_type const> tdigest_
 std::unique_ptr<column> compute_approx_percentiles(tdigest_column_view const& input,
                                                    column_view const& percentiles,
                                                    rmm::cuda_stream_view stream,
-                                                   rmm::mr::device_memory_resource* mr)
+                                                   rmm::device_async_resource_ref mr)
 {
   tdigest_column_view tdv(input);
 
@@ -198,15 +201,15 @@ std::unique_ptr<column> compute_approx_percentiles(tdigest_column_view const& in
                                                           weight.size(),
                                                           mask_state::UNALLOCATED,
                                                           stream,
-                                                          rmm::mr::get_current_device_resource());
+                                                          cudf::get_current_device_resource_ref());
   auto keys               = cudf::detail::make_counting_transform_iterator(
     0,
     cuda::proclaim_return_type<std::ptrdiff_t>(
       [offsets_begin = offsets.begin<size_type>(),
        offsets_end   = offsets.end<size_type>()] __device__(size_type i) {
-        return thrust::distance(
+        return cuda::std::distance(
           offsets_begin,
-          thrust::prev(thrust::upper_bound(thrust::seq, offsets_begin, offsets_end, i)));
+          cuda::std::prev(thrust::upper_bound(thrust::seq, offsets_begin, offsets_end, i)));
       }));
   thrust::inclusive_scan_by_key(rmm::exec_policy(stream),
                                 keys,
@@ -260,7 +263,7 @@ std::unique_ptr<column> make_tdigest_column(size_type num_rows,
                                             std::unique_ptr<column>&& min_values,
                                             std::unique_ptr<column>&& max_values,
                                             rmm::cuda_stream_view stream,
-                                            rmm::mr::device_memory_resource* mr)
+                                            rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(tdigest_offsets->size() == num_rows + 1,
                "Encountered unexpected offset count in make_tdigest_column");
@@ -291,32 +294,33 @@ std::unique_ptr<column> make_tdigest_column(size_type num_rows,
   return make_structs_column(num_rows, std::move(children), 0, {}, stream, mr);
 }
 
-std::unique_ptr<column> make_empty_tdigest_column(rmm::cuda_stream_view stream,
-                                                  rmm::mr::device_memory_resource* mr)
+std::unique_ptr<column> make_empty_tdigests_column(size_type num_rows,
+                                                   rmm::cuda_stream_view stream,
+                                                   rmm::device_async_resource_ref mr)
 {
   auto offsets = cudf::make_fixed_width_column(
-    data_type(type_id::INT32), 2, mask_state::UNALLOCATED, stream, mr);
+    data_type(type_id::INT32), num_rows + 1, mask_state::UNALLOCATED, stream, mr);
   thrust::fill(rmm::exec_policy(stream),
                offsets->mutable_view().begin<size_type>(),
                offsets->mutable_view().end<size_type>(),
                0);
 
-  auto min_col =
-    cudf::make_numeric_column(data_type(type_id::FLOAT64), 1, mask_state::UNALLOCATED, stream, mr);
+  auto min_col = cudf::make_numeric_column(
+    data_type(type_id::FLOAT64), num_rows, mask_state::UNALLOCATED, stream, mr);
   thrust::fill(rmm::exec_policy(stream),
                min_col->mutable_view().begin<double>(),
                min_col->mutable_view().end<double>(),
                0);
-  auto max_col =
-    cudf::make_numeric_column(data_type(type_id::FLOAT64), 1, mask_state::UNALLOCATED, stream, mr);
+  auto max_col = cudf::make_numeric_column(
+    data_type(type_id::FLOAT64), num_rows, mask_state::UNALLOCATED, stream, mr);
   thrust::fill(rmm::exec_policy(stream),
                max_col->mutable_view().begin<double>(),
                max_col->mutable_view().end<double>(),
                0);
 
-  return make_tdigest_column(1,
-                             make_empty_column(type_id::FLOAT64),
-                             make_empty_column(type_id::FLOAT64),
+  return make_tdigest_column(num_rows,
+                             cudf::make_empty_column(type_id::FLOAT64),
+                             cudf::make_empty_column(type_id::FLOAT64),
                              std::move(offsets),
                              std::move(min_col),
                              std::move(max_col),
@@ -335,9 +339,9 @@ std::unique_ptr<column> make_empty_tdigest_column(rmm::cuda_stream_view stream,
  * @returns An empty tdigest scalar.
  */
 std::unique_ptr<scalar> make_empty_tdigest_scalar(rmm::cuda_stream_view stream,
-                                                  rmm::mr::device_memory_resource* mr)
+                                                  rmm::device_async_resource_ref mr)
 {
-  auto contents = make_empty_tdigest_column(stream, mr)->release();
+  auto contents = make_empty_tdigests_column(1, stream, mr)->release();
   return std::make_unique<struct_scalar>(
     std::move(*std::make_unique<table>(std::move(contents.children))), true, stream, mr);
 }
@@ -347,7 +351,7 @@ std::unique_ptr<scalar> make_empty_tdigest_scalar(rmm::cuda_stream_view stream,
 std::unique_ptr<column> percentile_approx(tdigest_column_view const& input,
                                           column_view const& percentiles,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   tdigest_column_view tdv(input);
   CUDF_EXPECTS(percentiles.type().id() == type_id::FLOAT64,
@@ -392,7 +396,7 @@ std::unique_ptr<column> percentile_approx(tdigest_column_view const& input,
       return std::pair<rmm::device_buffer, size_type>{rmm::device_buffer{}, null_count};
     }
     return cudf::detail::valid_if(
-      tdigest_is_empty, tdigest_is_empty + tdv.size(), thrust::logical_not{}, stream, mr);
+      tdigest_is_empty, tdigest_is_empty + tdv.size(), cuda::std::logical_not{}, stream, mr);
   }();
 
   return cudf::make_lists_column(input.size(),
@@ -408,10 +412,11 @@ std::unique_ptr<column> percentile_approx(tdigest_column_view const& input,
 
 std::unique_ptr<column> percentile_approx(tdigest_column_view const& input,
                                           column_view const& percentiles,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return tdigest::percentile_approx(input, percentiles, cudf::get_default_stream(), mr);
+  return tdigest::percentile_approx(input, percentiles, stream, mr);
 }
 
 }  // namespace cudf

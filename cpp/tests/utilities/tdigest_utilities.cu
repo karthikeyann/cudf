@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,15 +14,16 @@
  * limitations under the License.
  */
 
+#include <cudf_test/column_utilities.hpp>
+#include <cudf_test/cudf_gtest.hpp>
+#include <cudf_test/tdigest_utilities.cuh>
+
 #include <cudf/column/column_factories.hpp>
 #include <cudf/concatenate.hpp>
 #include <cudf/detail/tdigest/tdigest.hpp>
 #include <cudf/tdigest/tdigest_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
-
-#include <cudf_test/column_utilities.hpp>
-#include <cudf_test/cudf_gtest.hpp>
-#include <cudf_test/tdigest_utilities.cuh>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/exec_policy.hpp>
 
@@ -65,11 +66,11 @@ void tdigest_sample_compare(cudf::tdigest::tdigest_column_view const& tdv,
   }
 
   auto d_expected_src = cudf::detail::make_device_uvector_async(
-    h_expected_src, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+    h_expected_src, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   auto d_expected_mean = cudf::detail::make_device_uvector_async(
-    h_expected_mean, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+    h_expected_mean, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   auto d_expected_weight = cudf::detail::make_device_uvector_async(
-    h_expected_weight, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+    h_expected_weight, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
 
   auto iter = thrust::make_counting_iterator(0);
   thrust::for_each(

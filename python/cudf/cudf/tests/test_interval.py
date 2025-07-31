@@ -1,4 +1,4 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 
 
 import numpy as np
@@ -6,7 +6,8 @@ import pandas as pd
 import pytest
 
 import cudf
-from cudf.testing._utils import assert_eq
+from cudf.core._compat import PANDAS_GE_220
+from cudf.testing import assert_eq
 
 
 @pytest.mark.parametrize(
@@ -16,7 +17,6 @@ from cudf.testing._utils import assert_eq
 @pytest.mark.parametrize("data3, data4", [(6, 10), (5.0, 9.0), (2, 6.0)])
 @pytest.mark.parametrize("closed", ["left", "right", "both", "neither"])
 def test_create_interval_series(data1, data2, data3, data4, closed):
-
     expect = pd.Series(pd.Interval(data1, data2, closed), dtype="interval")
     got = cudf.Series(pd.Interval(data1, data2, closed), dtype="interval")
     assert_eq(expect, got)
@@ -169,11 +169,15 @@ def test_interval_index_unique():
 
 @pytest.mark.parametrize("box", [pd.Series, pd.IntervalIndex])
 @pytest.mark.parametrize("tz", ["US/Eastern", None])
+@pytest.mark.skipif(
+    condition=not PANDAS_GE_220,
+    reason="ME frequency new in pandas 2.2",
+)
 def test_interval_with_datetime(tz, box):
     dti = pd.date_range(
         start=pd.Timestamp("20180101", tz=tz),
         end=pd.Timestamp("20181231", tz=tz),
-        freq="M",
+        freq="ME",
     )
     pobj = box(pd.IntervalIndex.from_breaks(dti))
     if tz is None:
@@ -182,3 +186,36 @@ def test_interval_with_datetime(tz, box):
     else:
         with pytest.raises(NotImplementedError):
             cudf.from_pandas(pobj)
+
+
+def test_from_pandas_intervaldtype():
+    dtype = pd.IntervalDtype("int64", closed="left")
+    result = cudf.from_pandas(dtype)
+    expected = cudf.IntervalDtype("int64", closed="left")
+    assert_eq(result, expected)
+
+
+def test_intervaldtype_eq_string_with_attributes():
+    dtype = cudf.IntervalDtype("int64", closed="left")
+    assert dtype == "interval"
+    assert dtype == "interval[int64, left]"
+
+
+def test_reduction_return_interval_pandas_compatible():
+    ii = pd.IntervalIndex.from_tuples(
+        [("2017-01-03", "2017-01-04")], dtype="interval[datetime64[ns], right]"
+    )
+    cudf_ii = cudf.IntervalIndex.from_pandas(ii)
+    with cudf.option_context("mode.pandas_compatible", True):
+        result = cudf_ii.min()
+    expected = ii.min()
+    assert result == expected
+
+
+def test_empty_intervaldtype():
+    # "older pandas" supported closed=None, cudf chooses not to support that
+    pd_id = pd.IntervalDtype(closed="right")
+    cudf_id = cudf.IntervalDtype()
+
+    assert str(pd_id) == str(cudf_id)
+    assert pd_id.subtype == cudf_id.subtype

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,19 +16,22 @@
 
 #include <benchmarks/join/join_common.hpp>
 
-template <typename key_type, typename payload_type, bool Nullable>
-void nvbench_mixed_inner_join(
-  nvbench::state& state, nvbench::type_list<key_type, payload_type, nvbench::enum_type<Nullable>>)
-{
-  skip_helper(state);
+#include <cudf/join/mixed_join.hpp>
 
+auto const num_keys = 2;
+
+template <bool Nullable, cudf::null_equality NullEquality, data_type DataType>
+void nvbench_mixed_inner_join(nvbench::state& state,
+                              nvbench::type_list<nvbench::enum_type<Nullable>,
+                                                 nvbench::enum_type<NullEquality>,
+                                                 nvbench::enum_type<DataType>>)
+{
   auto join = [](cudf::table_view const& left_equality_input,
                  cudf::table_view const& right_equality_input,
                  cudf::table_view const& left_conditional_input,
                  cudf::table_view const& right_conditional_input,
                  cudf::ast::operation binary_pred,
-                 cudf::null_equality compare_nulls,
-                 rmm::cuda_stream_view stream) {
+                 cudf::null_equality compare_nulls) {
     return cudf::mixed_inner_join(left_equality_input,
                                   right_equality_input,
                                   left_conditional_input,
@@ -37,22 +40,22 @@ void nvbench_mixed_inner_join(
                                   compare_nulls);
   };
 
-  BM_join<key_type, payload_type, Nullable, join_t::MIXED>(state, join);
+  auto dtypes = cycle_dtypes(get_type_or_group(static_cast<int32_t>(DataType)), num_keys);
+  BM_join<Nullable, join_t::MIXED, NullEquality>(state, dtypes, join);
 }
 
-template <typename key_type, typename payload_type, bool Nullable>
-void nvbench_mixed_left_join(
-  nvbench::state& state, nvbench::type_list<key_type, payload_type, nvbench::enum_type<Nullable>>)
+template <bool Nullable, cudf::null_equality NullEquality, data_type DataType>
+void nvbench_mixed_left_join(nvbench::state& state,
+                             nvbench::type_list<nvbench::enum_type<Nullable>,
+                                                nvbench::enum_type<NullEquality>,
+                                                nvbench::enum_type<DataType>>)
 {
-  skip_helper(state);
-
   auto join = [](cudf::table_view const& left_equality_input,
                  cudf::table_view const& right_equality_input,
                  cudf::table_view const& left_conditional_input,
                  cudf::table_view const& right_conditional_input,
                  cudf::ast::operation binary_pred,
-                 cudf::null_equality compare_nulls,
-                 rmm::cuda_stream_view stream) {
+                 cudf::null_equality compare_nulls) {
     return cudf::mixed_left_join(left_equality_input,
                                  right_equality_input,
                                  left_conditional_input,
@@ -61,22 +64,22 @@ void nvbench_mixed_left_join(
                                  compare_nulls);
   };
 
-  BM_join<key_type, payload_type, Nullable, join_t::MIXED>(state, join);
+  auto dtypes = cycle_dtypes(get_type_or_group(static_cast<int32_t>(DataType)), num_keys);
+  BM_join<Nullable, join_t::MIXED, NullEquality>(state, dtypes, join);
 }
 
-template <typename key_type, typename payload_type, bool Nullable>
-void nvbench_mixed_full_join(
-  nvbench::state& state, nvbench::type_list<key_type, payload_type, nvbench::enum_type<Nullable>>)
+template <bool Nullable, cudf::null_equality NullEquality, data_type DataType>
+void nvbench_mixed_full_join(nvbench::state& state,
+                             nvbench::type_list<nvbench::enum_type<Nullable>,
+                                                nvbench::enum_type<NullEquality>,
+                                                nvbench::enum_type<DataType>>)
 {
-  skip_helper(state);
-
   auto join = [](cudf::table_view const& left_equality_input,
                  cudf::table_view const& right_equality_input,
                  cudf::table_view const& left_conditional_input,
                  cudf::table_view const& right_conditional_input,
                  cudf::ast::operation binary_pred,
-                 cudf::null_equality compare_nulls,
-                 rmm::cuda_stream_view stream) {
+                 cudf::null_equality compare_nulls) {
     return cudf::mixed_full_join(left_equality_input,
                                  right_equality_input,
                                  left_conditional_input,
@@ -85,22 +88,22 @@ void nvbench_mixed_full_join(
                                  compare_nulls);
   };
 
-  BM_join<key_type, payload_type, Nullable, join_t::MIXED>(state, join);
+  auto dtypes = cycle_dtypes(get_type_or_group(static_cast<int32_t>(DataType)), num_keys);
+  BM_join<Nullable, join_t::MIXED, NullEquality>(state, dtypes, join);
 }
 
-template <typename key_type, typename payload_type, bool Nullable>
-void nvbench_mixed_left_semi_join(
-  nvbench::state& state, nvbench::type_list<key_type, payload_type, nvbench::enum_type<Nullable>>)
+template <bool Nullable, cudf::null_equality NullEquality, data_type DataType>
+void nvbench_mixed_left_semi_join(nvbench::state& state,
+                                  nvbench::type_list<nvbench::enum_type<Nullable>,
+                                                     nvbench::enum_type<NullEquality>,
+                                                     nvbench::enum_type<DataType>>)
 {
-  skip_helper(state);
-
   auto join = [](cudf::table_view const& left_equality_input,
                  cudf::table_view const& right_equality_input,
                  cudf::table_view const& left_conditional_input,
                  cudf::table_view const& right_conditional_input,
                  cudf::ast::operation binary_pred,
-                 cudf::null_equality compare_nulls,
-                 rmm::cuda_stream_view stream) {
+                 cudf::null_equality compare_nulls) {
     return cudf::mixed_left_semi_join(left_equality_input,
                                       right_equality_input,
                                       left_conditional_input,
@@ -109,22 +112,22 @@ void nvbench_mixed_left_semi_join(
                                       compare_nulls);
   };
 
-  BM_join<key_type, payload_type, Nullable, join_t::MIXED>(state, join);
+  auto dtypes = cycle_dtypes(get_type_or_group(static_cast<int32_t>(DataType)), num_keys);
+  BM_join<Nullable, join_t::MIXED, NullEquality>(state, dtypes, join);
 }
 
-template <typename key_type, typename payload_type, bool Nullable>
-void nvbench_mixed_left_anti_join(
-  nvbench::state& state, nvbench::type_list<key_type, payload_type, nvbench::enum_type<Nullable>>)
+template <bool Nullable, cudf::null_equality NullEquality, data_type DataType>
+void nvbench_mixed_left_anti_join(nvbench::state& state,
+                                  nvbench::type_list<nvbench::enum_type<Nullable>,
+                                                     nvbench::enum_type<NullEquality>,
+                                                     nvbench::enum_type<DataType>>)
 {
-  skip_helper(state);
-
   auto join = [](cudf::table_view const& left_equality_input,
                  cudf::table_view const& right_equality_input,
                  cudf::table_view const& left_conditional_input,
                  cudf::table_view const& right_conditional_input,
                  cudf::ast::operation binary_pred,
-                 cudf::null_equality compare_nulls,
-                 rmm::cuda_stream_view stream) {
+                 cudf::null_equality compare_nulls) {
     return cudf::mixed_left_anti_join(left_equality_input,
                                       right_equality_input,
                                       left_conditional_input,
@@ -133,200 +136,51 @@ void nvbench_mixed_left_anti_join(
                                       compare_nulls);
   };
 
-  BM_join<key_type, payload_type, Nullable, join_t::MIXED>(state, join);
+  auto dtypes = cycle_dtypes(get_type_or_group(static_cast<int32_t>(DataType)), num_keys);
+  BM_join<Nullable, join_t::MIXED, NullEquality>(state, dtypes, join);
 }
 
-// inner join -----------------------------------------------------------------------
 NVBENCH_BENCH_TYPES(nvbench_mixed_inner_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_inner_join_32bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_inner_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_inner_join_64bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_inner_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_inner_join_32bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_inner_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_inner_join_64bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-// left join ------------------------------------------------------------------------
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_left_join_32bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
+                    NVBENCH_TYPE_AXES(JOIN_NULLABLE_RANGE,
+                                      DEFAULT_JOIN_NULL_EQUALITY,
+                                      DEFAULT_JOIN_DATATYPES))
+  .set_name("mixed_inner_join")
+  .set_type_axes_names({"Nullable", "NullEquality", "DataType"})
+  .add_int64_axis("left_size", JOIN_SIZE_RANGE)
+  .add_int64_axis("right_size", JOIN_SIZE_RANGE);
 
 NVBENCH_BENCH_TYPES(nvbench_mixed_left_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_left_join_64bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_left_join_32bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_left_join_64bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-// full join ------------------------------------------------------------------------
-NVBENCH_BENCH_TYPES(nvbench_mixed_full_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_full_join_32bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
+                    NVBENCH_TYPE_AXES(JOIN_NULLABLE_RANGE,
+                                      DEFAULT_JOIN_NULL_EQUALITY,
+                                      DEFAULT_JOIN_DATATYPES))
+  .set_name("mixed_left_join")
+  .set_type_axes_names({"Nullable", "NullEquality", "DataType"})
+  .add_int64_axis("left_size", JOIN_SIZE_RANGE)
+  .add_int64_axis("right_size", JOIN_SIZE_RANGE);
 
 NVBENCH_BENCH_TYPES(nvbench_mixed_full_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_full_join_64bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_full_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_full_join_32bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_full_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_full_join_64bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-// left semi join ------------------------------------------------------------------------
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_semi_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_left_semi_join_32bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
+                    NVBENCH_TYPE_AXES(JOIN_NULLABLE_RANGE,
+                                      DEFAULT_JOIN_NULL_EQUALITY,
+                                      DEFAULT_JOIN_DATATYPES))
+  .set_name("mixed_full_join")
+  .set_type_axes_names({"Nullable", "NullEquality", "DataType"})
+  .add_int64_axis("left_size", JOIN_SIZE_RANGE)
+  .add_int64_axis("right_size", JOIN_SIZE_RANGE);
 
 NVBENCH_BENCH_TYPES(nvbench_mixed_left_semi_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_left_semi_join_64bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_semi_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_left_semi_join_32bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_semi_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_left_semi_join_64bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-// left anti join ------------------------------------------------------------------------
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_anti_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_left_anti_join_32bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
+                    NVBENCH_TYPE_AXES(JOIN_NULLABLE_RANGE,
+                                      DEFAULT_JOIN_NULL_EQUALITY,
+                                      DEFAULT_JOIN_DATATYPES))
+  .set_name("mixed_left_semi_join")
+  .set_type_axes_names({"Nullable", "NullEquality", "DataType"})
+  .add_int64_axis("left_size", JOIN_SIZE_RANGE)
+  .add_int64_axis("right_size", JOIN_SIZE_RANGE);
 
 NVBENCH_BENCH_TYPES(nvbench_mixed_left_anti_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<false>))
-  .set_name("mixed_left_anti_join_64bit")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_anti_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::type_list<nvbench::int32_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_left_anti_join_32bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {100'000, 10'000'000, 80'000'000, 100'000'000})
-  .add_int64_axis("Probe Table Size",
-                  {100'000, 400'000, 10'000'000, 40'000'000, 100'000'000, 240'000'000});
-
-NVBENCH_BENCH_TYPES(nvbench_mixed_left_anti_join,
-                    NVBENCH_TYPE_AXES(nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::type_list<nvbench::int64_t>,
-                                      nvbench::enum_type_list<true>))
-  .set_name("mixed_left_anti_join_64bit_nulls")
-  .set_type_axes_names({"Key Type", "Payload Type", "Nullable"})
-  .add_int64_axis("Build Table Size", {40'000'000, 50'000'000})
-  .add_int64_axis("Probe Table Size", {50'000'000, 120'000'000});
+                    NVBENCH_TYPE_AXES(JOIN_NULLABLE_RANGE,
+                                      DEFAULT_JOIN_NULL_EQUALITY,
+                                      DEFAULT_JOIN_DATATYPES))
+  .set_name("mixed_left_anti_join")
+  .set_type_axes_names({"Nullable", "NullEquality", "DataType"})
+  .add_int64_axis("left_size", JOIN_SIZE_RANGE)
+  .add_int64_axis("right_size", JOIN_SIZE_RANGE);

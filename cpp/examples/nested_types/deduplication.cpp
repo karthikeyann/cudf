@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,17 +20,18 @@
 #include <cudf/groupby.hpp>
 #include <cudf/io/json.hpp>
 #include <cudf/io/types.hpp>
-#include <cudf/join.hpp>
+#include <cudf/join/hash_join.hpp>
+#include <cudf/join/join.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/table/table_view.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/mr/device/cuda_memory_resource.hpp>
 #include <rmm/mr/device/device_memory_resource.hpp>
 #include <rmm/mr/device/owning_wrapper.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
-#include <chrono>
 #include <iostream>
 #include <string>
 
@@ -57,7 +58,10 @@
 std::shared_ptr<rmm::mr::device_memory_resource> create_memory_resource(bool pool)
 {
   auto cuda_mr = std::make_shared<rmm::mr::cuda_memory_resource>();
-  if (pool) { return rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(cuda_mr); }
+  if (pool) {
+    return rmm::mr::make_owning_wrapper<rmm::mr::pool_memory_resource>(
+      cuda_mr, rmm::percent_of_free_device_memory(50));
+  }
   return cuda_mr;
 }
 
@@ -188,7 +192,7 @@ int main(int argc, char const** argv)
 
   auto pool     = mr_name == "pool";
   auto resource = create_memory_resource(pool);
-  rmm::mr::set_current_device_resource(resource.get());
+  cudf::set_current_device_resource(resource.get());
 
   std::cout << "Reading " << input_filepath << "..." << std::endl;
   // read input file

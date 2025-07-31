@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,14 +17,13 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/detail/iterator.cuh>
 #include <cudf/unary.hpp>
 
 #include <thrust/iterator/counting_iterator.h>
-
-#include <cuda/std/limits>
 
 template <typename T>
 cudf::test::fixed_width_column_wrapper<T> create_fixed_columns(cudf::size_type start,
@@ -266,6 +265,20 @@ template <typename T>
 struct FixedPointUnaryTests : public cudf::test::BaseFixture {};
 
 TYPED_TEST_SUITE(FixedPointUnaryTests, cudf::test::FixedPointTypes);
+
+TYPED_TEST(FixedPointUnaryTests, FixedPointUnaryNegate)
+{
+  using namespace numeric;
+  using decimalXX  = TypeParam;
+  using RepType    = cudf::device_storage_type_t<decimalXX>;
+  using fp_wrapper = cudf::test::fixed_point_column_wrapper<RepType>;
+
+  auto const input    = fp_wrapper{{0, -1234, -3456, -6789, 1234, 3456, 6789}, scale_type{-3}};
+  auto const expected = fp_wrapper{{0, 1234, 3456, 6789, -1234, -3456, -6789}, scale_type{-3}};
+  auto const result   = cudf::unary_operation(input, cudf::unary_operator::NEGATE);
+
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result->view());
+}
 
 TYPED_TEST(FixedPointUnaryTests, FixedPointUnaryAbs)
 {

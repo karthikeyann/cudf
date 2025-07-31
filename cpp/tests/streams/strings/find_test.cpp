@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,14 @@
  * limitations under the License.
  */
 
+#include <cudf_test/base_fixture.hpp>
+#include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/default_stream.hpp>
+
 #include <cudf/strings/find.hpp>
 #include <cudf/strings/find_multiple.hpp>
 #include <cudf/strings/findall.hpp>
 #include <cudf/strings/regex/regex_program.hpp>
-
-#include <cudf_test/base_fixture.hpp>
-#include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/default_stream.hpp>
 
 #include <string>
 
@@ -42,8 +42,10 @@ TEST_F(StringsFindTest, Find)
   cudf::strings::starts_with(view, view, cudf::test::get_default_stream());
   cudf::strings::ends_with(view, target, cudf::test::get_default_stream());
   cudf::strings::ends_with(view, view, cudf::test::get_default_stream());
+  cudf::strings::find_instance(view, target, 0, cudf::test::get_default_stream());
 
   auto const pattern = std::string("[a-z]");
   auto const prog    = cudf::strings::regex_program::create(pattern);
   cudf::strings::findall(view, *prog, cudf::test::get_default_stream());
+  cudf::strings::find_re(view, *prog, cudf::test::get_default_stream());
 }

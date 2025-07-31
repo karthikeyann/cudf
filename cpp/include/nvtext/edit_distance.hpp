@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,9 +18,11 @@
 #include <cudf/column/column.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+#include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 //! NVText APIs
-namespace nvtext {
+namespace CUDF_EXPORT nvtext {
 /**
  * @addtogroup nvtext_edit_distance
  * @{
@@ -48,20 +50,20 @@ namespace nvtext {
  * The `targets.size()` must equal `input.size()` unless `targets.size()==1`.
  * In this case, all `input` will be computed against the single `targets[0]` string.
  *
- * @throw cudf::logic_error if `targets.size() != input.size()` and
- *                          if `targets.size() != 1`
+ * @throw std::invalid_argument if `targets.size() != input.size()` and if `targets.size() != 1`
+ * @throw std::invalid_argument if `targets.size() == 1` and `targets[0].is_null()`
  *
  * @param input Strings column of input strings
  * @param targets Strings to compute edit distance against `input`
  * @param stream CUDA stream used for device memory operations and kernel launches
  * @param mr Device memory resource used to allocate the returned column's device memory
- * @return New strings columns of with replaced strings
+ * @return New lists column of edit distance values
  */
 std::unique_ptr<cudf::column> edit_distance(
   cudf::strings_column_view const& input,
   cudf::strings_column_view const& targets,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Compute the edit distance between all the strings in the input column.
@@ -89,7 +91,8 @@ std::unique_ptr<cudf::column> edit_distance(
  * The output is a lists column of size `input.size()` and where each list item
  * is `input.size()` elements.
  *
- * @throw cudf::logic_error if `strings.size() == 1`
+ * @throw std::invalid_argument if `input.size() == 1`
+ * @throw std::overflow_error if `input.size() * input.size()` greater than max size_type
  *
  * @param input Strings column of input strings
  * @param stream CUDA stream used for device memory operations and kernel launches
@@ -98,8 +101,8 @@ std::unique_ptr<cudf::column> edit_distance(
  */
 std::unique_ptr<cudf::column> edit_distance_matrix(
   cudf::strings_column_view const& input,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
-}  // namespace nvtext
+}  // namespace CUDF_EXPORT nvtext

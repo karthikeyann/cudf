@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,7 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/timestamp_utilities.cuh>
 #include <cudf_test/type_lists.hpp>
 
@@ -36,6 +37,7 @@
 #include <thrust/logical.h>
 #include <thrust/sequence.h>
 
+namespace {
 template <typename T>
 struct ChronoColumnTest : public cudf::test::BaseFixture {
   cudf::size_type size() { return cudf::size_type(100); }
@@ -71,6 +73,7 @@ struct compare_chrono_elements_to_primitive_representation {
     return primitive == dur.count();
   }
 };
+}  // namespace
 
 TYPED_TEST_SUITE(ChronoColumnTest, cudf::test::ChronoTypes);
 
@@ -102,6 +105,7 @@ TYPED_TEST(ChronoColumnTest, ChronoDurationsMatchPrimitiveRepresentation)
                                *cudf::column_device_view::create(chrono_col)}));
 }
 
+namespace {
 template <typename ChronoT>
 struct compare_chrono_elements {
   cudf::binary_operator comp;
@@ -128,6 +132,7 @@ struct compare_chrono_elements {
     }
   }
 };
+}  // namespace
 
 TYPED_TEST(ChronoColumnTest, ChronosCanBeComparedInDeviceCode)
 {

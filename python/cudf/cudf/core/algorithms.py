@@ -1,21 +1,28 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+from __future__ import annotations
+
 import warnings
+from typing import TYPE_CHECKING
 
 import cupy as cp
-import numpy as np
+import pyarrow as pa
 
+import cudf
 from cudf.core.column import as_column
-from cudf.core.copy_types import BooleanMask
-from cudf.core.index import RangeIndex, as_index
-from cudf.core.indexed_frame import IndexedFrame
-from cudf.core.scalar import Scalar
+from cudf.core.dtypes import CategoricalDtype
 from cudf.options import get_option
-from cudf.utils.dtypes import can_convert_to_column
+from cudf.utils.dtypes import can_convert_to_column, cudf_dtype_to_pa_type
+
+if TYPE_CHECKING:
+    from cudf.core.index import Index
 
 
 def factorize(
-    values, sort=False, na_sentinel=None, use_na_sentinel=None, size_hint=None
-):
+    values,
+    sort: bool = False,
+    use_na_sentinel: bool = True,
+    size_hint: int | None = None,
+) -> tuple[cp.ndarray, cp.ndarray | Index]:
     """Encode the input values as integer labels
 
     Parameters
@@ -24,14 +31,6 @@ def factorize(
         The data to be factorized.
     sort : bool, default True
         Sort uniques and shuffle codes to maintain the relationship.
-    na_sentinel : number, default -1
-        Value to indicate missing category.
-
-        .. deprecated:: 23.04
-
-           The na_sentinel argument is deprecated and will be removed in
-           a future version of cudf. Specify use_na_sentinel as
-           either True or False.
     use_na_sentinel : bool, default True
         If True, the sentinel -1 will be used for NA values.
         If False, NA values will be encoded as non-negative
@@ -58,7 +57,7 @@ def factorize(
     >>> codes
     array([0, 1, 1], dtype=int8)
     >>> uniques
-    StringIndex(['a' 'c'], dtype='object')
+    Index(['a' 'c'], dtype='object')
 
     When ``use_na_sentinel=True`` (the default), missing values are indicated
     in the `codes` with the sentinel value ``-1`` and missing values are not
@@ -68,7 +67,7 @@ def factorize(
     >>> codes
     array([ 1, -1,  0,  2,  1], dtype=int8)
     >>> uniques
-    StringIndex(['a' 'b' 'c'], dtype='object')
+    Index(['a', 'b', 'c'], dtype='object')
 
     If NA is in the values, and we want to include NA in the uniques of the
     values, it can be achieved by setting ``use_na_sentinel=False``.
@@ -78,22 +77,13 @@ def factorize(
     >>> codes
     array([ 0,  1,  0, -1], dtype=int8)
     >>> uniques
-    Float64Index([1.0, 2.0], dtype='float64')
+    Index([1.0, 2.0], dtype='float64')
     >>> codes, uniques = cudf.factorize(values, use_na_sentinel=False)
     >>> codes
     array([1, 2, 1, 0], dtype=int8)
     >>> uniques
-    Float64Index([<NA>, 1.0, 2.0], dtype='float64')
+    Index([<NA>, 1.0, 2.0], dtype='float64')
     """
-    # TODO: Drop `na_sentinel` in the next release immediately after
-    # pandas 2.0 upgrade.
-    if na_sentinel is not None and use_na_sentinel is not None:
-        raise ValueError(
-            "Cannot specify both `na_sentinel` and `use_na_sentile`; "
-            f"got `na_sentinel={na_sentinel}` and "
-            f"`use_na_sentinel={use_na_sentinel}`"
-        )
-
     return_cupy_array = isinstance(values, cp.ndarray)
 
     if not can_convert_to_column(values):
@@ -104,39 +94,14 @@ def factorize(
 
     values = as_column(values)
 
-    if na_sentinel is None:
-        na_sentinel = (
-            -1
-            if use_na_sentinel is None or use_na_sentinel
-            else Scalar(None, dtype=values.dtype)
-        )
-    else:
-        if na_sentinel is None:
-            msg = (
-                "Specifying `na_sentinel=None` is deprecated, specify "
-                "`use_na_sentinel=False` instead."
-            )
-        elif na_sentinel == -1:
-            msg = (
-                "Specifying `na_sentinel=-1` is deprecated, specify "
-                "`use_na_sentinel=True` instead."
-            )
-        else:
-            msg = (
-                "Specifying the specific value to use for `na_sentinel` is "
-                "deprecated and will be removed in a future version of cudf. "
-                "Specify `use_na_sentinel=True` to use the sentinel value -1, "
-                "and `use_na_sentinel=False` to encode NA values.",
-            )
-        # Do not remove until pandas 2.0 support is added.
-        warnings.warn(msg, FutureWarning)
-
     if size_hint:
         warnings.warn("size_hint is not applicable for cudf.factorize")
 
-    if use_na_sentinel is None or use_na_sentinel:
+    if use_na_sentinel:
+        na_sentinel = pa.scalar(-1)
         cats = values.dropna()
     else:
+        na_sentinel = pa.scalar(None, type=cudf_dtype_to_pa_type(values.dtype))
         cats = values
 
     cats = cats.unique().astype(values.dtype)
@@ -146,62 +111,134 @@ def factorize(
 
     labels = values._label_encoding(
         cats=cats,
-        na_sentinel=Scalar(na_sentinel),
+        na_sentinel=na_sentinel,
         dtype="int64" if get_option("mode.pandas_compatible") else None,
     ).values
 
-    return labels, cats.values if return_cupy_array else as_index(cats)
-
-
-def _linear_interpolation(column, index=None):
-    """
-    Interpolate over a float column. Implicitly assumes that values are
-    evenly spaced with respect to the x-axis, for example the data
-    [1.0, NaN, 3.0] will be interpolated assuming the NaN is half way
-    between the two valid values, yielding [1.0, 2.0, 3.0]
-    """
-
-    index = RangeIndex(start=0, stop=len(column), step=1)
-    return _index_or_values_interpolation(column, index=index)
-
-
-def _index_or_values_interpolation(column, index=None):
-    """
-    Interpolate over a float column. assumes a linear interpolation
-    strategy using the index of the data to denote spacing of the x
-    values. For example the data and index [1.0, NaN, 4.0], [1, 3, 4]
-    would result in [1.0, 3.0, 4.0]
-    """
-    # figure out where the nans are
-    mask = cp.isnan(column)
-
-    # trivial cases, all nan or no nans
-    num_nan = mask.sum()
-    if num_nan == 0 or num_nan == len(column):
-        return column
-
-    to_interp = IndexedFrame(data={None: column}, index=index)
-    known_x_and_y = to_interp._apply_boolean_mask(
-        BooleanMask(~mask, len(to_interp))
+    # TODO: Avoid accessing Index from the top level namespace
+    return (
+        labels,
+        cats.values if return_cupy_array else cudf.Index._from_column(cats),
     )
 
-    known_x = known_x_and_y._index._column.values
-    known_y = known_x_and_y._data.columns[0].values
 
-    result = cp.interp(to_interp._index.values, known_x, known_y)
+def unique(values):
+    """
+    Return unique values from array-like
 
-    # find the first nan
-    first_nan_idx = (mask == 0).argmax().item()
-    result[:first_nan_idx] = np.nan
-    return result
+    Parameters
+    ----------
+    values : 1d array-like
 
+    Returns
+    -------
+    cudf.Series,
 
-def get_column_interpolator(method):
-    interpolator = {
-        "linear": _linear_interpolation,
-        "index": _index_or_values_interpolation,
-        "values": _index_or_values_interpolation,
-    }.get(method, None)
-    if not interpolator:
-        raise ValueError(f"Interpolation method `{method}` not found")
-    return interpolator
+        The return can be:
+
+        * Index : when the input is an Index
+        * cudf.Series : when the input is a Series
+        * cupy.ndarray : when the input is a cupy.ndarray
+
+        Return cudf.Series, cudf.Index, or cupy.ndarray.
+
+    See Also
+    --------
+    Index.unique : Return unique values from an Index.
+    Series.unique : Return unique values of Series object.
+
+    Examples
+    --------
+    >>> cudf.unique(cudf.Series([2, 1, 3, 3]))
+    0    2
+    1    1
+    2    3
+    dtype: int64
+
+    >>> cudf.unique(cudf.Series([2] + [1] * 5))
+    0    2
+    1    1
+    dtype: int64
+
+    >>> cudf.unique(cudf.Series([pd.Timestamp("20160101"), pd.Timestamp("20160101")]))
+    0   2016-01-01
+    dtype: datetime64[ns]
+
+    >>> cudf.unique(
+    ...     cudf.Series(
+    ...         [
+    ...             pd.Timestamp("20160101", tz="US/Eastern"),
+    ...             pd.Timestamp("20160101", tz="US/Eastern"),
+    ...             pd.Timestamp("20160103", tz="US/Eastern"),
+    ...         ]
+    ...     )
+    ... )
+    0   2016-01-01 00:00:00-05:00
+    1   2016-01-03 00:00:00-05:00
+    dtype: datetime64[ns, US/Eastern]
+
+    >>> cudf.unique(
+    ...     cudf.Index(
+    ...         [
+    ...             pd.Timestamp("20160101", tz="US/Eastern"),
+    ...             pd.Timestamp("20160101", tz="US/Eastern"),
+    ...             pd.Timestamp("20160103", tz="US/Eastern"),
+    ...         ]
+    ...     )
+    ... )
+    DatetimeIndex(['2016-01-01 00:00:00-05:00', '2016-01-03 00:00:00-05:00'],dtype='datetime64[ns, US/Eastern]')
+
+    An unordered Categorical will return categories in the
+    order of appearance.
+
+    >>> cudf.unique(cudf.Series(pd.Categorical(list("baabc"))))
+    0    b
+    1    a
+    2    c
+    dtype: category
+    Categories (3, object): ['a', 'b', 'c']
+
+    >>> cudf.unique(cudf.Series(pd.Categorical(list("baabc"), categories=list("abc"))))
+    0    b
+    1    a
+    2    c
+    dtype: category
+    Categories (3, object): ['a', 'b', 'c']
+
+    An ordered Categorical preserves the category ordering.
+
+    >>> pd.unique(
+    ...     pd.Series(
+    ...         pd.Categorical(list("baabc"), categories=list("abc"), ordered=True)
+    ...     )
+    ... )
+    0    b
+    1    a
+    2    c
+    dtype: category
+    Categories (3, object): ['a' < 'b' < 'c']
+
+    An array of tuples
+
+    >>> pd.unique(pd.Series([("a", "b"), ("b", "a"), ("a", "c"), ("b", "a")]).values)
+    array([('a', 'b'), ('b', 'a'), ('a', 'c')], dtype=object)
+    """
+    # TODO: Avoid accessing Index and Series from the top level namespace
+    if not isinstance(values, (cudf.Series, cudf.Index, cp.ndarray)):
+        raise ValueError(
+            "Must pass cudf.Series, cudf.Index, or cupy.ndarray object"
+        )
+    if isinstance(values, cp.ndarray):
+        # pandas.unique will not sort the values in the result
+        # while cupy.unique documents it will, so we pass cupy.ndarray
+        # through cudf.Index to maintain the original order.
+        return cp.asarray(cudf.Index(values).unique())
+    if isinstance(values, cudf.Series):
+        if get_option("mode.pandas_compatible"):
+            if isinstance(values.dtype, CategoricalDtype):
+                raise NotImplementedError(
+                    "cudf.Categorical is not implemented"
+                )
+            else:
+                return cp.asarray(values.unique())
+    return values.unique()

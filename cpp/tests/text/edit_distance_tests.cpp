@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,14 @@
  * limitations under the License.
  */
 
-#include <cudf/column/column.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-#include <nvtext/edit_distance.hpp>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+
+#include <cudf/column/column.hpp>
+#include <cudf/strings/strings_column_view.hpp>
+
+#include <nvtext/edit_distance.hpp>
 
 #include <thrust/iterator/transform_iterator.h>
 
@@ -52,6 +53,16 @@ TEST_F(TextEditDistanceTest, EditDistance)
     auto results =
       nvtext::edit_distance(cudf::strings_column_view(strings), cudf::strings_column_view(single));
     cudf::test::fixed_width_column_wrapper<int32_t> expected({3, 3, 3, 4, 0, 3, 2, 3});
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
+  }
+  {
+    cudf::test::strings_column_wrapper single({"pup"}, {1});
+    std::vector<char const*> h_input(516, "cup");
+    auto input = cudf::test::strings_column_wrapper(h_input.begin(), h_input.end());
+    auto results =
+      nvtext::edit_distance(cudf::strings_column_view(input), cudf::strings_column_view(single));
+    auto begin    = thrust::constant_iterator<int32_t>(1);
+    auto expected = cudf::test::fixed_width_column_wrapper<int32_t>(begin, begin + h_input.size());
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
 }
@@ -92,10 +103,14 @@ TEST_F(TextEditDistanceTest, EmptyTest)
 
 TEST_F(TextEditDistanceTest, ErrorsTest)
 {
-  cudf::test::strings_column_wrapper strings({"pup"});
-  cudf::test::strings_column_wrapper targets({"pup", ""});
-  EXPECT_THROW(
-    nvtext::edit_distance(cudf::strings_column_view(strings), cudf::strings_column_view(targets)),
-    cudf::logic_error);
-  EXPECT_THROW(nvtext::edit_distance_matrix(cudf::strings_column_view(strings)), cudf::logic_error);
+  auto input   = cudf::test::strings_column_wrapper({"pup"});
+  auto targets = cudf::test::strings_column_wrapper({"pup", ""});
+  auto svi     = cudf::strings_column_view(input);
+  auto tvi     = cudf::strings_column_view(targets);
+  EXPECT_THROW(nvtext::edit_distance(svi, tvi), std::invalid_argument);
+  EXPECT_THROW(nvtext::edit_distance_matrix(svi), std::invalid_argument);
+
+  auto single = cudf::test::strings_column_wrapper({"pup"}, {0});
+  auto sv1    = cudf::strings_column_view(single);
+  EXPECT_THROW(nvtext::edit_distance(svi, sv1), std::invalid_argument);
 }

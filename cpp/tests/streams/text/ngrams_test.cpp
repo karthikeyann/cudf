@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#include <nvtext/generate_ngrams.hpp>
-#include <nvtext/ngrams_tokenize.hpp>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/default_stream.hpp>
+
+#include <nvtext/generate_ngrams.hpp>
+#include <nvtext/ngrams_tokenize.hpp>
 
 class TextNGramsTest : public cudf::test::BaseFixture {};
 
@@ -45,7 +45,7 @@ TEST_F(TextNGramsTest, HashCharacterNgrams)
   auto input =
     cudf::test::strings_column_wrapper({"the quick brown fox", "jumped over the lazy dog."});
   nvtext::hash_character_ngrams(
-    cudf::strings_column_view(input), 5, cudf::test::get_default_stream());
+    cudf::strings_column_view(input), 5, 5, cudf::test::get_default_stream());
 }
 
 TEST_F(TextNGramsTest, NgramsTokenize)

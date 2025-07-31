@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,20 +20,17 @@
 #include <cudf/detail/utilities/assert.cuh>
 #include <cudf/hashing/detail/hash_functions.cuh>
 #include <cudf/hashing/detail/hashing.hpp>
-#include <cudf/sorting.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <cuda/std/limits>
 #include <thrust/equal.h>
 #include <thrust/execution_policy.h>
 #include <thrust/iterator/counting_iterator.h>
-#include <thrust/swap.h>
 #include <thrust/transform_reduce.h>
 
-#include <limits>
-
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @brief Result type of the `element_relational_comparator` function object.
@@ -79,8 +76,9 @@ __device__ weak_ordering compare_elements(Element lhs, Element rhs)
  * `[null, -Inf, -ve, 0, -0, +ve, +Inf, NaN, NaN] (for null_order::BEFORE)`
  *
  */
-template <typename Element, std::enable_if_t<std::is_floating_point_v<Element>>* = nullptr>
+template <typename Element>
 __device__ weak_ordering relational_compare(Element lhs, Element rhs)
+  requires(std::is_floating_point_v<Element>)
 {
   if (isnan(lhs) and isnan(rhs)) {
     return weak_ordering::EQUIVALENT;
@@ -121,8 +119,9 @@ inline __device__ auto null_compare(bool lhs_is_null, bool rhs_is_null, null_ord
  * @param rhs The second element
  * @return Indicates the relationship between the elements in the `lhs` and `rhs` columns
  */
-template <typename Element, std::enable_if_t<not std::is_floating_point_v<Element>>* = nullptr>
+template <typename Element>
 __device__ weak_ordering relational_compare(Element lhs, Element rhs)
+  requires(not std::is_floating_point_v<Element>)
 {
   return detail::compare_elements(lhs, rhs);
 }
@@ -135,8 +134,9 @@ __device__ weak_ordering relational_compare(Element lhs, Element rhs)
  * @param rhs second element
  * @return `true` if `lhs` == `rhs` else `false`.
  */
-template <typename Element, std::enable_if_t<std::is_floating_point_v<Element>>* = nullptr>
+template <typename Element>
 __device__ bool equality_compare(Element lhs, Element rhs)
+  requires(std::is_floating_point_v<Element>)
 {
   if (isnan(lhs) and isnan(rhs)) { return true; }
   return lhs == rhs;
@@ -150,8 +150,9 @@ __device__ bool equality_compare(Element lhs, Element rhs)
  * @param rhs second element
  * @return `true` if `lhs` == `rhs` else `false`.
  */
-template <typename Element, std::enable_if_t<not std::is_floating_point_v<Element>>* = nullptr>
+template <typename Element>
 __device__ bool equality_compare(Element const lhs, Element const rhs)
+  requires(not std::is_floating_point_v<Element>)
 {
   return lhs == rhs;
 }
@@ -191,10 +192,10 @@ class element_equality_comparator {
    * @param rhs_element_index The index of the second element
    * @return True if both lhs and rhs element are both nulls and `nulls_are_equal` is true, or equal
    */
-  template <typename Element,
-            std::enable_if_t<cudf::is_equality_comparable<Element, Element>()>* = nullptr>
+  template <typename Element>
   __device__ bool operator()(size_type lhs_element_index,
                              size_type rhs_element_index) const noexcept
+    requires(cudf::is_equality_comparable<Element, Element>())
   {
     if (nulls) {
       bool const lhs_is_null{lhs.is_null(lhs_element_index)};
@@ -211,9 +212,9 @@ class element_equality_comparator {
   }
 
   // @cond
-  template <typename Element,
-            std::enable_if_t<not cudf::is_equality_comparable<Element, Element>()>* = nullptr>
+  template <typename Element>
   __device__ bool operator()(size_type lhs_element_index, size_type rhs_element_index)
+    requires(not cudf::is_equality_comparable<Element, Element>())
   {
     CUDF_UNREACHABLE("Attempted to compare elements of uncomparable types.");
   }
@@ -260,7 +261,8 @@ class row_equality_comparator {
    */
   __device__ bool operator()(size_type lhs_row_index, size_type rhs_row_index) const noexcept
   {
-    auto equal_elements = [=](column_device_view l, column_device_view r) {
+    auto equal_elements = [lhs_row_index, rhs_row_index, this](column_device_view l,
+                                                               column_device_view r) {
       return cudf::type_dispatcher(l.type(),
                                    element_equality_comparator{nulls, l, r, nulls_are_equal},
                                    lhs_row_index,
@@ -327,10 +329,10 @@ class element_relational_comparator {
    * @return Indicates the relationship between the elements in
    * the `lhs` and `rhs` columns.
    */
-  template <typename Element,
-            std::enable_if_t<cudf::is_relationally_comparable<Element, Element>()>* = nullptr>
+  template <typename Element>
   __device__ weak_ordering operator()(size_type lhs_element_index,
                                       size_type rhs_element_index) const noexcept
+    requires(cudf::is_relationally_comparable<Element, Element>())
   {
     if (nulls) {
       bool const lhs_is_null{lhs.is_null(lhs_element_index)};
@@ -346,9 +348,9 @@ class element_relational_comparator {
   }
 
   // @cond
-  template <typename Element,
-            std::enable_if_t<not cudf::is_relationally_comparable<Element, Element>()>* = nullptr>
+  template <typename Element>
   __device__ weak_ordering operator()(size_type lhs_element_index, size_type rhs_element_index)
+    requires(not cudf::is_relationally_comparable<Element, Element>())
   {
     CUDF_UNREACHABLE("Attempted to compare elements of uncomparable types.");
   }
@@ -470,7 +472,9 @@ class element_hasher {
   template <typename T, CUDF_ENABLE_IF(column_device_view::has_element_accessor<T>())>
   __device__ hash_value_type operator()(column_device_view col, size_type row_index) const
   {
-    if (has_nulls && col.is_null(row_index)) { return std::numeric_limits<hash_value_type>::max(); }
+    if (has_nulls && col.is_null(row_index)) {
+      return cuda::std::numeric_limits<hash_value_type>::max();
+    }
     return hash_function<T>{}(col.element<T>(row_index));
   }
 
@@ -554,7 +558,7 @@ class element_hasher_with_seed {
 
  private:
   uint32_t _seed{DEFAULT_HASH_SEED};
-  hash_value_type _null_hash{std::numeric_limits<hash_value_type>::max()};
+  hash_value_type _null_hash{cuda::std::numeric_limits<hash_value_type>::max()};
   Nullate _has_nulls;
 };
 
@@ -609,7 +613,7 @@ class row_hasher {
         row_index));
 
     // Hashes an element in a column
-    auto hasher = [=](size_type column_index) {
+    auto hasher = [row_index, this](size_type column_index) {
       return cudf::type_dispatcher<dispatch_storage_type>(
         _table.column(column_index).type(),
         element_hasher<hash_function, Nullate>{_has_nulls},
@@ -636,4 +640,4 @@ class row_hasher {
   uint32_t _seed{DEFAULT_HASH_SEED};
 };
 
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

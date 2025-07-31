@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,13 +19,13 @@
 #include <cudf/aggregation.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
-
-#include <rmm/mr/device/per_device_resource.hpp>
+#include <cudf/utilities/export.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <memory>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @addtogroup column_sort
@@ -54,7 +54,7 @@ std::unique_ptr<column> sorted_order(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Computes the row indices that would produce `input` in a stable
@@ -69,7 +69,7 @@ std::unique_ptr<column> stable_sorted_order(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Checks whether the rows of a `table` are sorted in a lexicographical
@@ -113,7 +113,19 @@ std::unique_ptr<table> sort(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Performs a stable lexicographic sort of the rows of a table
+ *
+ * @copydoc cudf::sort
+ */
+std::unique_ptr<table> stable_sort(
+  table_view const& input,
+  std::vector<order> const& column_order         = {},
+  std::vector<null_order> const& null_precedence = {},
+  rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a key-value sort.
@@ -143,31 +155,12 @@ std::unique_ptr<table> sort_by_key(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a key-value stable sort.
  *
- * Creates a new table that reorders the rows of `values` according to the
- * lexicographic ordering of the rows of `keys`.
- *
- * The order of equivalent elements is guaranteed to be preserved.
- *
- * @throws cudf::logic_error if `values.num_rows() != keys.num_rows()`.
- *
- * @param values The table to reorder
- * @param keys The table that determines the ordering
- * @param column_order The desired order for each column in `keys`. Size must be
- * equal to `keys.num_columns()` or empty. If empty, all columns are sorted in
- * ascending order.
- * @param null_precedence The desired order of a null element compared to other
- * elements for each column in `keys`. Size must be equal to
- * `keys.num_columns()` or empty. If empty, all columns will be sorted with
- * `null_order::BEFORE`.
- * @param stream CUDA stream used for device memory operations and kernel launches
- * @param mr Device memory resource used to allocate the returned table's device memory
- * @return The reordering of `values` determined by the lexicographic order of
- * the rows of `keys`.
+ * @copydoc cudf::sort_by_key
  */
 std::unique_ptr<table> stable_sort_by_key(
   table_view const& values,
@@ -175,7 +168,7 @@ std::unique_ptr<table> stable_sort_by_key(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Computes the ranks of input column in sorted order.
@@ -214,8 +207,8 @@ std::unique_ptr<column> rank(
   null_policy null_handling,
   null_order null_precedence,
   bool percentage,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns sorted order after sorting each segment in the table.
@@ -266,7 +259,7 @@ std::unique_ptr<column> segmented_sorted_order(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns sorted order after stably sorting each segment in the table.
@@ -279,7 +272,7 @@ std::unique_ptr<column> stable_segmented_sorted_order(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a lexicographic segmented sort of a table
@@ -335,7 +328,7 @@ std::unique_ptr<table> segmented_sort_by_key(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a stably lexicographic segmented sort of a table
@@ -349,7 +342,53 @@ std::unique_ptr<table> stable_segmented_sort_by_key(
   std::vector<order> const& column_order         = {},
   std::vector<null_order> const& null_precedence = {},
   rmm::cuda_stream_view stream                   = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr            = rmm::mr::get_current_device_resource());
+  rmm::device_async_resource_ref mr              = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Computes the top k values of a column
+ *
+ * This performs the equivalent of a sort and the slice of the resulting first k elements.
+ * However, the returned column may or may not necessarily be sorted.
+ *
+ * @throw std::invalid_argument if k is greater than the number of rows in the column
+ *
+ * @param col Column to compute top k
+ * @param k Number of values to return
+ * @param sort_order The desired sort order for the top k values.
+ *                   Default is high to low.
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return A column with the top k values of the input column.
+ */
+std::unique_ptr<column> top_k(
+  column_view const& col,
+  size_type k,
+  order sort_order                  = order::DESCENDING,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Computes the indices of the top k values of a column
+ *
+ * The indices will represent the top k elements but may or may not represent
+ * those elements as k sorted values.
+ *
+ * @throw std::invalid_argument if k is greater than the number of rows in the column
+ *
+ * @param col Column to compute top k
+ * @param k Number of values to return
+ * @param sort_order The desired sort order for the top k values.
+ *                   Default is high to low.
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return Indices of the top k values of the input column
+ */
+std::unique_ptr<column> top_k_order(
+  column_view const& col,
+  size_type k,
+  order sort_order                  = order::DESCENDING,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

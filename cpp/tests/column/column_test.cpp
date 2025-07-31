@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,7 +17,7 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/cudf_gtest.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_list_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
@@ -32,6 +32,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <numeric>
 #include <random>
@@ -41,7 +42,7 @@ struct TypedColumnTest : public cudf::test::BaseFixture {
   cudf::data_type type() { return cudf::data_type{cudf::type_to_id<T>()}; }
 
   TypedColumnTest(rmm::cuda_stream_view stream = cudf::get_default_stream())
-    : data{_num_elements * cudf::size_of(type()), stream},
+    : data{_num_elements * sizeof(T), stream},
       mask{cudf::bitmask_allocation_size_bytes(_num_elements), stream}
   {
     std::vector<char> h_data(std::max(data.size(), mask.size()));
@@ -338,7 +339,7 @@ TYPED_TEST(TypedColumnTest, MoveConstructorNoMask)
 
   cudf::column moved_to{std::move(original)};
 
-  EXPECT_EQ(0, original.size());
+  EXPECT_EQ(0, original.size());  // NOLINT
   EXPECT_EQ(cudf::data_type{cudf::type_id::EMPTY}, original.type());
 
   verify_column_views(moved_to);
@@ -357,7 +358,7 @@ TYPED_TEST(TypedColumnTest, MoveConstructorWithMask)
   cudf::column moved_to{std::move(original)};
   verify_column_views(moved_to);
 
-  EXPECT_EQ(0, original.size());
+  EXPECT_EQ(0, original.size());  // NOLINT
   EXPECT_EQ(cudf::data_type{cudf::type_id::EMPTY}, original.type());
 
   // Verify move
@@ -372,7 +373,7 @@ TYPED_TEST(TypedColumnTest, DeviceUvectorConstructorNoMask)
                                                  this->num_elements());
 
   auto original = cudf::detail::make_device_uvector_async(
-    data, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+    data, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   auto original_data = original.data();
   cudf::column moved_to{std::move(original), rmm::device_buffer{}, 0};
   verify_column_views(moved_to);
@@ -388,7 +389,7 @@ TYPED_TEST(TypedColumnTest, DeviceUvectorConstructorWithMask)
                                                  this->num_elements());
 
   auto original = cudf::detail::make_device_uvector_async(
-    data, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+    data, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   auto original_data = original.data();
   auto original_mask = this->all_valid_mask.data();
   cudf::column moved_to{std::move(original), std::move(this->all_valid_mask), 0};

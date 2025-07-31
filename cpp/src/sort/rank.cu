@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,6 +20,7 @@
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/sorting.hpp>
+#include <cudf/detail/utilities/functional.hpp>
 #include <cudf/sorting.hpp>
 #include <cudf/table/experimental/row_operators.cuh>
 #include <cudf/table/table.hpp>
@@ -27,11 +28,13 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/functional.h>
+#include <cuda/functional>
+#include <cuda/std/type_traits>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
 #include <thrust/iterator/permutation_iterator.h>
@@ -43,9 +46,6 @@
 #include <thrust/sequence.h>
 #include <thrust/transform.h>
 #include <thrust/tuple.h>
-
-#include <cuda/functional>
-#include <cuda/std/type_traits>
 
 namespace cudf {
 namespace detail {
@@ -146,7 +146,7 @@ void tie_break_ranks_transform(cudf::device_span<size_type const> dense_rank_sor
                         tie_iter,
                         thrust::make_discard_iterator(),
                         tie_sorted.begin(),
-                        thrust::equal_to{},
+                        cuda::std::equal_to{},
                         tie_breaker);
   using TransformerReturnType =
     cuda::std::decay_t<cuda::std::invoke_result_t<Transformer, TieType>>;
@@ -203,8 +203,8 @@ void rank_min(cudf::device_span<size_type const> group_keys,
                                        thrust::make_counting_iterator<size_type>(1),
                                        sorted_order_view,
                                        rank_mutable_view.begin<outputType>(),
-                                       thrust::minimum{},
-                                       thrust::identity{},
+                                       cudf::detail::minimum{},
+                                       cuda::std::identity{},
                                        stream);
 }
 
@@ -221,8 +221,8 @@ void rank_max(cudf::device_span<size_type const> group_keys,
                                        thrust::make_counting_iterator<size_type>(1),
                                        sorted_order_view,
                                        rank_mutable_view.begin<outputType>(),
-                                       thrust::maximum{},
-                                       thrust::identity{},
+                                       cudf::detail::maximum{},
+                                       cuda::std::identity{},
                                        stream);
 }
 
@@ -271,7 +271,7 @@ std::unique_ptr<column> rank(column_view const& input,
                              null_order null_precedence,
                              bool percentage,
                              rmm::cuda_stream_view stream,
-                             rmm::mr::device_memory_resource* mr)
+                             rmm::device_async_resource_ref mr)
 {
   data_type const output_type         = (percentage or method == rank_method::AVERAGE)
                                           ? data_type(type_id::FLOAT64)
@@ -374,7 +374,7 @@ std::unique_ptr<column> rank(column_view const& input,
                              null_order null_precedence,
                              bool percentage,
                              rmm::cuda_stream_view stream,
-                             rmm::mr::device_memory_resource* mr)
+                             rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::rank(

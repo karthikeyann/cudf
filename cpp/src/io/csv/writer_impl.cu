@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,16 +19,19 @@
  * @brief cuDF-IO CSV writer class implementation
  */
 
-#include "durations.hpp"
-
 #include "csv_common.hpp"
 #include "csv_gpu.hpp"
+#include "durations.hpp"
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/detail/copy.hpp>
+#include <cudf/detail/fill.hpp>
 #include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/data_sink.hpp>
 #include <cudf/io/detail/csv.hpp>
+#include <cudf/io/detail/utils.hpp>
 #include <cudf/null_mask.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/detail/combine.hpp>
@@ -38,10 +41,10 @@
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
 
 #include <thrust/execution_policy.h>
 #include <thrust/host_vector.h>
@@ -75,8 +78,9 @@ namespace {
 struct escape_strings_fn {
   column_device_view const d_column;
   string_view const d_delimiter;  // check for column delimiter
-  size_type* d_offsets{};
+  size_type* d_sizes{};
   char* d_chars{};
+  cudf::detail::input_offsetalator d_offsets;
 
   __device__ void write_char(char_utf8 chr, char*& d_buffer, size_type& bytes)
   {
@@ -89,7 +93,7 @@ struct escape_strings_fn {
   __device__ void operator()(size_type idx)
   {
     if (d_column.is_null(idx)) {
-      if (!d_chars) d_offsets[idx] = 0;
+      if (!d_chars) { d_sizes[idx] = 0; }
       return;
     }
 
@@ -115,33 +119,14 @@ struct escape_strings_fn {
     }
     if (quote_row) write_char(quote, d_buffer, bytes);
 
-    if (!d_chars) d_offsets[idx] = bytes;
+    if (!d_chars) { d_sizes[idx] = bytes; }
   }
 };
 
 struct column_to_strings_fn {
-  // compile-time predicate that defines unsupported column types;
-  // based on the conditions used for instantiations of individual
-  // converters in strings/convert/convert_*.hpp;
-  //(this should have been a `variable template`,
-  // instead of a static function, but nvcc (10.0)
-  // fails to compile var-templs);
-  //
-  template <typename column_type>
-  constexpr static bool is_not_handled()
-  {
-    // Note: the case (not std::is_same_v<column_type, bool>)
-    // is already covered by is_integral)
-    //
-    return not((std::is_same_v<column_type, cudf::string_view>) ||
-               (std::is_integral_v<column_type>) || (std::is_floating_point_v<column_type>) ||
-               (cudf::is_fixed_point<column_type>()) || (cudf::is_timestamp<column_type>()) ||
-               (cudf::is_duration<column_type>()));
-  }
-
   explicit column_to_strings_fn(csv_writer_options const& options,
                                 rmm::cuda_stream_view stream,
-                                rmm::mr::device_memory_resource* mr)
+                                rmm::device_async_resource_ref mr)
     : options_(options), stream_(stream), mr_(mr)
   {
   }
@@ -154,17 +139,12 @@ struct column_to_strings_fn {
 
   // Note: `null` replacement with `na_rep` deferred to `concatenate()`
   // instead of column-wise; might be faster
-  //
-  // Note: Cannot pass `stream` to detail::<fname> version of <fname> calls below, because they are
-  // not exposed in header (see, for example, detail::concatenate(tbl_view, separator, na_rep,
-  // stream, mr) is declared and defined in combine.cu); Possible solution: declare `extern`, or
-  // just declare a prototype inside `namespace cudf::strings::detail`;
 
   // bools:
   //
   template <typename column_type>
-  std::enable_if_t<std::is_same_v<column_type, bool>, std::unique_ptr<column>> operator()(
-    column_view const& column) const
+  std::unique_ptr<column> operator()(column_view const& column) const
+    requires(std::is_same_v<column_type, bool>)
   {
     string_scalar true_string{options_.get_true_value(), true, stream_};
     string_scalar false_string{options_.get_false_value(), true, stream_};
@@ -174,8 +154,8 @@ struct column_to_strings_fn {
   // strings:
   //
   template <typename column_type>
-  std::enable_if_t<std::is_same_v<column_type, cudf::string_view>, std::unique_ptr<column>>
-  operator()(column_view const& column_v) const
+  std::unique_ptr<column> operator()(column_view const& column_v) const
+    requires(std::is_same_v<column_type, cudf::string_view>)
   {
     if (options_.get_quoting() == cudf::io::quote_style::NONE) {
       return std::make_unique<column>(column_v, stream_, mr_);
@@ -186,11 +166,12 @@ struct column_to_strings_fn {
 
     auto d_column = column_device_view::create(column_v, stream_);
     escape_strings_fn fn{*d_column, delimiter.value(stream_)};
-    auto children = cudf::strings::detail::make_strings_children(fn, column_v.size(), stream_, mr_);
+    auto [offsets_column, chars] =
+      cudf::strings::detail::make_strings_children(fn, column_v.size(), stream_, mr_);
 
     return make_strings_column(column_v.size(),
-                               std::move(children.first),
-                               std::move(children.second),
+                               std::move(offsets_column),
+                               chars.release(),
                                column_v.null_count(),
                                cudf::detail::copy_bitmask(column_v, stream_, mr_));
   }
@@ -198,9 +179,8 @@ struct column_to_strings_fn {
   // ints:
   //
   template <typename column_type>
-  std::enable_if_t<std::is_integral_v<column_type> && !std::is_same_v<column_type, bool>,
-                   std::unique_ptr<column>>
-  operator()(column_view const& column) const
+  std::unique_ptr<column> operator()(column_view const& column) const
+    requires(std::is_integral_v<column_type> && !std::is_same_v<column_type, bool>)
   {
     return cudf::strings::detail::from_integers(column, stream_, mr_);
   }
@@ -208,8 +188,8 @@ struct column_to_strings_fn {
   // floats:
   //
   template <typename column_type>
-  std::enable_if_t<std::is_floating_point_v<column_type>, std::unique_ptr<column>> operator()(
-    column_view const& column) const
+  std::unique_ptr<column> operator()(column_view const& column) const
+    requires(std::is_floating_point_v<column_type>)
   {
     return cudf::strings::detail::from_floats(column, stream_, mr_);
   }
@@ -217,8 +197,8 @@ struct column_to_strings_fn {
   // fixed point:
   //
   template <typename column_type>
-  std::enable_if_t<cudf::is_fixed_point<column_type>(), std::unique_ptr<column>> operator()(
-    column_view const& column) const
+  std::unique_ptr<column> operator()(column_view const& column) const
+    requires(cudf::is_fixed_point<column_type>())
   {
     return cudf::strings::detail::from_fixed_point(column, stream_, mr_);
   }
@@ -226,8 +206,8 @@ struct column_to_strings_fn {
   // timestamps:
   //
   template <typename column_type>
-  std::enable_if_t<cudf::is_timestamp<column_type>(), std::unique_ptr<column>> operator()(
-    column_view const& column) const
+  std::unique_ptr<column> operator()(column_view const& column) const
+    requires(cudf::is_timestamp<column_type>())
   {
     std::string format = [&]() {
       if (std::is_same_v<cudf::timestamp_s, column_type>) {
@@ -264,8 +244,8 @@ struct column_to_strings_fn {
   }
 
   template <typename column_type>
-  std::enable_if_t<cudf::is_duration<column_type>(), std::unique_ptr<column>> operator()(
-    column_view const& column) const
+  std::unique_ptr<column> operator()(column_view const& column) const
+    requires(cudf::is_duration<column_type>())
   {
     return cudf::io::detail::csv::pandas_format_durations(column, stream_, mr_);
   }
@@ -273,8 +253,8 @@ struct column_to_strings_fn {
   // unsupported type of column:
   //
   template <typename column_type>
-  std::enable_if_t<is_not_handled<column_type>(), std::unique_ptr<column>> operator()(
-    column_view const&) const
+  std::unique_ptr<column> operator()(column_view const&) const
+    requires(!cudf::io::detail::is_convertible_to_string_column<column_type>())
   {
     CUDF_FAIL("Unsupported column type.");
   }
@@ -282,7 +262,7 @@ struct column_to_strings_fn {
  private:
   csv_writer_options const& options_;
   rmm::cuda_stream_view stream_;
-  rmm::mr::device_memory_resource* mr_;
+  rmm::device_async_resource_ref mr_;
 };
 }  // unnamed namespace
 
@@ -293,7 +273,7 @@ void write_chunked_begin(data_sink* out_sink,
                          host_span<std::string const> user_column_names,
                          csv_writer_options const& options,
                          rmm::cuda_stream_view stream,
-                         rmm::mr::device_memory_resource* mr)
+                         rmm::device_async_resource_ref mr)
 {
   if (options.is_enabled_include_header()) {
     // need to generate column names if names are not provided
@@ -359,7 +339,7 @@ void write_chunked(data_sink* out_sink,
                    strings_column_view const& str_column_view,
                    csv_writer_options const& options,
                    rmm::cuda_stream_view stream,
-                   rmm::mr::device_memory_resource* mr)
+                   rmm::device_async_resource_ref mr)
 {
   // algorithm outline:
   //
@@ -375,28 +355,41 @@ void write_chunked(data_sink* out_sink,
   CUDF_EXPECTS(str_column_view.size() > 0, "Unexpected empty strings column.");
 
   cudf::string_scalar newline{options.get_line_terminator(), true, stream};
-  auto p_str_col_w_nl = cudf::strings::detail::join_strings(str_column_view,
-                                                            newline,
-                                                            string_scalar{"", false, stream},
-                                                            stream,
-                                                            rmm::mr::get_current_device_resource());
-  strings_column_view strings_column{p_str_col_w_nl->view()};
 
-  auto total_num_bytes      = strings_column.chars_size();
-  char const* ptr_all_bytes = strings_column.chars_begin();
+  // use strings concatenate to build the final CSV output in device memory
+  auto contents_w_nl = [&] {
+    auto const total_size =
+      str_column_view.chars_size(stream) + (newline.size() * str_column_view.size());
+    auto const empty_str = string_scalar("", true, stream);
+    // use join_strings when the output will be less than 2GB
+    if (total_size < static_cast<int64_t>(std::numeric_limits<size_type>::max())) {
+      return cudf::strings::detail::join_strings(str_column_view, newline, empty_str, stream, mr)
+        ->release();
+    }
+    auto nl_col = cudf::make_column_from_scalar(newline, str_column_view.size(), stream);
+    // convert the last element into an empty string by resetting the last offset value
+    auto& offsets     = nl_col->child(strings_column_view::offsets_column_index);
+    auto offsets_view = offsets.mutable_view();
+    cudf::fill_in_place(offsets_view,
+                        offsets.size() - 1,  // set the last element with
+                        offsets.size(),      // the value from 2nd to last element
+                        *cudf::detail::get_element(offsets.view(), offsets.size() - 2, stream, mr),
+                        stream);
+    auto const nl_tbl = cudf::table_view({str_column_view.parent(), nl_col->view()});
+    return cudf::strings::detail::concatenate(
+             nl_tbl, empty_str, empty_str, strings::separator_on_nulls::NO, stream, mr)
+      ->release();
+  }();
+  auto const total_num_bytes = contents_w_nl.data->size();
+  auto const ptr_all_bytes   = static_cast<char const*>(contents_w_nl.data->data());
 
   if (out_sink->is_device_write_preferred(total_num_bytes)) {
     // Direct write from device memory
     out_sink->device_write(ptr_all_bytes, total_num_bytes, stream);
   } else {
     // copy the bytes to host to write them out
-    thrust::host_vector<char> h_bytes(total_num_bytes);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(h_bytes.data(),
-                                  ptr_all_bytes,
-                                  total_num_bytes * sizeof(char),
-                                  cudaMemcpyDefault,
-                                  stream.value()));
-    stream.synchronize();
+    auto const h_bytes = cudf::detail::make_host_vector(
+      device_span<char const>{ptr_all_bytes, total_num_bytes}, stream);
 
     out_sink->host_write(h_bytes.data(), total_num_bytes);
   }
@@ -414,13 +407,15 @@ void write_csv(data_sink* out_sink,
                table_view const& table,
                host_span<std::string const> user_column_names,
                csv_writer_options const& options,
-               rmm::cuda_stream_view stream,
-               rmm::mr::device_memory_resource* mr)
+               rmm::cuda_stream_view stream)
 {
   // write header: column names separated by delimiter:
   // (even for tables with no rows)
   //
-  write_chunked_begin(out_sink, table, user_column_names, options, stream, mr);
+  CUDF_FUNC_RANGE();
+
+  write_chunked_begin(
+    out_sink, table, user_column_names, options, stream, cudf::get_current_device_resource_ref());
 
   if (table.num_rows() > 0) {
     // no need to check same-size columns constraint; auto-enforced by table_view
@@ -454,7 +449,7 @@ void write_csv(data_sink* out_sink,
 
     // convert each chunk to CSV:
     //
-    column_to_strings_fn converter{options, stream, rmm::mr::get_current_device_resource()};
+    column_to_strings_fn converter{options, stream, cudf::get_current_device_resource_ref()};
     for (auto&& sub_view : vector_views) {
       // Skip if the table has no rows
       if (sub_view.num_rows() == 0) continue;
@@ -489,12 +484,13 @@ void write_csv(data_sink* out_sink,
                                                     options_narep,
                                                     strings::separator_on_nulls::YES,
                                                     stream,
-                                                    rmm::mr::get_current_device_resource());
+                                                    cudf::get_current_device_resource_ref());
         return cudf::strings::detail::replace_nulls(
-          str_table_view.column(0), options_narep, stream, rmm::mr::get_current_device_resource());
+          str_table_view.column(0), options_narep, stream, cudf::get_current_device_resource_ref());
       }();
 
-      write_chunked(out_sink, str_concat_col->view(), options, stream, mr);
+      write_chunked(
+        out_sink, str_concat_col->view(), options, stream, cudf::get_current_device_resource_ref());
     }
   }
 }

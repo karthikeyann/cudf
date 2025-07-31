@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION.
+# Copyright (c) 2023-2024, NVIDIA CORPORATION.
 
 import itertools
 import operator
@@ -9,8 +9,12 @@ import numpy as np
 import pytest
 
 import cudf
-from cudf.core._compat import PANDAS_GE_220
-from cudf.testing._utils import assert_eq
+from cudf.core._compat import (
+    PANDAS_CURRENT_SUPPORTED_VERSION,
+    PANDAS_GE_220,
+    PANDAS_VERSION,
+)
+from cudf.testing import assert_eq
 
 
 @pytest.fixture(params=[False, True], ids=["unsorted", "sorted"])
@@ -34,6 +38,9 @@ def right():
     return cudf.DataFrame({"key": right_key, "val": right_val})
 
 
+# Behaviour in sort=False case didn't match documentation in many
+# cases prior to https://github.com/pandas-dev/pandas/pull/54611
+# (released as part of pandas 2.2)
 if PANDAS_GE_220:
     # Behaviour in sort=False case didn't match documentation in many
     # cases prior to https://github.com/pandas-dev/pandas/pull/54611
@@ -155,7 +162,14 @@ else:
 
 
 @pytest.mark.parametrize("how", ["inner", "left", "right", "outer"])
-def test_join_ordering_pandas_compat(left, right, sort, how):
+def test_join_ordering_pandas_compat(request, left, right, sort, how):
+    request.applymarker(
+        pytest.mark.xfail(
+            PANDAS_VERSION >= PANDAS_CURRENT_SUPPORTED_VERSION
+            and how == "right",
+            reason="TODO: Result ording of suffix'ed columns is incorrect",
+        )
+    )
     with cudf.option_context("mode.pandas_compatible", True):
         actual = left.merge(right, on="key", how=how, sort=sort)
     expect = expected(left, right, sort, how=how)

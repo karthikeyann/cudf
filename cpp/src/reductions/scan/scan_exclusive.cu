@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,13 +23,13 @@
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/utilities/cast_functor.cuh>
 #include <cudf/null_mask.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/scan.h>
-
 #include <cuda/functional>
+#include <thrust/scan.h>
 
 namespace cudf {
 namespace detail {
@@ -53,11 +53,12 @@ struct scan_dispatcher {
    * @param mr Device memory resource used to allocate the returned column's device memory
    * @return Output column with scan results
    */
-  template <typename T, std::enable_if_t<cuda::std::is_arithmetic_v<T>>* = nullptr>
+  template <typename T>
   std::unique_ptr<column> operator()(column_view const& input,
                                      bitmask_type const*,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
+    requires(cuda::std::is_arithmetic_v<T>)
   {
     auto output_column =
       detail::allocate_like(input, input.size(), mask_allocation_policy::NEVER, stream, mr);
@@ -78,7 +79,8 @@ struct scan_dispatcher {
   }
 
   template <typename T, typename... Args>
-  std::enable_if_t<not cuda::std::is_arithmetic_v<T>, std::unique_ptr<column>> operator()(Args&&...)
+  std::unique_ptr<column> operator()(Args&&...)
+    requires(not cuda::std::is_arithmetic_v<T>)
   {
     CUDF_FAIL("Non-arithmetic types not supported for exclusive scan");
   }
@@ -90,7 +92,7 @@ std::unique_ptr<column> scan_exclusive(column_view const& input,
                                        scan_aggregation const& agg,
                                        null_policy null_handling,
                                        rmm::cuda_stream_view stream,
-                                       rmm::mr::device_memory_resource* mr)
+                                       rmm::device_async_resource_ref mr)
 {
   auto [mask, null_count] = [&] {
     if (null_handling == null_policy::EXCLUDE) {
@@ -103,7 +105,7 @@ std::unique_ptr<column> scan_exclusive(column_view const& input,
 
   auto output = scan_agg_dispatch<scan_dispatcher>(
     input, agg, static_cast<bitmask_type*>(mask.data()), stream, mr);
-  output->set_null_mask(mask, null_count);
+  output->set_null_mask(std::move(mask), null_count);
 
   return output;
 }

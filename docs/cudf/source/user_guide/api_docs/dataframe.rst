@@ -28,6 +28,7 @@ Attributes and underlying data
    DataFrame.info
    DataFrame.select_dtypes
    DataFrame.values
+   DataFrame.values_host
    DataFrame.ndim
    DataFrame.size
    DataFrame.shape
@@ -62,6 +63,7 @@ Indexing, iteration
    DataFrame.pop
    DataFrame.tail
    DataFrame.isin
+   DataFrame.squeeze
    DataFrame.where
    DataFrame.mask
    DataFrame.query
@@ -91,27 +93,26 @@ Binary operator functions
    DataFrame.rfloordiv
    DataFrame.rmod
    DataFrame.rpow
-   DataFrame.round
    DataFrame.lt
    DataFrame.gt
    DataFrame.le
    DataFrame.ge
    DataFrame.ne
    DataFrame.eq
-   DataFrame.product
 
 Function application, GroupBy & window
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 .. autosummary::
    :toctree: api/
 
+   DataFrame.agg
    DataFrame.apply
    DataFrame.applymap
    DataFrame.apply_chunks
    DataFrame.apply_rows
-   DataFrame.pipe
-   DataFrame.agg
    DataFrame.groupby
+   DataFrame.map
+   DataFrame.pipe
    DataFrame.rolling
 
 .. _api.dataframe.stats:
@@ -135,6 +136,7 @@ Computations / descriptive stats
    DataFrame.describe
    DataFrame.diff
    DataFrame.eval
+   DataFrame.ewm
    DataFrame.kurt
    DataFrame.kurtosis
    DataFrame.max
@@ -232,7 +234,6 @@ Combining / comparing / joining / merging
 .. autosummary::
    :toctree: api/
 
-   DataFrame.append
    DataFrame.assign
    DataFrame.join
    DataFrame.merge
@@ -269,12 +270,11 @@ Serialization / IO / conversion
    DataFrame.to_csv
    DataFrame.to_cupy
    DataFrame.to_hdf
-   DataFrame.to_dict
    DataFrame.to_json
    DataFrame.to_numpy
    DataFrame.to_pandas
    DataFrame.to_feather
    DataFrame.to_records
    DataFrame.to_string
-   DataFrame.values
-   DataFrame.values_host
+   DataFrame.to_pylibcudf
+   DataFrame.from_pylibcudf

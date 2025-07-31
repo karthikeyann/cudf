@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,15 +16,14 @@
 #pragma once
 
 #include <cudf/column/column_view.hpp>
-
 #include <cudf/null_mask.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
-#include <rmm/mr/device/per_device_resource.hpp>
 
 #include <memory>
 #include <type_traits>
@@ -36,7 +35,7 @@
  * @brief Class definition for cudf::column
  */
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 
 /**
  * @brief A container of nullable device data as a column of elements.
@@ -64,8 +63,8 @@ class column {
    * @param mr Device memory resource to use for all device memory allocations
    */
   column(column const& other,
-         rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-         rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+         rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+         rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Move the contents from `other` to create a new column.
@@ -142,8 +141,8 @@ class column {
    * @param mr Device memory resource to use for all device memory allocations
    */
   explicit column(column_view view,
-                  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-                  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+                  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+                  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Returns the column's logical element type
@@ -281,6 +280,17 @@ class column {
   contents release() noexcept;
 
   /**
+   * @brief Returns the total device allocation size of the column in bytes
+   *
+   * This includes the size of the data buffer, null mask, and any child columns.
+   * It also includes any padding bytes and is at least as large as
+   * `size()*sizeof(T)` for the column's logical type.
+   *
+   * @return The total allocation size in bytes
+   */
+  [[nodiscard]] std::size_t alloc_size() const;
+
+  /**
    * @brief Creates an immutable, non-owning view of the column's data and
    * children.
    *
@@ -332,4 +342,4 @@ class column {
 };
 
 /** @} */  // end of group
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

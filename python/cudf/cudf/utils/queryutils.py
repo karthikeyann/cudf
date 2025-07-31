@@ -1,8 +1,9 @@
-# Copyright (c) 2018-2023, NVIDIA CORPORATION.
+# Copyright (c) 2018-2025, NVIDIA CORPORATION.
+from __future__ import annotations
 
 import ast
 import datetime
-from typing import Any, Dict
+from typing import Any
 
 import numpy as np
 from numba import cuda
@@ -63,7 +64,7 @@ def query_parser(text):
     Returns
     -------
     info: a `dict` of the parsed info
-    """  # noqa
+    """
     # convert any '@' to
     text = text.replace("@", ENVREF_PREFIX)
     tree = ast.parse(text)
@@ -114,7 +115,7 @@ def _check_error(tree):
         raise QuerySyntaxError("too many expressions")
 
 
-_cache: Dict[Any, Any] = {}
+_cache: dict[Any, Any] = {}
 
 
 def query_compile(expr):
@@ -204,12 +205,11 @@ def query_execute(df, expr, callenv):
     ----------
     df : DataFrame
     expr : str
-        boolean expression
+        Boolean expression
     callenv : dict
-        Contains keys 'local_dict', 'locals' and 'globals' which are all dict.
-        They represent the arg, local and global dictionaries of the caller.
+        Contains keys 'local_dict', 'global_dict', 'locals', and 'globals',
+        each of which is a dict representing variable scopes in resolution order.
     """
-
     # compile
     compiled = query_compile(expr)
     columns = compiled["colnames"]
@@ -220,8 +220,7 @@ def query_execute(df, expr, callenv):
     # wait to check the types until we know which cols are used
     if any(col.dtype not in SUPPORTED_QUERY_TYPES for col in colarrays):
         raise TypeError(
-            "query only supports numeric, datetime, timedelta, "
-            "or bool dtypes."
+            "query only supports numeric, datetime, timedelta, or bool dtypes."
         )
 
     colarrays = [col.data_array_view(mode="read") for col in colarrays]
@@ -229,7 +228,9 @@ def query_execute(df, expr, callenv):
     kernel = compiled["kernel"]
     # process env args
     envargs = []
+    envargs = []
     envdict = callenv["globals"].copy()
+    envdict.update(callenv["global_dict"])
     envdict.update(callenv["locals"])
     envdict.update(callenv["local_dict"])
     for name in compiled["refnames"]:
@@ -246,9 +247,9 @@ def query_execute(df, expr, callenv):
 
     # allocate output buffer
     nrows = len(df)
-    out = column_empty(nrows, dtype=np.bool_)
+    out = column_empty(nrows, dtype=np.dtype(np.bool_), for_numba=True)
     # run kernel
-    args = [out] + colarrays + envargs
+    args = [out, *colarrays, *envargs]
     with _CUDFNumbaConfig():
         kernel.forall(nrows)(*args)
     out_mask = applyutils.make_aggregate_nullmask(df, columns=columns)

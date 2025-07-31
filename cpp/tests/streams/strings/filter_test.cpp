@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#include <cudf/strings/char_types/char_types.hpp>
-#include <cudf/strings/translate.hpp>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/default_stream.hpp>
+
+#include <cudf/strings/char_types/char_types.hpp>
+#include <cudf/strings/translate.hpp>
 
 #include <string>
 #include <vector>
@@ -41,7 +41,7 @@ TEST_F(StringsFilterTest, Translate)
   auto view  = cudf::strings_column_view(input);
 
   std::vector<std::pair<cudf::char_utf8, cudf::char_utf8>> translate_table{
-    make_entry("b", 0), make_entry("a", "A"), make_entry(" ", "_")};
+    make_entry("b", nullptr), make_entry("a", "A"), make_entry(" ", "_")};
   cudf::strings::translate(view, translate_table, cudf::test::get_default_stream());
 }
 
@@ -51,7 +51,7 @@ TEST_F(StringsFilterTest, Filter)
   auto view  = cudf::strings_column_view(input);
 
   std::vector<std::pair<cudf::char_utf8, cudf::char_utf8>> filter_table{
-    make_entry("b", 0), make_entry("a", "A"), make_entry(" ", "_")};
+    make_entry("b", nullptr), make_entry("a", "A"), make_entry(" ", "_")};
 
   auto const repl = cudf::string_scalar("X", true, cudf::test::get_default_stream());
   auto const keep = cudf::strings::filter_type::KEEP;

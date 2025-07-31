@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,19 +14,22 @@
  * limitations under the License.
  */
 
+#include "text/subword/detail/wordpiece_tokenizer.hpp"
+
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/get_value.cuh>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/sequence.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <nvtext/detail/load_hash_file.hpp>
 #include <nvtext/subword_tokenize.hpp>
-#include <text/subword/detail/wordpiece_tokenizer.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
@@ -56,10 +59,10 @@ namespace {
  * @param[out] attn_mask Identifies valid token id entries
  * @param[out] metadata Additional data per row
  */
-__global__ void kernel_compute_tensor_metadata(
+CUDF_KERNEL void kernel_compute_tensor_metadata(
   // input
   uint32_t const* token_ids,
-  cudf::size_type const* offsets,
+  int64_t const* offsets,
   uint32_t const* row2tensor,
   uint32_t const* row2row_within_tensor,
   uint32_t max_sequence_length,
@@ -71,15 +74,10 @@ __global__ void kernel_compute_tensor_metadata(
   uint32_t* attn_mask,
   uint32_t* metadata)
 {
-  cudf::thread_index_type const output_idx =
-    threadIdx.x + static_cast<cudf::thread_index_type>(blockIdx.x) *
-                    static_cast<cudf::thread_index_type>(blockDim.x);
-  if (output_idx >= (static_cast<cudf::thread_index_type>(nrows_tensor_token_ids) *
-                     static_cast<cudf::thread_index_type>(max_sequence_length))) {
-    return;
-  }
+  auto const output_idx = cudf::detail::grid_1d::global_thread_id();
 
-  uint32_t const absolute_row_id         = output_idx / max_sequence_length;
+  uint32_t const absolute_row_id = output_idx / max_sequence_length;
+  if (absolute_row_id >= nrows_tensor_token_ids) { return; }
   uint32_t const tensor_id               = row2tensor[absolute_row_id];
   uint32_t const row_within_tensor       = row2row_within_tensor[absolute_row_id];
   uint32_t const offset_token_ids_tensor = offsets[tensor_id];
@@ -138,7 +136,7 @@ __global__ void kernel_compute_tensor_metadata(
 tokenizer_result build_empty_result(cudf::size_type size,
                                     uint32_t max_sequence_length,
                                     rmm::cuda_stream_view stream,
-                                    rmm::mr::device_memory_resource* mr)
+                                    rmm::device_async_resource_ref mr)
 {
   auto zero = cudf::numeric_scalar<uint32_t>(0, true, stream);
   auto ids  = cudf::detail::sequence(size * max_sequence_length, zero, zero, stream, mr);
@@ -165,7 +163,7 @@ tokenizer_result subword_tokenize(cudf::strings_column_view const& strings,
                                   bool do_lower_case,
                                   bool do_truncate,
                                   rmm::cuda_stream_view stream,
-                                  rmm::mr::device_memory_resource* mr)
+                                  rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(stride <= max_sequence_length,
                "stride must be less than or equal to max_sequence_length");
@@ -183,16 +181,11 @@ tokenizer_result subword_tokenize(cudf::strings_column_view const& strings,
     "max_sequence_length times number of input rows exceeds the column size limit",
     std::overflow_error);
 
-  auto const offsets   = strings.offsets();
-  auto const d_offsets = offsets.data<cudf::size_type>() + strings.offset();
-  auto const offset  = cudf::detail::get_value<cudf::size_type>(offsets, strings.offset(), stream);
-  auto const d_chars = strings.chars().data<char>() + offset;
-
   // Create tokenizer
   wordpiece_tokenizer tokenizer(
     vocab_table, max_sequence_length, stride, do_truncate, do_lower_case);
   // Run tokenizer
-  auto const tokens = tokenizer.tokenize(d_chars, d_offsets, strings_count, stream);
+  auto const tokens = tokenizer.tokenize(strings, stream);
   // assign output components
   auto device_token_ids = tokens.first->data();
   auto device_offsets   = tokens.second->data();
@@ -217,7 +210,7 @@ tokenizer_result subword_tokenize(cudf::strings_column_view const& strings,
       return 1 + ((num_tokens - max_sequence_length + stride - 1) / stride);
     },
     uint32_t{0},
-    thrust::plus<uint32_t>());
+    cuda::std::plus<uint32_t>());
   // last element is the total number of output rows
   uint32_t const nrows_tensor_token_ids = offsets_per_tensor.element(strings_count, stream);
   // if there are no tokens at all, build a specific empty result
@@ -296,17 +289,12 @@ tokenizer_result subword_tokenize(cudf::strings_column_view const& strings,
                                   uint32_t stride,
                                   bool do_lower_case,
                                   bool do_truncate,
-                                  rmm::mr::device_memory_resource* mr)
+                                  rmm::cuda_stream_view stream,
+                                  rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::subword_tokenize(strings,
-                                  vocabulary_table,
-                                  max_sequence_length,
-                                  stride,
-                                  do_lower_case,
-                                  do_truncate,
-                                  cudf::get_default_stream(),
-                                  mr);
+  return detail::subword_tokenize(
+    strings, vocabulary_table, max_sequence_length, stride, do_lower_case, do_truncate, stream, mr);
 }
 
 }  // namespace nvtext

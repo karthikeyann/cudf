@@ -1,12 +1,13 @@
-# Copyright (c) 2021-2023, NVIDIA CORPORATION.
+# Copyright (c) 2021-2024, NVIDIA CORPORATION.
 
 import numpy as np
 import pandas as pd
 import pytest
 
 import cudf
-from cudf.core._compat import PANDAS_GE_150
-from cudf.testing._utils import NUMERIC_TYPES, assert_eq
+from cudf.core._compat import PANDAS_GE_220
+from cudf.testing import assert_eq
+from cudf.testing._utils import NUMERIC_TYPES, expect_warning_if
 from cudf.utils.dtypes import np_dtypes_to_pandas_dtypes
 
 
@@ -45,7 +46,7 @@ def test_can_cast_safely_same_kind():
     assert data.can_cast_safely(to_dtype)
 
     data = cudf.Series(
-        [np.finfo("float32").max * 2, 1.0], dtype="float64"
+        [float(np.finfo("float32").max) * 2, 1.0], dtype="float64"
     )._column
     to_dtype = np.dtype("float32")
     assert not data.can_cast_safely(to_dtype)
@@ -267,12 +268,7 @@ def test_to_numeric_downcast_large_float_pd_bug(data, downcast):
     expected = pd.to_numeric(ps, downcast=downcast)
     got = cudf.to_numeric(gs, downcast=downcast)
 
-    if PANDAS_GE_150:
-        assert_eq(expected, got)
-    else:
-        # Pandas bug: https://github.com/pandas-dev/pandas/issues/19729
-        with pytest.raises(AssertionError, match="Series are different"):
-            assert_eq(expected, got)
+    assert_eq(expected, got)
 
 
 @pytest.mark.parametrize(
@@ -350,12 +346,7 @@ def test_to_numeric_downcast_string_large_float(data, downcast):
         expected = pd.to_numeric(ps, downcast=downcast)
         got = cudf.to_numeric(gs, downcast=downcast)
 
-        if PANDAS_GE_150:
-            assert_eq(expected, got)
-        else:
-            # Pandas bug: https://github.com/pandas-dev/pandas/issues/19729
-            with pytest.raises(AssertionError, match="Series are different"):
-                assert_eq(expected, got)
+        assert_eq(expected, got)
     else:
         expected = pd.Series([np.inf, -np.inf])
         with pytest.warns(
@@ -383,8 +374,10 @@ def test_to_numeric_error(data, errors):
         ):
             cudf.to_numeric(data, errors=errors)
     else:
-        expect = pd.to_numeric(data, errors=errors)
-        got = cudf.to_numeric(data, errors=errors)
+        with expect_warning_if(PANDAS_GE_220 and errors == "ignore"):
+            expect = pd.to_numeric(data, errors=errors)
+        with expect_warning_if(errors == "ignore"):
+            got = cudf.to_numeric(data, errors=errors)
 
         assert_eq(expect, got)
 
@@ -425,3 +418,11 @@ def test_series_to_numeric_bool(data, downcast):
     got = cudf.to_numeric(gs, downcast=downcast)
 
     assert_eq(expect, got)
+
+
+@pytest.mark.parametrize("klass", [cudf.Series, pd.Series])
+def test_series_to_numeric_preserve_index_name(klass):
+    ser = klass(["1"] * 8, index=range(2, 10), name="name")
+    result = cudf.to_numeric(ser)
+    expected = cudf.Series([1] * 8, index=range(2, 10), name="name")
+    assert_eq(result, expected)

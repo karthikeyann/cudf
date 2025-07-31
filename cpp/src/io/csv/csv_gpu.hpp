@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@
 
 #pragma once
 
-#include <io/utilities/parsing_utils.cuh>
+#include "io/utilities/parsing_utils.cuh"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
@@ -199,7 +199,7 @@ device_span<uint64_t> remove_blank_rows(cudf::io::parse_options_view const& opti
  *
  * @return stats Histogram of each dtypes' occurrence for each column
  */
-std::vector<column_type_histogram> detect_column_types(
+cudf::detail::host_vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> data,
   device_span<column_parse::flags const> column_flags,

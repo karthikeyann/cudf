@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,13 +23,19 @@
 
 #include <cudf/io/orc_types.hpp>
 #include <cudf/io/types.hpp>
+#include <cudf/utilities/export.hpp>
 
 #include <optional>
 #include <variant>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace io {
+/**
+ * @addtogroup io_types
+ * @{
+ * @file
+ */
 
 /**
  * @brief Holds column names and buffers containing raw file-level and stripe-level statistics.
@@ -58,10 +64,12 @@ struct raw_orc_statistics {
  * @endcode
  *
  * @param src_info Dataset source
+ * @param stream CUDA stream used for device memory operations and kernel launches
  *
  * @return Column names and encoded ORC statistics
  */
-raw_orc_statistics read_raw_orc_statistics(source_info const& src_info);
+raw_orc_statistics read_raw_orc_statistics(
+  source_info const& src_info, rmm::cuda_stream_view stream = cudf::get_default_stream());
 
 /**
  * @brief Monostate type alias for the statistics variant.
@@ -147,12 +155,28 @@ struct timestamp_statistics : minmax_statistics<int64_t> {
   std::optional<uint32_t> maximum_nanos;  ///< nanoseconds part of the maximum
 };
 
-namespace orc {
-// forward declare the type that ProtobufReader uses. The `cudf::io::column_statistics` objects,
+/**
+ * @brief Variant type for ORC type-specific column statistics.
+ *
+ * The variant can hold any of the supported column statistics types.
+ */
+using statistics_type = std::variant<no_statistics,
+                                     integer_statistics,
+                                     double_statistics,
+                                     string_statistics,
+                                     bucket_statistics,
+                                     decimal_statistics,
+                                     date_statistics,
+                                     binary_statistics,
+                                     timestamp_statistics>;
+
+//! Orc I/O interfaces
+namespace orc::detail {
+// forward declare the type that protobuf_reader uses. The `cudf::io::column_statistics` objects,
 // returned from `read_parsed_orc_statistics`, are constructed from
-// `cudf::io::orc::column_statistics` objects that `ProtobufReader` initializes.
+// `cudf::io::orc::detail::column_statistics` objects that `protobuf_reader` initializes.
 struct column_statistics;
-}  // namespace orc
+}  // namespace orc::detail
 
 /**
  * @brief Contains per-column ORC statistics.
@@ -163,23 +187,14 @@ struct column_statistics;
 struct column_statistics {
   std::optional<uint64_t> number_of_values;  ///< number of statistics
   std::optional<bool> has_null;              ///< column has any nulls
-  std::variant<no_statistics,
-               integer_statistics,
-               double_statistics,
-               string_statistics,
-               bucket_statistics,
-               decimal_statistics,
-               date_statistics,
-               binary_statistics,
-               timestamp_statistics>
-    type_specific_stats;  ///< type-specific statistics
+  statistics_type type_specific_stats;       ///< type-specific statistics
 
   /**
    * @brief Construct a new column statistics object
    *
    * @param detail_statistics The statistics to initialize the object with
    */
-  column_statistics(orc::column_statistics&& detail_statistics);
+  column_statistics(orc::detail::column_statistics&& detail_statistics);
 };
 
 /**
@@ -201,10 +216,12 @@ struct parsed_orc_statistics {
  * @ingroup io_readers
  *
  * @param src_info Dataset source
+ * @param stream CUDA stream used for device memory operations and kernel launches
  *
  * @return Column names and decoded ORC statistics
  */
-parsed_orc_statistics read_parsed_orc_statistics(source_info const& src_info);
+parsed_orc_statistics read_parsed_orc_statistics(
+  source_info const& src_info, rmm::cuda_stream_view stream = cudf::get_default_stream());
 
 /**
  * @brief Schema of an ORC column, including the nested columns.
@@ -321,7 +338,7 @@ class orc_metadata {
    * @param num_rows number of rows
    * @param num_stripes number of stripes
    */
-  orc_metadata(orc_schema schema, size_type num_rows, size_type num_stripes)
+  orc_metadata(orc_schema schema, uint64_t num_rows, size_type num_stripes)
     : _schema{std::move(schema)}, _num_rows{num_rows}, _num_stripes{num_stripes}
   {
   }
@@ -352,7 +369,7 @@ class orc_metadata {
 
  private:
   orc_schema _schema;
-  size_type _num_rows;
+  uint64_t _num_rows;
   size_type _num_stripes;
 };
 
@@ -362,10 +379,13 @@ class orc_metadata {
  * @ingroup io_readers
  *
  * @param src_info Dataset source
+ * @param stream CUDA stream used for device memory operations and kernel launches
  *
  * @return orc_metadata with ORC schema, number of rows and number of stripes.
  */
-orc_metadata read_orc_metadata(source_info const& src_info);
+orc_metadata read_orc_metadata(source_info const& src_info,
+                               rmm::cuda_stream_view stream = cudf::get_default_stream());
 
+/** @} */  // end of group
 }  // namespace io
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

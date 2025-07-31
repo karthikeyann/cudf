@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,15 +15,17 @@
  */
 
 #include "group_reductions.hpp"
-#include <quantiles/quantiles_util.hpp>
+#include "quantiles/quantiles_util.hpp"
 
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/aggregation/aggregation.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/dictionary/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -82,15 +84,15 @@ struct calculate_quantile_fn {
 
 struct quantiles_functor {
   template <typename T>
-  std::enable_if_t<std::is_arithmetic_v<T>, std::unique_ptr<column>> operator()(
-    column_view const& values,
-    column_view const& group_sizes,
-    cudf::device_span<size_type const> group_offsets,
-    size_type const num_groups,
-    device_span<double const> quantile,
-    interpolation interpolation,
-    rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr)
+  std::unique_ptr<column> operator()(column_view const& values,
+                                     column_view const& group_sizes,
+                                     cudf::device_span<size_type const> group_offsets,
+                                     size_type const num_groups,
+                                     device_span<double const> quantile,
+                                     interpolation interpolation,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
+    requires(std::is_arithmetic_v<T>)
   {
     using ResultType = cudf::detail::target_type_t<T, aggregation::QUANTILE>;
 
@@ -107,7 +109,7 @@ struct quantiles_functor {
     auto values_view     = column_device_view::create(values, stream);
     auto group_size_view = column_device_view::create(group_sizes, stream);
     auto result_view     = mutable_column_device_view::create(result->mutable_view(), stream);
-    auto null_count      = rmm::device_scalar<cudf::size_type>(0, stream, mr);
+    auto null_count      = cudf::detail::device_scalar<cudf::size_type>(0, stream, mr);
 
     // For each group, calculate quantile
     if (!cudf::is_dictionary(values.type())) {
@@ -145,7 +147,8 @@ struct quantiles_functor {
   }
 
   template <typename T, typename... Args>
-  std::enable_if_t<!std::is_arithmetic_v<T>, std::unique_ptr<column>> operator()(Args&&...)
+  std::unique_ptr<column> operator()(Args&&...)
+    requires(!std::is_arithmetic_v<T>)
   {
     CUDF_FAIL("Only arithmetic types are supported in quantiles");
   }
@@ -161,10 +164,10 @@ std::unique_ptr<column> group_quantiles(column_view const& values,
                                         std::vector<double> const& quantiles,
                                         interpolation interp,
                                         rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::device_async_resource_ref mr)
 {
   auto dv_quantiles = cudf::detail::make_device_uvector_async(
-    quantiles, stream, rmm::mr::get_current_device_resource());
+    quantiles, stream, cudf::get_current_device_resource_ref());
 
   auto values_type = cudf::is_dictionary(values.type())
                        ? dictionary_column_view(values).keys().type()

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@
  */
 
 #include <cudf_test/base_fixture.hpp>
-#include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_list_utilities.hpp>
 #include <cudf_test/type_lists.hpp>
 
@@ -31,9 +31,8 @@ namespace testdata {
 // ----- most numerics
 
 template <typename T>
-std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool>,
-                 cudf::test::fixed_width_column_wrapper<T>>
-ascending()
+cudf::test::fixed_width_column_wrapper<T> ascending()
+  requires(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>)
 {
   return std::is_signed_v<T>
            ? cudf::test::fixed_width_column_wrapper<T>({std::numeric_limits<T>::lowest(),
@@ -54,9 +53,8 @@ ascending()
 }
 
 template <typename T>
-std::enable_if_t<std::is_arithmetic_v<T> && !std::is_same_v<T, bool>,
-                 cudf::test::fixed_width_column_wrapper<T>>
-descending()
+cudf::test::fixed_width_column_wrapper<T> descending()
+  requires(std::is_arithmetic_v<T> && !std::is_same_v<T, bool>)
 {
   return std::is_signed_v<T>
            ? cudf::test::fixed_width_column_wrapper<T>({std::numeric_limits<T>::max(),
@@ -97,13 +95,15 @@ auto nulls_before()
 // ----- bool
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, bool>, cudf::test::fixed_width_column_wrapper<bool>> ascending()
+cudf::test::fixed_width_column_wrapper<bool> ascending()
+  requires(std::is_same_v<T, bool>)
 {
   return cudf::test::fixed_width_column_wrapper<bool>({false, false, true, true});
 }
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, bool>, cudf::test::fixed_width_column_wrapper<bool>> descending()
+cudf::test::fixed_width_column_wrapper<bool> descending()
+  requires(std::is_same_v<T, bool>)
 {
   return cudf::test::fixed_width_column_wrapper<bool>({true, true, false, false});
 }
@@ -111,13 +111,15 @@ std::enable_if_t<std::is_same_v<T, bool>, cudf::test::fixed_width_column_wrapper
 // ----- chrono types
 
 template <typename T>
-std::enable_if_t<cudf::is_chrono<T>(), cudf::test::fixed_width_column_wrapper<T>> ascending()
+cudf::test::fixed_width_column_wrapper<T> ascending()
+  requires(cudf::is_chrono<T>())
 {
   return cudf::test::fixed_width_column_wrapper<T>({T::min(), T::max()});
 }
 
 template <typename T>
-std::enable_if_t<cudf::is_chrono<T>(), cudf::test::fixed_width_column_wrapper<T>> descending()
+cudf::test::fixed_width_column_wrapper<T> descending()
+  requires(cudf::is_chrono<T>())
 {
   return cudf::test::fixed_width_column_wrapper<T>({T::max(), T::min()});
 }
@@ -125,15 +127,15 @@ std::enable_if_t<cudf::is_chrono<T>(), cudf::test::fixed_width_column_wrapper<T>
 // ----- string_view
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, cudf::string_view>, cudf::test::strings_column_wrapper>
-ascending()
+cudf::test::strings_column_wrapper ascending()
+  requires(std::is_same_v<T, cudf::string_view>)
 {
   return cudf::test::strings_column_wrapper({"A", "B"});
 }
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, cudf::string_view>, cudf::test::strings_column_wrapper>
-descending()
+cudf::test::strings_column_wrapper descending()
+  requires(std::is_same_v<T, cudf::string_view>)
 {
   return cudf::test::strings_column_wrapper({"B", "A"});
 }
@@ -147,20 +149,20 @@ auto empty<cudf::string_view>()
 template <>
 auto nulls_after<cudf::string_view>()
 {
-  return cudf::test::strings_column_wrapper({"identical", "identical"}, {1, 0});
+  return cudf::test::strings_column_wrapper({"identical", "identical"}, {true, false});
 }
 
 template <>
 auto nulls_before<cudf::string_view>()
 {
-  return cudf::test::strings_column_wrapper({"identical", "identical"}, {0, 1});
+  return cudf::test::strings_column_wrapper({"identical", "identical"}, {false, true});
 }
 
 // ----- struct_view {"nestedInt" : {"Int" : 0 }, "float" : 1}
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, cudf::struct_view>, cudf::test::structs_column_wrapper>
-ascending()
+cudf::test::structs_column_wrapper ascending()
+  requires(std::is_same_v<T, cudf::struct_view>)
 {
   using T1     = int32_t;
   auto int_col = cudf::test::fixed_width_column_wrapper<int32_t>({std::numeric_limits<T1>::lowest(),
@@ -178,8 +180,8 @@ ascending()
 }
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, cudf::struct_view>, cudf::test::structs_column_wrapper>
-descending()
+cudf::test::structs_column_wrapper descending()
+  requires(std::is_same_v<T, cudf::struct_view>)
 {
   using T1 = int32_t;
   auto int_col =
@@ -212,7 +214,7 @@ auto nulls_after<cudf::struct_view>()
   auto int_col = cudf::test::fixed_width_column_wrapper<int32_t>({1, 1});
   auto col1    = cudf::test::structs_column_wrapper{{int_col}};
   auto col2    = cudf::test::fixed_width_column_wrapper<float>({1, 1});
-  return cudf::test::structs_column_wrapper{{col1, col2}, {1, 0}};
+  return cudf::test::structs_column_wrapper{{col1, col2}, {true, false}};
 }
 
 template <>
@@ -221,7 +223,7 @@ auto nulls_before<cudf::struct_view>()
   auto int_col = cudf::test::fixed_width_column_wrapper<int32_t>({1, 1});
   auto col1    = cudf::test::structs_column_wrapper{{int_col}};
   auto col2    = cudf::test::fixed_width_column_wrapper<float>({1, 1});
-  return cudf::test::structs_column_wrapper{{col1, col2}, {0, 1}};
+  return cudf::test::structs_column_wrapper{{col1, col2}, {false, true}};
 }
 
 using lcw = cudf::test::lists_column_wrapper<int32_t>;
@@ -238,7 +240,8 @@ List<List<List<int>
 */
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, cudf::list_view>, lcw> ascending()
+lcw ascending()
+  requires(std::is_same_v<T, cudf::list_view>)
 {
   return lcw{lcw{lcw{lcw{0}}, lcw{lcw{0}}, lcw{lcw{0}}},
              lcw{lcw{lcw{0}, lcw{0}, lcw{0}}},
@@ -248,7 +251,8 @@ std::enable_if_t<std::is_same_v<T, cudf::list_view>, lcw> ascending()
 }
 
 template <typename T>
-std::enable_if_t<std::is_same_v<T, cudf::list_view>, lcw> descending()
+lcw descending()
+  requires(std::is_same_v<T, cudf::list_view>)
 {
   return lcw{lcw{lcw{lcw{0, 0, 0}}, lcw{lcw{0}}, lcw{lcw{0}}},
              lcw{lcw{lcw{0, 0, 0}}},

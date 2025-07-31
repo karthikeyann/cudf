@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -32,11 +32,6 @@ static void bench_extract(nvbench::state& state)
   auto const num_rows  = static_cast<cudf::size_type>(state.get_int64("num_rows"));
   auto const row_width = static_cast<cudf::size_type>(state.get_int64("row_width"));
 
-  if (static_cast<std::size_t>(num_rows) * static_cast<std::size_t>(row_width) >=
-      static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
-    state.skip("Skip benchmarks greater than size_type limit");
-  }
-
   auto groups = static_cast<cudf::size_type>(state.get_int64("groups"));
 
   std::default_random_engine generator;
@@ -67,10 +62,9 @@ static void bench_extract(nvbench::state& state)
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
   // gather some throughput statistics as well
-  auto chars_size = strings_view.chars_size();
-  state.add_element_count(chars_size, "chars_size");            // number of bytes;
-  state.add_global_memory_reads<nvbench::int8_t>(chars_size);   // all bytes are read;
-  state.add_global_memory_writes<nvbench::int8_t>(chars_size);  // all bytes are written
+  auto data_size = input->alloc_size();
+  state.add_global_memory_reads<nvbench::int8_t>(data_size);   // all bytes are read;
+  state.add_global_memory_writes<nvbench::int8_t>(data_size);  // all bytes are written
 
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
     auto result = cudf::strings::extract(strings_view, *prog);
@@ -79,6 +73,6 @@ static void bench_extract(nvbench::state& state)
 
 NVBENCH_BENCH(bench_extract)
   .set_name("extract")
-  .add_int64_axis("row_width", {32, 64, 128, 256, 512, 1024, 2048})
-  .add_int64_axis("num_rows", {4096, 32768, 262144, 2097152, 16777216})
+  .add_int64_axis("row_width", {32, 64, 128, 256})
+  .add_int64_axis("num_rows", {32768, 262144, 2097152})
   .add_int64_axis("groups", {1, 2, 4});

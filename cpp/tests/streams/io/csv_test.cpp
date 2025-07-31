@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,13 @@
  * limitations under the License.
  */
 
-#include <cudf/io/csv.hpp>
-#include <cudf/io/detail/csv.hpp>
-#include <cudf/table/table.hpp>
-#include <cudf/table/table_view.hpp>
-#include <cudf/types.hpp>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/default_stream.hpp>
-#include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/testing_main.hpp>
+
+#include <cudf/io/csv.hpp>
+#include <cudf/table/table_view.hpp>
 
 #include <string>
 #include <vector>
@@ -39,12 +36,6 @@ TEST_F(CSVTest, CSVWriter)
 
   std::vector<size_t> zeros(num_rows, 0);
   std::vector<size_t> ones(num_rows, 1);
-  auto col6_data = cudf::detail::make_counting_transform_iterator(0, [&](auto i) {
-    return numeric::decimal128{ones[i], numeric::scale_type{12}};
-  });
-  auto col7_data = cudf::detail::make_counting_transform_iterator(0, [&](auto i) {
-    return numeric::decimal128{ones[i], numeric::scale_type{-12}};
-  });
 
   cudf::test::fixed_width_column_wrapper<bool> col0(zeros.begin(), zeros.end());
   cudf::test::fixed_width_column_wrapper<int8_t> col1(zeros.begin(), zeros.end());
@@ -52,8 +43,10 @@ TEST_F(CSVTest, CSVWriter)
   cudf::test::fixed_width_column_wrapper<int32_t> col3(zeros.begin(), zeros.end());
   cudf::test::fixed_width_column_wrapper<float> col4(zeros.begin(), zeros.end());
   cudf::test::fixed_width_column_wrapper<double> col5(zeros.begin(), zeros.end());
-  cudf::test::fixed_width_column_wrapper<numeric::decimal128> col6(col6_data, col6_data + num_rows);
-  cudf::test::fixed_width_column_wrapper<numeric::decimal128> col7(col7_data, col7_data + num_rows);
+  cudf::test::fixed_point_column_wrapper<numeric::decimal128::rep> col6(
+    ones.begin(), ones.end(), numeric::scale_type{12});
+  cudf::test::fixed_point_column_wrapper<numeric::decimal128::rep> col7(
+    ones.begin(), ones.end(), numeric::scale_type{-12});
 
   std::vector<std::string> col8_data(num_rows, "rapids");
   cudf::test::strings_column_wrapper col8(col8_data.begin(), col8_data.end());
@@ -72,12 +65,6 @@ TEST_F(CSVTest, CSVReader)
 
   std::vector<size_t> zeros(num_rows, 0);
   std::vector<size_t> ones(num_rows, 1);
-  auto col6_data = cudf::detail::make_counting_transform_iterator(0, [&](auto i) {
-    return numeric::decimal128{ones[i], numeric::scale_type{12}};
-  });
-  auto col7_data = cudf::detail::make_counting_transform_iterator(0, [&](auto i) {
-    return numeric::decimal128{ones[i], numeric::scale_type{-12}};
-  });
 
   cudf::test::fixed_width_column_wrapper<bool> col0(zeros.begin(), zeros.end());
   cudf::test::fixed_width_column_wrapper<int8_t> col1(zeros.begin(), zeros.end());
@@ -85,8 +72,10 @@ TEST_F(CSVTest, CSVReader)
   cudf::test::fixed_width_column_wrapper<int32_t> col3(zeros.begin(), zeros.end());
   cudf::test::fixed_width_column_wrapper<float> col4(zeros.begin(), zeros.end());
   cudf::test::fixed_width_column_wrapper<double> col5(zeros.begin(), zeros.end());
-  cudf::test::fixed_width_column_wrapper<numeric::decimal128> col6(col6_data, col6_data + num_rows);
-  cudf::test::fixed_width_column_wrapper<numeric::decimal128> col7(col7_data, col7_data + num_rows);
+  cudf::test::fixed_point_column_wrapper<numeric::decimal128::rep> col6(
+    ones.begin(), ones.end(), numeric::scale_type{12});
+  cudf::test::fixed_point_column_wrapper<numeric::decimal128::rep> col7(
+    ones.begin(), ones.end(), numeric::scale_type{-12});
 
   std::vector<std::string> col8_data(num_rows, "rapids");
   cudf::test::strings_column_wrapper col8(col8_data.begin(), col8_data.end());
@@ -102,3 +91,5 @@ TEST_F(CSVTest, CSVReader)
     cudf::io::csv_reader_options::builder(cudf::io::source_info{filepath}).build();
   cudf::io::read_csv(r_options, cudf::test::get_default_stream());
 }
+
+CUDF_TEST_PROGRAM_MAIN()

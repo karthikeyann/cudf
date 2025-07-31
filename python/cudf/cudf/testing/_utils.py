@@ -1,13 +1,14 @@
-# Copyright (c) 2020-2023, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
+from __future__ import annotations
 
 import itertools
 import string
-import warnings
+import time
 from collections import abc
 from contextlib import contextmanager
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
-import cupy
 import numpy as np
 import pandas as pd
 import pytest
@@ -15,15 +16,24 @@ from numba.core.typing import signature as nb_signature
 from numba.core.typing.templates import AbstractTemplate
 from numba.cuda.cudadecl import registry as cuda_decl_registry
 from numba.cuda.cudaimpl import lower as cuda_lower
-from pandas import testing as tm
+
+import pylibcudf as plc
 
 import cudf
-from cudf._lib.null_mask import bitmask_allocation_size_bytes
-from cudf.api.types import is_scalar
-from cudf.core.column.timedelta import _unit_to_nanoseconds_conversion
-from cudf.core.udf.strings_lowering import cast_string_view_to_udf_string
-from cudf.core.udf.strings_typing import StringView, string_view, udf_string
+from cudf.core.column.column import as_column
+from cudf.core.udf.strings_lowering import (
+    cast_string_view_to_managed_udf_string,
+)
+from cudf.core.udf.strings_typing import (
+    StringView,
+    managed_udf_string,
+    string_view,
+)
 from cudf.utils import dtypes as dtypeutils
+from cudf.utils.temporal import unit_to_nanoseconds_conversion
+
+if TYPE_CHECKING:
+    from cudf.core.column.column import ColumnBase
 
 supported_numpy_dtypes = [
     "bool",
@@ -94,8 +104,9 @@ def random_bitmask(size):
     size : int
         number of bits
     """
-    sz = bitmask_allocation_size_bytes(size)
-    data = np.random.randint(0, 255, dtype="u1", size=sz)
+    sz = plc.null_mask.bitmask_allocation_size_bytes(size)
+    rng = np.random.default_rng(seed=0)
+    data = rng.integers(0, 255, dtype="u1", size=sz)
     return data.view("i1")
 
 
@@ -112,81 +123,6 @@ def expand_bits_to_bytes(arr):
 def count_zero(arr):
     arr = np.asarray(arr)
     return np.count_nonzero(arr == 0)
-
-
-def assert_eq(left, right, **kwargs):
-    """Assert that two cudf-like things are equivalent
-
-    This equality test works for pandas/cudf dataframes/series/indexes/scalars
-    in the same way, and so makes it easier to perform parametrized testing
-    without switching between assert_frame_equal/assert_series_equal/...
-    functions.
-    """
-    # dtypes that we support but Pandas doesn't will convert to
-    # `object`. Check equality before that happens:
-    if kwargs.get("check_dtype", True):
-        if hasattr(left, "dtype") and hasattr(right, "dtype"):
-            if isinstance(
-                left.dtype, cudf.core.dtypes._BaseDtype
-            ) and not isinstance(
-                left.dtype, cudf.CategoricalDtype
-            ):  # leave categorical comparison to Pandas
-                assert_eq(left.dtype, right.dtype)
-
-    if hasattr(left, "to_pandas"):
-        left = left.to_pandas()
-    if hasattr(right, "to_pandas"):
-        right = right.to_pandas()
-    if isinstance(left, cupy.ndarray):
-        left = cupy.asnumpy(left)
-    if isinstance(right, cupy.ndarray):
-        right = cupy.asnumpy(right)
-
-    if isinstance(left, (pd.DataFrame, pd.Series, pd.Index)):
-        # TODO: A warning is emitted from the function
-        # pandas.testing.assert_[series, frame, index]_equal for some inputs:
-        # "DeprecationWarning: elementwise comparison failed; this will raise
-        # an error in the future."
-        # or "FutureWarning: elementwise ..."
-        # This warning comes from a call from pandas to numpy. It is ignored
-        # here because it cannot be fixed within cudf.
-        with warnings.catch_warnings():
-            warnings.simplefilter(
-                "ignore", (DeprecationWarning, FutureWarning)
-            )
-            if isinstance(left, pd.DataFrame):
-                tm.assert_frame_equal(left, right, **kwargs)
-            elif isinstance(left, pd.Series):
-                tm.assert_series_equal(left, right, **kwargs)
-            else:
-                tm.assert_index_equal(left, right, **kwargs)
-
-    elif isinstance(left, np.ndarray) and isinstance(right, np.ndarray):
-        if np.issubdtype(left.dtype, np.floating) and np.issubdtype(
-            right.dtype, np.floating
-        ):
-            assert np.allclose(left, right, equal_nan=True)
-        else:
-            assert np.array_equal(left, right)
-    else:
-        # Use the overloaded __eq__ of the operands
-        if left == right:
-            return True
-        elif any(np.issubdtype(type(x), np.floating) for x in (left, right)):
-            np.testing.assert_almost_equal(left, right)
-        else:
-            np.testing.assert_equal(left, right)
-    return True
-
-
-def assert_neq(left, right, **kwargs):
-    __tracebackhide__ = True
-    try:
-        assert_eq(left, right, **kwargs)
-    except AssertionError:
-        pass
-    else:
-        raise AssertionError
 
 
 def assert_exceptions_equal(
@@ -287,9 +223,10 @@ def _get_args_kwars_for_assert_exceptions(func_args_and_kwargs):
 
 
 def gen_rand(dtype, size, **kwargs):
+    rng = np.random.default_rng(seed=kwargs.get("seed", 0))
     dtype = cudf.dtype(dtype)
     if dtype.kind == "f":
-        res = np.random.random(size=size).astype(dtype)
+        res = rng.random(size=size).astype(dtype)
         if kwargs.get("positive_only", False):
             return res
         else:
@@ -297,41 +234,39 @@ def gen_rand(dtype, size, **kwargs):
     elif dtype == np.int8 or dtype == np.int16:
         low = kwargs.get("low", -32)
         high = kwargs.get("high", 32)
-        return np.random.randint(low=low, high=high, size=size).astype(dtype)
+        return rng.integers(low=low, high=high, size=size).astype(dtype)
     elif dtype.kind == "i":
         low = kwargs.get("low", -10000)
         high = kwargs.get("high", 10000)
-        return np.random.randint(low=low, high=high, size=size).astype(dtype)
+        return rng.integers(low=low, high=high, size=size).astype(dtype)
     elif dtype == np.uint8 or dtype == np.uint16:
         low = kwargs.get("low", 0)
         high = kwargs.get("high", 32)
-        return np.random.randint(low=low, high=high, size=size).astype(dtype)
+        return rng.integers(low=low, high=high, size=size).astype(dtype)
     elif dtype.kind == "u":
         low = kwargs.get("low", 0)
         high = kwargs.get("high", 128)
-        return np.random.randint(low=low, high=high, size=size).astype(dtype)
+        return rng.integers(low=low, high=high, size=size).astype(dtype)
     elif dtype.kind == "b":
         low = kwargs.get("low", 0)
         high = kwargs.get("high", 2)
-        return np.random.randint(low=low, high=high, size=size).astype(
-            np.bool_
-        )
+        return rng.integers(low=low, high=high, size=size).astype(np.bool_)
     elif dtype.kind == "M":
         low = kwargs.get("low", 0)
         time_unit, _ = np.datetime_data(dtype)
         high = kwargs.get(
             "high",
-            int(1e18) / _unit_to_nanoseconds_conversion[time_unit],
+            int(1e18) / unit_to_nanoseconds_conversion[time_unit],
         )
         return pd.to_datetime(
-            np.random.randint(low=low, high=high, size=size), unit=time_unit
+            rng.integers(low=low, high=high, size=size), unit=time_unit
         )
     elif dtype.kind in ("O", "U"):
         low = kwargs.get("low", 10)
         high = kwargs.get("high", 11)
-        nchars = np.random.randint(low=low, high=high, size=1)[0]
+        nchars = rng.integers(low=low, high=high, size=1)[0]
         char_options = np.array(list(string.ascii_letters + string.digits))
-        all_chars = "".join(np.random.choice(char_options, nchars * size))
+        all_chars = "".join(rng.choice(char_options, nchars * size))
         return np.array(
             [all_chars[nchars * i : nchars * (i + 1)] for i in range(size)]
         )
@@ -342,7 +277,9 @@ def gen_rand(dtype, size, **kwargs):
 def gen_rand_series(dtype, size, **kwargs):
     values = gen_rand(dtype, size, **kwargs)
     if kwargs.get("has_nulls", False):
-        return cudf.Series.from_masked_array(values, random_bitmask(size))
+        return cudf.Series._from_column(
+            as_column(values).set_mask(random_bitmask(size))
+        )
 
     return cudf.Series(values)
 
@@ -359,9 +296,7 @@ def does_not_raise():
     yield
 
 
-def assert_column_memory_eq(
-    lhs: cudf.core.column.ColumnBase, rhs: cudf.core.column.ColumnBase
-):
+def assert_column_memory_eq(lhs: ColumnBase, rhs: ColumnBase):
     """Assert the memory location and size of `lhs` and `rhs` are equivalent.
 
     Both data pointer and mask pointer are checked. Also recursively check for
@@ -387,9 +322,7 @@ def assert_column_memory_eq(
         assert_column_memory_eq(lhs.codes, rhs.codes)
 
 
-def assert_column_memory_ne(
-    lhs: cudf.core.column.ColumnBase, rhs: cudf.core.column.ColumnBase
-):
+def assert_column_memory_ne(lhs: ColumnBase, rhs: ColumnBase):
     try:
         assert_column_memory_eq(lhs, rhs)
     except AssertionError:
@@ -397,30 +330,48 @@ def assert_column_memory_ne(
     raise AssertionError("lhs and rhs holds the same memory.")
 
 
-def _create_pandas_series_float64_default(
-    data=None, index=None, dtype=None, *args, **kwargs
+def assert_asserters_equal(
+    pandas_asserter,
+    cudf_asserter,
+    pandas_left,
+    pandas_right,
+    cudf_left,
+    cudf_right,
+    *args,
+    **kwargs,
 ):
-    # Wrapper around pd.Series using a float64
-    # default dtype for empty data to silence warnings.
-    # TODO: Remove this in pandas-2.0 upgrade
-    if dtype is None and (
-        data is None or (not is_scalar(data) and len(data) == 0)
-    ):
-        dtype = "float64"
-    return pd.Series(data=data, index=index, dtype=dtype, *args, **kwargs)
+    """
+    Assert that a pandas and cudf asserter have equivalent behavior.
 
-
-def _create_cudf_series_float64_default(
-    data=None, index=None, dtype=None, *args, **kwargs
-):
-    # Wrapper around cudf.Series using a float64
-    # default dtype for empty data to silence warnings.
-    # TODO: Remove this in pandas-2.0 upgrade
-    if dtype is None and (
-        data is None or (not is_scalar(data) and len(data) == 0)
-    ):
-        dtype = "float64"
-    return cudf.Series(data=data, index=index, dtype=dtype, *args, **kwargs)
+    Parameters
+    ----------
+    pandas_asserter : callable
+        A pandas asserter function.
+    cudf_asserter : callable
+        A cudf asserter function.
+    pandas_left : object
+        A pandas object as the left argument to the pandas asserter.
+    pandas_right : object
+        A pandas object as the right argument to the pandas asserter.
+    cudf_left : object
+        A cudf object as the left argument to the cudf asserter.
+    cudf_right : object
+        A cudf object as the right argument to the pandas asserter.
+    *args : tuple
+        Additional arguments to pass to both asserters.
+    **kwargs : dict
+        Additional keyword arguments to both asserters.
+    """
+    # TypeError is raised (erroneously from pandas) when comparing
+    # categorical indices with different categories.
+    exceptions = (AssertionError, TypeError)
+    try:
+        pandas_asserter(pandas_left, pandas_right, *args, **kwargs)
+    except exceptions:
+        with pytest.raises(exceptions):
+            cudf_asserter(cudf_left, cudf_right, *args, **kwargs)
+    else:
+        cudf_asserter(cudf_left, cudf_right, *args, **kwargs)
 
 
 parametrize_numeric_dtypes_pairwise = pytest.mark.parametrize(
@@ -442,9 +393,9 @@ def expect_warning_if(condition, warning=FutureWarning, *args, **kwargs):
         yield
 
 
-def sv_to_udf_str(sv):
+def sv_to_managed_udf_str(sv):
     """
-    Cast a string_view object to a udf_string object
+    Cast a string_view object to a managed_udf_string object
 
     This placeholder function never runs in python
     It exists only for numba to have something to replace
@@ -461,15 +412,36 @@ def sv_to_udf_str(sv):
     pass
 
 
-@cuda_decl_registry.register_global(sv_to_udf_str)
+@cuda_decl_registry.register_global(sv_to_managed_udf_str)
 class StringViewToUDFStringDecl(AbstractTemplate):
     def generic(self, args, kws):
         if isinstance(args[0], StringView) and len(args) == 1:
-            return nb_signature(udf_string, string_view)
+            return nb_signature(managed_udf_string, string_view)
 
 
-@cuda_lower(sv_to_udf_str, string_view)
+@cuda_lower(sv_to_managed_udf_str, string_view)
 def sv_to_udf_str_testing_lowering(context, builder, sig, args):
-    return cast_string_view_to_udf_string(
+    return cast_string_view_to_managed_udf_string(
         context, builder, sig.args[0], sig.return_type, args[0]
     )
+
+
+class cudf_timeout:
+    """
+    Context manager to raise a TimeoutError after a specified number of seconds.
+    """
+
+    def __init__(self, timeout):
+        self.timeout = timeout
+
+    def __enter__(self):
+        self.start_time = time.perf_counter()
+
+    def __exit__(self, *args):
+        elapsed_time = (
+            time.perf_counter() - self.start_time
+        )  # Calculate elapsed time
+        if elapsed_time >= self.timeout:
+            raise TimeoutError(
+                f"Expected to finish in {self.timeout=} seconds but took {elapsed_time=} seconds"
+            )

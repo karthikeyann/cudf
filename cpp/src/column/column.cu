@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -30,13 +30,14 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
-#include <thrust/iterator/transform_iterator.h>
-
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
+
+#include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
 #include <iterator>
@@ -46,9 +47,7 @@
 namespace cudf {
 
 // Copy ctor w/ optional stream/mr
-column::column(column const& other,
-               rmm::cuda_stream_view stream,
-               rmm::mr::device_memory_resource* mr)
+column::column(column const& other, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
   : _type{other._type},
     _size{other._size},
     _data{other._data, stream, mr},
@@ -84,6 +83,15 @@ column::contents column::release() noexcept
   return column::contents{std::make_unique<rmm::device_buffer>(std::move(_data)),
                           std::make_unique<rmm::device_buffer>(std::move(_null_mask)),
                           std::move(_children)};
+}
+
+std::size_t column::alloc_size() const
+{
+  return _data.size() + _null_mask.size() +
+         std::transform_reduce(
+           _children.begin(), _children.end(), std::size_t{0}, std::plus{}, [](auto const& c) {
+             return c->alloc_size();
+           });
 }
 
 // Create immutable view
@@ -160,19 +168,19 @@ namespace {
 struct create_column_from_view {
   cudf::column_view view;
   rmm::cuda_stream_view stream{cudf::get_default_stream()};
-  rmm::mr::device_memory_resource* mr;
+  rmm::device_async_resource_ref mr;
 
-  template <typename ColumnType,
-            std::enable_if_t<std::is_same_v<ColumnType, cudf::string_view>>* = nullptr>
+  template <typename ColumnType>
   std::unique_ptr<column> operator()()
+    requires(std::is_same_v<ColumnType, cudf::string_view>)
   {
     cudf::strings_column_view sview(view);
     return cudf::strings::detail::copy_slice(sview, 0, view.size(), stream, mr);
   }
 
-  template <typename ColumnType,
-            std::enable_if_t<std::is_same_v<ColumnType, cudf::dictionary32>>* = nullptr>
+  template <typename ColumnType>
   std::unique_ptr<column> operator()()
+    requires(std::is_same_v<ColumnType, cudf::dictionary32>)
   {
     std::vector<std::unique_ptr<column>> children;
     if (view.num_children()) {
@@ -194,8 +202,9 @@ struct create_column_from_view {
                                     std::move(children));
   }
 
-  template <typename ColumnType, std::enable_if_t<cudf::is_fixed_width<ColumnType>()>* = nullptr>
+  template <typename ColumnType>
   std::unique_ptr<column> operator()()
+    requires(cudf::is_fixed_width<ColumnType>())
   {
     auto op       = [&](auto const& child) { return std::make_unique<column>(child, stream, mr); };
     auto begin    = thrust::make_transform_iterator(view.child_begin(), op);
@@ -214,17 +223,17 @@ struct create_column_from_view {
       std::move(children));
   }
 
-  template <typename ColumnType,
-            std::enable_if_t<std::is_same_v<ColumnType, cudf::list_view>>* = nullptr>
+  template <typename ColumnType>
   std::unique_ptr<column> operator()()
+    requires(std::is_same_v<ColumnType, cudf::list_view>)
   {
     auto lists_view = lists_column_view(view);
     return cudf::lists::detail::copy_slice(lists_view, 0, view.size(), stream, mr);
   }
 
-  template <typename ColumnType,
-            std::enable_if_t<std::is_same_v<ColumnType, cudf::struct_view>>* = nullptr>
+  template <typename ColumnType>
   std::unique_ptr<column> operator()()
+    requires(std::is_same_v<ColumnType, cudf::struct_view>)
   {
     if (view.is_empty()) { return cudf::empty_like(view); }
 
@@ -254,7 +263,7 @@ struct create_column_from_view {
 }  // anonymous namespace
 
 // Copy from a view
-column::column(column_view view, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr)
+column::column(column_view view, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr)
   :  // Move is needed here because the dereference operator of unique_ptr returns
      // an lvalue reference, which would otherwise dispatch to the copy constructor
     column{std::move(*type_dispatcher(view.type(), create_column_from_view{view, stream, mr}))}

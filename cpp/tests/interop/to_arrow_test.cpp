@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,28 +14,30 @@
  * limitations under the License.
  */
 
+#include <tests/interop/arrow_utils.hpp>
+
+#include <cudf_test/base_fixture.hpp>
+#include <cudf_test/column_utilities.hpp>
+#include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/testing_main.hpp>
+#include <cudf_test/type_lists.hpp>
+
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/detail/copy.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/interop.hpp>
+#include <cudf/lists/lists_column_view.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 
-#include <cudf_test/base_fixture.hpp>
-#include <cudf_test/column_utilities.hpp>
-#include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/table_utilities.hpp>
-#include <cudf_test/type_lists.hpp>
-
-#include <tests/interop/arrow_utils.hpp>
-
 #include <thrust/iterator/counting_iterator.h>
+
+#include <arrow/c/bridge.h>
 
 using vector_of_columns = std::vector<std::unique_ptr<cudf::column>>;
 
@@ -61,7 +63,6 @@ std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> get_table
   auto validity_generator = []() { return rand() % 7 != 0; };
   std::generate(
     list_int64_data_validity.begin(), list_int64_data_validity.end(), validity_generator);
-  // cudf::size_type n = 0;
   std::generate(
     list_offsets.begin(), list_offsets.end(), [length_of_individual_list, n = 0]() mutable {
       return (n++) * length_of_individual_list;
@@ -85,8 +86,7 @@ std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> get_table
       .release());
   auto col4 = cudf::test::fixed_width_column_wrapper<int64_t>(
     int64_data.begin(), int64_data.end(), validity.begin());
-  auto dict_col = cudf::dictionary::encode(col4);
-  columns.emplace_back(std::move(cudf::dictionary::encode(col4)));
+  columns.emplace_back(cudf::dictionary::encode(col4));
   columns.emplace_back(cudf::test::fixed_width_column_wrapper<bool>(
                          bool_data.begin(), bool_data.end(), bool_validity.begin())
                          .release());
@@ -108,8 +108,8 @@ std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> get_table
     cudf::test::strings_column_wrapper(string_data.begin(), string_data.end(), validity.begin())
       .release();
   vector_of_columns cols;
-  cols.push_back(move(int_column));
-  cols.push_back(move(str_column));
+  cols.push_back(std::move(int_column));
+  cols.push_back(std::move(str_column));
   auto [null_mask, null_count] = cudf::bools_to_mask(cudf::test::fixed_width_column_wrapper<bool>(
     bool_data_validity.begin(), bool_data_validity.end()));
   columns.emplace_back(
@@ -118,9 +118,10 @@ std::pair<std::unique_ptr<cudf::table>, std::shared_ptr<arrow::Table>> get_table
   auto int64array = get_arrow_array<int64_t>(int64_data, validity);
 
   auto string_array = get_arrow_array<cudf::string_view>(string_data, validity);
+  auto dict_col     = cudf::dictionary::encode(col4);
   cudf::dictionary_column_view view(dict_col->view());
   auto keys       = cudf::test::to_host<int64_t>(view.keys()).first;
-  auto indices    = cudf::test::to_host<uint32_t>(view.indices()).first;
+  auto indices    = cudf::test::to_host<int32_t>(view.indices()).first;
   auto dict_array = get_arrow_dict_array(std::vector<int64_t>(keys.begin(), keys.end()),
                                          std::vector<int32_t>(indices.begin(), indices.end()),
                                          validity);
@@ -160,6 +161,21 @@ struct ToArrowTest : public cudf::test::BaseFixture {};
 template <typename T>
 struct ToArrowTestDurationsTest : public cudf::test::BaseFixture {};
 
+auto is_equal(cudf::table_view const& table,
+              cudf::host_span<cudf::column_metadata const> metadata,
+              std::shared_ptr<arrow::Table> expected_arrow_table)
+{
+  auto got_arrow_schema = cudf::to_arrow_schema(table, metadata);
+  auto got_arrow_table  = cudf::to_arrow_host(table);
+
+  for (auto i = 0; i < got_arrow_schema->n_children; ++i) {
+    auto arr = arrow::ImportArray(got_arrow_table->array.children[i], got_arrow_schema->children[i])
+                 .ValueOrDie();
+    if (!expected_arrow_table->column(i)->Equals(arrow::ChunkedArray(arr))) { return false; }
+  }
+  return true;
+}
+
 TYPED_TEST_SUITE(ToArrowTestDurationsTest, cudf::test::DurationTypes);
 
 TEST_F(ToArrowTest, EmptyTable)
@@ -171,10 +187,9 @@ TEST_F(ToArrowTest, EmptyTable)
   auto struct_meta          = cudf::column_metadata{"f"};
   struct_meta.children_meta = {{"integral"}, {"string"}};
 
-  auto got_arrow_table =
-    cudf::to_arrow(cudf_table_view, {{"a"}, {"b"}, {"c"}, {"d"}, {"e"}, struct_meta});
-
-  ASSERT_EQ(expected_arrow_table->Equals(*got_arrow_table, true), true);
+  std::vector<cudf::column_metadata> const metadata = {
+    {"a"}, {"b"}, {"c"}, {"d"}, {"e"}, struct_meta};
+  ASSERT_TRUE(is_equal(cudf_table_view, metadata, expected_arrow_table));
 }
 
 TEST_F(ToArrowTest, DateTimeTable)
@@ -197,9 +212,8 @@ TEST_F(ToArrowTest, DateTimeTable)
 
   auto expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-  auto got_arrow_table = cudf::to_arrow(input_view, {{"a"}});
-
-  ASSERT_EQ(expected_arrow_table->Equals(*got_arrow_table, true), true);
+  std::vector<cudf::column_metadata> const metadata = {{"a"}};
+  ASSERT_TRUE(is_equal(input_view, metadata, expected_arrow_table));
 }
 
 TYPED_TEST(ToArrowTestDurationsTest, DurationTable)
@@ -230,9 +244,8 @@ TYPED_TEST(ToArrowTestDurationsTest, DurationTable)
 
   auto expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-  auto got_arrow_table = cudf::to_arrow(input_view, {{"a"}});
-
-  ASSERT_EQ(expected_arrow_table->Equals(*got_arrow_table, true), true);
+  std::vector<cudf::column_metadata> const metadata = {{"a"}};
+  ASSERT_TRUE(is_equal(input_view, metadata, expected_arrow_table));
 }
 
 TEST_F(ToArrowTest, NestedList)
@@ -245,21 +258,21 @@ TEST_F(ToArrowTest, NestedList)
 
   auto list_arr = get_arrow_list_array<int64_t>({6, 7, 8, 9}, {0, 1, 4}, {1, 0, 1, 1});
   std::vector<int32_t> offset{0, 0, 2};
-  auto mask_buffer     = arrow::internal::BytesToBits({0, 1}).ValueOrDie();
-  auto nested_list_arr = std::make_shared<arrow::ListArray>(arrow::list(list(arrow::int64())),
-                                                            offset.size() - 1,
-                                                            arrow::Buffer::Wrap(offset),
-                                                            list_arr,
-                                                            mask_buffer);
+  auto mask_buffer     = arrow::internal::BytesToBits(std::vector<uint8_t>({0, 1})).ValueOrDie();
+  auto nested_list_arr = std::make_shared<arrow::ListArray>(
+    arrow::list(arrow::field("element", arrow::list(arrow::int64()), false)),
+    offset.size() - 1,
+    arrow::Buffer::Wrap(offset),
+    list_arr,
+    mask_buffer);
 
   std::vector<std::shared_ptr<arrow::Field>> schema_vector(
-    {arrow::field("a", nested_list_arr->type())});
+    {arrow::field("a", nested_list_arr->type(), false)});
   auto schema = std::make_shared<arrow::Schema>(schema_vector);
 
-  auto expected_arrow_table = arrow::Table::Make(schema, {nested_list_arr});
-  auto got_arrow_table      = cudf::to_arrow(input_view, {{"a"}});
-
-  ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+  auto expected_arrow_table                         = arrow::Table::Make(schema, {nested_list_arr});
+  std::vector<cudf::column_metadata> const metadata = {{"a"}};
+  ASSERT_TRUE(is_equal(input_view, metadata, expected_arrow_table));
 }
 
 TEST_F(ToArrowTest, StructColumn)
@@ -278,9 +291,9 @@ TEST_F(ToArrowTest, StructColumn)
   auto int_col2 =
     cudf::test::fixed_width_column_wrapper<int32_t, int32_t>{{12, 24, 47}, {1, 0, 1}}.release();
   auto bool_col = cudf::test::fixed_width_column_wrapper<bool>{{true, true, false}}.release();
-  auto list_col =
-    cudf::test::lists_column_wrapper<int64_t>({{{1, 2}, {3, 4}, {5}}, {{{6}}}, {{7}, {8, 9}}})
-      .release();
+  auto list_col = cudf::test::lists_column_wrapper<int64_t>(
+                    {{{1, 2}, {3, 4}, {5}}, {{{6}}}, {{7}, {8, 9}}})  // NOLINT
+                    .release();
   vector_of_columns cols2;
   cols2.push_back(std::move(str_col2));
   cols2.push_back(std::move(int_col2));
@@ -315,15 +328,19 @@ TEST_F(ToArrowTest, StructColumn)
   auto list_arr = get_arrow_list_array<int64_t>({1, 2, 3, 4, 5, 6, 7, 8, 9}, {0, 2, 4, 5, 6, 7, 9});
   std::vector<int32_t> offset{0, 3, 4, 6};
   auto nested_list_arr = std::make_shared<arrow::ListArray>(
-    arrow::list(list(arrow::int64())), offset.size() - 1, arrow::Buffer::Wrap(offset), list_arr);
+    arrow::list(arrow::field("a", arrow::list(arrow::field("a", arrow::int64(), false)), false)),
+    offset.size() - 1,
+    arrow::Buffer::Wrap(offset),
+    list_arr);
 
   std::vector<std::shared_ptr<arrow::Array>> child_arrays2({str2_array, int2_array});
   auto fields2 = std::vector<std::shared_ptr<arrow::Field>>{
     std::make_shared<arrow::Field>("string2", str2_array->type(), str2_array->null_count() > 0),
     std::make_shared<arrow::Field>("integral2", int2_array->type(), int2_array->null_count() > 0)};
-  auto dtype2                                = std::make_shared<arrow::StructType>(fields2);
-  std::shared_ptr<arrow::Buffer> mask_buffer = arrow::internal::BytesToBits({1, 1, 0}).ValueOrDie();
-  auto struct_array2                         = std::make_shared<arrow::StructArray>(
+  auto dtype2 = std::make_shared<arrow::StructType>(fields2);
+  std::shared_ptr<arrow::Buffer> mask_buffer =
+    arrow::internal::BytesToBits(std::vector<uint8_t>({1, 1, 0})).ValueOrDie();
+  auto struct_array2 = std::make_shared<arrow::StructArray>(
     dtype2, static_cast<int64_t>(input_view.num_rows()), child_arrays2, mask_buffer);
 
   std::vector<std::shared_ptr<arrow::Array>> child_arrays(
@@ -347,9 +364,8 @@ TEST_F(ToArrowTest, StructColumn)
 
   auto expected_arrow_table = arrow::Table::Make(schema, {struct_array});
 
-  auto got_arrow_table = cudf::to_arrow(input_view, {metadata});
-
-  ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+  std::vector<cudf::column_metadata> const meta = {metadata};
+  ASSERT_TRUE(is_equal(input_view, meta, expected_arrow_table));
 }
 
 template <typename T>
@@ -362,18 +378,17 @@ TEST_F(ToArrowTest, FixedPoint64Table)
   for (auto const scale : {3, 2, 1, 0, -1, -2, -3}) {
     auto const col         = fp_wrapper<int64_t>({-1, 2, 3, 4, 5, 6}, scale_type{scale});
     auto const input       = cudf::table_view({col});
-    auto const expect_data = std::vector<int64_t>{-1, -1, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0};
+    auto const expect_data = std::vector<int64_t>{-1, 2, 3, 4, 5, 6};
 
-    auto const arr = make_decimal128_arrow_array(expect_data, std::nullopt, scale);
+    auto const arr = get_decimal_arrow_array(expect_data, std::nullopt, 18, scale);
 
     auto const field                = arrow::field("a", arr->type());
     auto const schema_vector        = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema               = std::make_shared<arrow::Schema>(schema_vector);
     auto const expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, expected_arrow_table));
   }
 }
 
@@ -386,45 +401,38 @@ TEST_F(ToArrowTest, FixedPoint128Table)
     auto const input       = cudf::table_view({col});
     auto const expect_data = std::vector<__int128_t>{-1, 2, 3, 4, 5, 6};
 
-    auto const arr = make_decimal128_arrow_array(expect_data, std::nullopt, scale);
+    auto const arr = get_decimal_arrow_array(expect_data, std::nullopt, 38, scale);
 
     auto const field                = arrow::field("a", arr->type());
     auto const schema_vector        = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema               = std::make_shared<arrow::Schema>(schema_vector);
     auto const expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, expected_arrow_table));
   }
 }
 
 TEST_F(ToArrowTest, FixedPoint64TableLarge)
 {
   using namespace numeric;
-  auto constexpr BIT_WIDTH_RATIO = 2;  // Array::Type:type::DECIMAL (128) / int64_t
-  auto constexpr NUM_ELEMENTS    = 1000;
+  auto constexpr NUM_ELEMENTS = 1000;
 
   for (auto const scale : {3, 2, 1, 0, -1, -2, -3}) {
-    auto const iota  = thrust::make_counting_iterator(1);
-    auto const col   = fp_wrapper<int64_t>(iota, iota + NUM_ELEMENTS, scale_type{scale});
-    auto const input = cudf::table_view({col});
+    auto const iota        = thrust::make_counting_iterator(1);
+    auto const col         = fp_wrapper<int64_t>(iota, iota + NUM_ELEMENTS, scale_type{scale});
+    auto const input       = cudf::table_view({col});
+    auto const expect_data = std::vector<int64_t>{iota, iota + NUM_ELEMENTS};
 
-    auto const every_other = [](auto i) { return i % 2 == 0 ? i / 2 : 0; };
-    auto const transform   = cudf::detail::make_counting_transform_iterator(2, every_other);
-    auto const expect_data =
-      std::vector<int64_t>{transform, transform + NUM_ELEMENTS * BIT_WIDTH_RATIO};
-
-    auto const arr = make_decimal128_arrow_array(expect_data, std::nullopt, scale);
+    auto const arr = get_decimal_arrow_array(expect_data, std::nullopt, 18, scale);
 
     auto const field                = arrow::field("a", arr->type());
     auto const schema_vector        = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema               = std::make_shared<arrow::Schema>(schema_vector);
     auto const expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};  // NOLINT
+    ASSERT_TRUE(is_equal(input, metadata, expected_arrow_table));
   }
 }
 
@@ -439,16 +447,15 @@ TEST_F(ToArrowTest, FixedPoint128TableLarge)
     auto const input       = cudf::table_view({col});
     auto const expect_data = std::vector<__int128_t>{iota, iota + NUM_ELEMENTS};
 
-    auto const arr = make_decimal128_arrow_array(expect_data, std::nullopt, scale);
+    auto const arr = get_decimal_arrow_array(expect_data, std::nullopt, 38, scale);
 
     auto const field                = arrow::field("a", arr->type());
     auto const schema_vector        = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema               = std::make_shared<arrow::Schema>(schema_vector);
     auto const expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, expected_arrow_table));
   }
 }
 
@@ -457,22 +464,21 @@ TEST_F(ToArrowTest, FixedPoint64TableNullsSimple)
   using namespace numeric;
 
   for (auto const scale : {3, 2, 1, 0, -1, -2, -3}) {
-    auto const data     = std::vector<int64_t>{1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 0, 0, 0, 0};
-    auto const validity = std::vector<int32_t>{1, 1, 1, 1, 1, 1, 0, 0};
+    auto const data     = std::vector<int64_t>{1, 2, 3, 4, 5, 6, 0, 0};
+    auto const validity = std::vector<uint8_t>{1, 1, 1, 1, 1, 1, 0, 0};
     auto const col =
       fp_wrapper<int64_t>({1, 2, 3, 4, 5, 6, 0, 0}, {1, 1, 1, 1, 1, 1, 0, 0}, scale_type{scale});
     auto const input = cudf::table_view({col});
 
-    auto const arr = make_decimal128_arrow_array(data, validity, scale);
+    auto const arr = get_decimal_arrow_array(data, validity, 18, scale);
 
     auto const field         = arrow::field("a", arr->type());
     auto const schema_vector = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema        = std::make_shared<arrow::Schema>(schema_vector);
     auto const arrow_table   = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, arrow_table));
   }
 }
 
@@ -482,21 +488,20 @@ TEST_F(ToArrowTest, FixedPoint128TableNullsSimple)
 
   for (auto const scale : {3, 2, 1, 0, -1, -2, -3}) {
     auto const data     = std::vector<__int128_t>{1, 2, 3, 4, 5, 6, 0, 0};
-    auto const validity = std::vector<int32_t>{1, 1, 1, 1, 1, 1, 0, 0};
+    auto const validity = std::vector<uint8_t>{1, 1, 1, 1, 1, 1, 0, 0};
     auto const col =
       fp_wrapper<__int128_t>({1, 2, 3, 4, 5, 6, 0, 0}, {1, 1, 1, 1, 1, 1, 0, 0}, scale_type{scale});
     auto const input = cudf::table_view({col});
 
-    auto const arr = make_decimal128_arrow_array(data, validity, scale);
+    auto const arr = get_decimal_arrow_array(data, validity, 38, scale);
 
     auto const field         = arrow::field("a", arr->type());
     auto const schema_vector = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema        = std::make_shared<arrow::Schema>(schema_vector);
     auto const arrow_table   = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, arrow_table));
   }
 }
 
@@ -509,20 +514,18 @@ TEST_F(ToArrowTest, FixedPoint64TableNulls)
       {1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, {1, 0, 1, 0, 1, 0, 1, 0, 1, 0}, scale_type{scale});
     auto const input = cudf::table_view({col});
 
-    auto const expect_data =
-      std::vector<int64_t>{1, 0, 2, 0, 3, 0, 4, 0, 5, 0, 6, 0, 7, 0, 8, 0, 9, 0, 10, 0};
-    auto const validity = std::vector<int32_t>{1, 0, 1, 0, 1, 0, 1, 0, 1, 0};
+    auto const expect_data = std::vector<int64_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+    auto const validity    = std::vector<uint8_t>{1, 0, 1, 0, 1, 0, 1, 0, 1, 0};
 
-    auto arr = make_decimal128_arrow_array(expect_data, validity, scale);
+    auto const arr = get_decimal_arrow_array(expect_data, validity, 18, scale);
 
     auto const field                = arrow::field("a", arr->type());
     auto const schema_vector        = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema               = std::make_shared<arrow::Schema>(schema_vector);
     auto const expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-    auto got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, expected_arrow_table));
   }
 }
 
@@ -536,18 +539,17 @@ TEST_F(ToArrowTest, FixedPoint128TableNulls)
     auto const input = cudf::table_view({col});
 
     auto const expect_data = std::vector<__int128_t>{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
-    auto const validity    = std::vector<int32_t>{1, 0, 1, 0, 1, 0, 1, 0, 1, 0};
+    auto const validity    = std::vector<uint8_t>{1, 0, 1, 0, 1, 0, 1, 0, 1, 0};
 
-    auto arr = make_decimal128_arrow_array(expect_data, validity, scale);
+    auto const arr = get_decimal_arrow_array(expect_data, validity, 38, scale);
 
     auto const field                = arrow::field("a", arr->type());
     auto const schema_vector        = std::vector<std::shared_ptr<arrow::Field>>({field});
     auto const schema               = std::make_shared<arrow::Schema>(schema_vector);
     auto const expected_arrow_table = arrow::Table::Make(schema, {arr});
 
-    auto const got_arrow_table = cudf::to_arrow(input, {{"a"}});
-
-    ASSERT_TRUE(expected_arrow_table->Equals(*got_arrow_table, true));
+    std::vector<cudf::column_metadata> const metadata = {{"a"}};
+    ASSERT_TRUE(is_equal(input, metadata, expected_arrow_table));
   }
 }
 
@@ -566,10 +568,10 @@ TEST_P(ToArrowTestSlice, SliceTest)
   auto expected_arrow_table = arrow_table->Slice(start, end - start);
   auto struct_meta          = cudf::column_metadata{"f"};
   struct_meta.children_meta = {{"integral"}, {"string"}};
-  auto got_arrow_table =
-    cudf::to_arrow(sliced_cudf_table, {{"a"}, {"b"}, {"c"}, {"d"}, {"e"}, struct_meta});
 
-  ASSERT_EQ(expected_arrow_table->Equals(*got_arrow_table, true), true);
+  std::vector<cudf::column_metadata> const metadata = {
+    {"a"}, {"b"}, {"c"}, {"d"}, {"e"}, struct_meta};
+  ASSERT_TRUE(is_equal(sliced_cudf_table, metadata, expected_arrow_table));
 }
 
 INSTANTIATE_TEST_CASE_P(ToArrowTest,
@@ -586,13 +588,60 @@ using NumericTypesNotBool =
   cudf::test::Concat<cudf::test::IntegralTypesNotBool, cudf::test::FloatingPointTypes>;
 TYPED_TEST_SUITE(ToArrowNumericScalarTest, NumericTypesNotBool);
 
+auto col_to_arrow_type(cudf::column_view const& col)
+{
+  switch (col.type().id()) {
+    case cudf::type_id::BOOL8: return arrow::boolean();
+    case cudf::type_id::INT8: return arrow::int8();
+    case cudf::type_id::INT16: return arrow::int16();
+    case cudf::type_id::INT32: return arrow::int32();
+    case cudf::type_id::INT64: return arrow::int64();
+    case cudf::type_id::UINT8: return arrow::uint8();
+    case cudf::type_id::UINT16: return arrow::uint16();
+    case cudf::type_id::UINT32: return arrow::uint32();
+    case cudf::type_id::UINT64: return arrow::uint64();
+    case cudf::type_id::FLOAT32: return arrow::float32();
+    case cudf::type_id::FLOAT64: return arrow::float64();
+    case cudf::type_id::TIMESTAMP_DAYS: return arrow::date32();
+    case cudf::type_id::STRING: return arrow::utf8();
+    case cudf::type_id::LIST:
+      return arrow::list(col_to_arrow_type(col.child(cudf::lists_column_view::child_column_index)));
+    case cudf::type_id::DECIMAL32: return arrow::decimal32(9, -col.type().scale());
+    case cudf::type_id::DECIMAL64: return arrow::decimal64(18, -col.type().scale());
+    case cudf::type_id::DECIMAL128: return arrow::decimal128(38, -col.type().scale());
+    default: CUDF_FAIL("Unsupported type_id conversion to arrow type", cudf::data_type_error);
+  }
+}
+
+std::optional<std::shared_ptr<arrow::Scalar>> cudf_scalar_to_arrow(
+  cudf::scalar const& scalar, std::optional<cudf::column_metadata> metadata = std::nullopt)
+{
+  auto const cudf_column   = cudf::make_column_from_scalar(scalar, 1);
+  auto const c_arrow_array = cudf::to_arrow_host(*cudf_column);
+  auto const arrow_array   = [&]() {
+    if (metadata.has_value()) {
+      auto const table = cudf::table_view({cudf_column->view()});
+      std::vector<cudf::column_metadata> const table_metadata = {metadata.value()};
+      auto const arrow_schema = cudf::to_arrow_schema(table, table_metadata);
+      return arrow::ImportArray(&c_arrow_array->array, arrow_schema->children[0]).ValueOrDie();
+    } else {
+      auto const arrow_type = col_to_arrow_type(cudf_column->view());
+      return arrow::ImportArray(&c_arrow_array->array, arrow_type).ValueOrDie();
+    }
+  }();
+  auto const maybe_scalar = arrow_array->GetScalar(0);
+  if (!maybe_scalar.ok()) { return std::nullopt; }
+  return maybe_scalar.ValueOrDie();
+}
+
 TYPED_TEST(ToArrowNumericScalarTest, Basic)
 {
   TypeParam const value{42};
   auto const cudf_scalar = cudf::make_fixed_width_scalar<TypeParam>(value);
 
-  cudf::column_metadata const metadata{""};
-  auto const arrow_scalar = cudf::to_arrow(*cudf_scalar, metadata);
+  auto const maybe_scalar = cudf_scalar_to_arrow(*cudf_scalar);
+  ASSERT_TRUE(maybe_scalar.has_value());
+  auto const arrow_scalar = *maybe_scalar;
 
   auto const ref_arrow_scalar = arrow::MakeScalar(value);
   EXPECT_TRUE(arrow_scalar->Equals(*ref_arrow_scalar));
@@ -600,26 +649,36 @@ TYPED_TEST(ToArrowNumericScalarTest, Basic)
 
 struct ToArrowDecimalScalarTest : public cudf::test::BaseFixture {};
 
-// Only testing Decimal128 because that's the only size cudf and arrow have in common.
+template <typename DecimalType>
+void check_decimal_scalar(int const value, arrow::Scalar const& ref_scalar, int32_t const scale)
+{
+  auto const cudf_scalar =
+    cudf::make_fixed_point_scalar<DecimalType>(value, numeric::scale_type{scale});
+
+  auto const maybe_scalar = cudf_scalar_to_arrow(*cudf_scalar);
+  ASSERT_TRUE(maybe_scalar.has_value());
+  auto const arrow_scalar = *maybe_scalar;
+  EXPECT_TRUE(arrow_scalar->Equals(ref_scalar));
+}
+
 TEST_F(ToArrowDecimalScalarTest, Basic)
 {
   auto const value{42};
-  auto const precision =
-    cudf::detail::max_precision<__int128_t>();  // cudf will convert to the widest-precision Arrow
-                                                // scalar of the type
   int32_t const scale{4};
 
-  auto const cudf_scalar =
-    cudf::make_fixed_point_scalar<numeric::decimal128>(value, numeric::scale_type{scale});
+  auto const get_ref_scalar = [&](std::shared_ptr<arrow::DataType> type) {
+    auto const maybe_ref_scalar = arrow::MakeScalar(type, value);
+    if (!maybe_ref_scalar.ok()) { CUDF_FAIL("Failed to construct reference scalar"); }
+    return *maybe_ref_scalar;
+  };
 
-  cudf::column_metadata const metadata{""};
-  auto const arrow_scalar = cudf::to_arrow(*cudf_scalar, metadata);
+  auto const decimal32_scalar  = get_ref_scalar(arrow::decimal32(9, -scale));
+  auto const decimal64_scalar  = get_ref_scalar(arrow::decimal64(18, -scale));
+  auto const decimal128_scalar = get_ref_scalar(arrow::decimal128(38, -scale));
 
-  auto const maybe_ref_arrow_scalar =
-    arrow::MakeScalar(arrow::decimal128(precision, -scale), value);
-  if (!maybe_ref_arrow_scalar.ok()) { CUDF_FAIL("Failed to construct reference scalar"); }
-  auto const ref_arrow_scalar = *maybe_ref_arrow_scalar;
-  EXPECT_TRUE(arrow_scalar->Equals(*ref_arrow_scalar));
+  check_decimal_scalar<numeric::decimal32>(value, *decimal32_scalar, scale);
+  check_decimal_scalar<numeric::decimal64>(value, *decimal64_scalar, scale);
+  check_decimal_scalar<numeric::decimal128>(value, *decimal128_scalar, scale);
 }
 
 struct ToArrowStringScalarTest : public cudf::test::BaseFixture {};
@@ -627,9 +686,10 @@ struct ToArrowStringScalarTest : public cudf::test::BaseFixture {};
 TEST_F(ToArrowStringScalarTest, Basic)
 {
   std::string const value{"hello world"};
-  auto const cudf_scalar = cudf::make_string_scalar(value);
-  cudf::column_metadata const metadata{""};
-  auto const arrow_scalar = cudf::to_arrow(*cudf_scalar, metadata);
+  auto const cudf_scalar  = cudf::make_string_scalar(value);
+  auto const maybe_scalar = cudf_scalar_to_arrow(*cudf_scalar);
+  ASSERT_TRUE(maybe_scalar.has_value());
+  auto const arrow_scalar = *maybe_scalar;
 
   auto const ref_arrow_scalar = arrow::MakeScalar(value);
   EXPECT_TRUE(arrow_scalar->Equals(*ref_arrow_scalar));
@@ -647,8 +707,9 @@ TEST_F(ToArrowListScalarTest, Basic)
 
   auto const cudf_scalar = cudf::make_list_scalar(col);
 
-  cudf::column_metadata const metadata{""};
-  auto const arrow_scalar = cudf::to_arrow(*cudf_scalar, metadata);
+  auto const maybe_scalar = cudf_scalar_to_arrow(*cudf_scalar);
+  ASSERT_TRUE(maybe_scalar.has_value());
+  auto const arrow_scalar = *maybe_scalar;
 
   arrow::Int64Builder builder;
   auto const status      = builder.AppendValues(host_values, host_validity);
@@ -673,7 +734,10 @@ TEST_F(ToArrowStructScalarTest, Basic)
 
   cudf::column_metadata metadata{""};
   metadata.children_meta.emplace_back(field_name);
-  auto const arrow_scalar = cudf::to_arrow(*cudf_scalar, metadata);
+
+  auto const maybe_scalar = cudf_scalar_to_arrow(*cudf_scalar, metadata);
+  ASSERT_TRUE(maybe_scalar.has_value());
+  auto const arrow_scalar = *maybe_scalar;
 
   auto const underlying_arrow_scalar = arrow::MakeScalar(value);
   auto const field            = arrow::field(field_name, underlying_arrow_scalar->type, false);

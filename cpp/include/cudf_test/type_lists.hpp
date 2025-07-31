@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,14 +16,16 @@
 
 #pragma once
 
+#include <cudf_test/type_list_utilities.hpp>
+
 #include <cudf/fixed_point/fixed_point.hpp>
 #include <cudf/strings/string_view.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/export.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 #include <cudf/wrappers/durations.hpp>
 #include <cudf/wrappers/timestamps.hpp>
-#include <cudf_test/type_list_utilities.hpp>
 
 #include <thrust/host_vector.h>
 
@@ -39,7 +41,7 @@
  * These lists should be used for consistency across tests as well as
  * future-proofing against the addition of any new types in the future.
  */
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace test {
 namespace detail {
 template <typename TYPES, std::size_t... Indices>
@@ -432,4 +434,4 @@ static constexpr std::array<cudf::type_id, 2> non_fixed_width_type_ids{cudf::typ
                                                                        cudf::type_id::STRING};
 
 }  // namespace test
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

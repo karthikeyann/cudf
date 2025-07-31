@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,17 +14,27 @@
  * limitations under the License.
  */
 
+// The usage of the lists_column_wrapper `LCW{LCW...` syntax in this file
+// causes gcc14 to throw a maybe-uninitialized warning in the copy constructor
+// of column_view_base. The same usage in every other test file causes no
+// issues, so it seems highly likely to be an incorrect diagnostic.
+// Unfortunately, because the warning is in an included file, neither inserting
+// ignore pragmas around just the includes nor just around the calling code
+// below that uses that syntax (of which there is a decent amount) seems to be
+// sufficient to make the compiler happy, so for now the easiest option is to
+// ignore the warning for the entire file.
+#if defined(__GNUC__) && (__GNUC__ >= 14)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+#endif
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
-#include <cudf/column/column_factories.hpp>
-#include <cudf/detail/null_mask.hpp>
 #include <cudf/lists/extract.hpp>
-
-#include <rmm/cuda_stream_view.hpp>
 
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -426,3 +436,6 @@ TEST_F(ListsExtractColumnIndicesTest, ExtractStrings)
 }
 
 CUDF_TEST_PROGRAM_MAIN()
+#if defined(__GNUC__) && (__GNUC__ >= 14)
+#pragma GCC diagnostic pop
+#endif

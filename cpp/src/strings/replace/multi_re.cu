@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include <strings/regex/regex.cuh>
-#include <strings/regex/regex_program_impl.h>
+#include "strings/regex/regex.cuh"
+#include "strings/regex/regex_program_impl.h"
 
 #include <cudf/column/column.hpp>
 #include <cudf/column/column_device_view.cuh>
@@ -29,15 +29,18 @@
 #include <cudf/strings/string_view.cuh>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 
+#include <cuda/std/iterator>
 #include <thrust/execution_policy.h>
 #include <thrust/fill.h>
 #include <thrust/find.h>
 #include <thrust/pair.h>
 
 #include <algorithm>
+#include <functional>
 
 namespace cudf {
 namespace strings {
@@ -55,13 +58,14 @@ struct replace_multi_regex_fn {
   device_span<reprog_device const> progs;  // array of regex progs
   found_range* d_found_ranges;             // working array matched (begin,end) values
   column_device_view const d_repls;        // replacement strings
-  size_type* d_offsets{};
+  size_type* d_sizes{};
   char* d_chars{};
+  cudf::detail::input_offsetalator d_offsets;
 
   __device__ void operator()(size_type idx)
   {
     if (d_strings.is_null(idx)) {
-      if (!d_chars) d_offsets[idx] = 0;
+      if (!d_chars) { d_sizes[idx] = 0; }
       return;
     }
 
@@ -90,7 +94,7 @@ struct replace_multi_regex_fn {
         }
         reprog_device prog = progs[ptn_idx];
 
-        auto const result = !prog.is_empty() ? prog.find(idx, d_str, itr) : thrust::nullopt;
+        auto const result = !prog.is_empty() ? prog.find(idx, d_str, itr) : cuda::std::nullopt;
         d_ranges[ptn_idx] =
           result ? found_range{result->first, result->second} : found_range{nchars, nchars};
       }
@@ -103,7 +107,7 @@ struct replace_multi_regex_fn {
                         [ch_pos = itr.position()](auto range) { return range.first == ch_pos; });
       if (ptn_itr != d_ranges + number_of_patterns) {
         // match found, compute and replace the string in the output
-        auto const ptn_idx = static_cast<size_type>(thrust::distance(d_ranges, ptn_itr));
+        auto const ptn_idx = static_cast<size_type>(cuda::std::distance(d_ranges, ptn_itr));
 
         auto d_repl = d_repls.size() > 1 ? d_repls.element<string_view>(ptn_idx)
                                          : d_repls.element<string_view>(0);
@@ -128,7 +132,7 @@ struct replace_multi_regex_fn {
                      d_str.size_bytes() - last_pos.byte_offset(),
                      out_ptr);
     } else {
-      d_offsets[idx] = nbytes;
+      d_sizes[idx] = nbytes;
     }
   }
 };
@@ -140,7 +144,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& input,
                                    strings_column_view const& replacements,
                                    regex_flags const flags,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   if (input.is_empty()) { return make_empty_column(type_id::STRING); }
   if (patterns.empty()) {  // if no patterns; just return a copy
@@ -169,7 +173,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& input,
   auto d_buffer          = rmm::device_buffer(buffer_size, stream);
 
   // copy all the reprog_device instances to a device memory array
-  std::vector<reprog_device> progs;
+  auto progs = cudf::detail::make_empty_host_vector<reprog_device>(h_progs.size(), stream);
   std::transform(h_progs.begin(),
                  h_progs.end(),
                  std::back_inserter(progs),
@@ -178,22 +182,22 @@ std::unique_ptr<column> replace_re(strings_column_view const& input,
                    return *prog;
                  });
   auto d_progs =
-    cudf::detail::make_device_uvector_async(progs, stream, rmm::mr::get_current_device_resource());
+    cudf::detail::make_device_uvector_async(progs, stream, cudf::get_current_device_resource_ref());
 
   auto const d_strings = column_device_view::create(input.parent(), stream);
   auto const d_repls   = column_device_view::create(replacements.parent(), stream);
 
   auto found_ranges = rmm::device_uvector<found_range>(d_progs.size() * input.size(), stream);
 
-  auto children = make_strings_children(
+  auto [offsets_column, chars] = make_strings_children(
     replace_multi_regex_fn{*d_strings, d_progs, found_ranges.data(), *d_repls},
     input.size(),
     stream,
     mr);
 
   return make_strings_column(input.size(),
-                             std::move(children.first),
-                             std::move(children.second),
+                             std::move(offsets_column),
+                             chars.release(),
                              input.null_count(),
                              cudf::detail::copy_bitmask(input.parent(), stream, mr));
 }
@@ -207,7 +211,7 @@ std::unique_ptr<column> replace_re(strings_column_view const& strings,
                                    strings_column_view const& replacements,
                                    regex_flags const flags,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr)
+                                   rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   return detail::replace_re(strings, patterns, replacements, flags, stream, mr);

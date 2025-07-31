@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,15 +15,14 @@
  */
 #pragma once
 
-#include "stream_compaction_common.hpp"
-
 #include <cudf/stream_compaction.hpp>
+#include <cudf/utilities/bit.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/std/iterator>
 #include <thrust/copy.h>
-#include <thrust/distance.h>
 #include <thrust/iterator/counting_iterator.h>
 
 namespace cudf {
@@ -100,7 +99,7 @@ OutputIterator unique_copy(InputIterator first,
                            duplicate_keep_option const keep,
                            rmm::cuda_stream_view stream)
 {
-  size_type const last_index = thrust::distance(first, last) - 1;
+  size_type const last_index = cuda::std::distance(first, last) - 1;
   return thrust::copy_if(
     rmm::exec_policy(stream),
     first,

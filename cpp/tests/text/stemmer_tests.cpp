@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,13 +14,12 @@
  * limitations under the License.
  */
 
-#include <cudf/column/column.hpp>
-#include <cudf/scalar/scalar.hpp>
-#include <cudf/strings/strings_column_view.hpp>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+
+#include <cudf/column/column.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 
 #include <nvtext/stemmer.hpp>
 
@@ -168,7 +167,7 @@ TEST_F(TextStemmerTest, EmptyTest)
 TEST_F(TextStemmerTest, ErrorTest)
 {
   auto empty = cudf::make_empty_column(cudf::data_type{cudf::type_id::STRING});
-  cudf::test::fixed_width_column_wrapper<int32_t> indices({0}, {0});
+  cudf::test::fixed_width_column_wrapper<int32_t> indices({0}, {false});
   EXPECT_THROW(nvtext::is_letter(
                  cudf::strings_column_view(empty->view()), nvtext::letter_type::VOWEL, indices),
                cudf::logic_error);

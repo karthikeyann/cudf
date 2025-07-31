@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,11 +14,12 @@
  * limitations under the License.
  */
 
-#include <cudf/dictionary/dictionary_column_view.hpp>
-#include <cudf/dictionary/encode.hpp>
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+
+#include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/dictionary/encode.hpp>
 
 #include <vector>
 
@@ -47,8 +48,9 @@ TEST_F(DictionaryDecodeTest, FloatColumn)
 
 TEST_F(DictionaryDecodeTest, ColumnWithNull)
 {
-  cudf::test::fixed_width_column_wrapper<int64_t> input{{444, 0, 333, 111, 222, 222, 222, 444, 000},
-                                                        {1, 1, 1, 1, 1, 0, 1, 1, 1}};
+  cudf::test::fixed_width_column_wrapper<int64_t> input{
+    {444, 0, 333, 111, 222, 222, 222, 444, 000},
+    {true, true, true, true, true, false, true, true, true}};
 
   auto dictionary = cudf::dictionary::encode(input);
   auto output     = cudf::dictionary::decode(cudf::dictionary_column_view(dictionary->view()));

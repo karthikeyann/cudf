@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Copyright 2018 BlazingDB, Inc.
  *     Copyright 2018 Cristhian Alberto Gonzales Castillo <cristhian@blazingdb.com>
@@ -20,21 +20,20 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/cudf_gtest.hpp>
+#include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/encode.hpp>
-#include <cudf/fixed_point/fixed_point.hpp>
-#include <cudf/null_mask.hpp>
 #include <cudf/replace.hpp>
+#include <cudf/types.hpp>
+#include <cudf/utilities/error.hpp>
 
 #include <thrust/host_vector.h>
-#include <thrust/iterator/transform_iterator.h>
+
+#include <gtest/gtest.h>
 
 #include <cstdlib>
-#include <cudf/types.hpp>
-#include <gtest/gtest.h>
 #include <iostream>
 #include <vector>
 
@@ -61,7 +60,7 @@ TEST_F(ReplaceErrorTest, TypeMismatch)
 
   EXPECT_THROW(
     cudf::find_and_replace_all(input_column, values_to_replace_column, replacement_values_column),
-    cudf::logic_error);
+    cudf::data_type_error);
 }
 
 // Error: nulls in old-values
@@ -95,9 +94,7 @@ TEST_F(ReplaceStringsTest, Strings)
   ASSERT_NO_THROW(result = cudf::find_and_replace_all(
                     input_wrapper, values_to_replace_wrapper, replacement_wrapper));
   std::vector<std::string> expected{"z", "b", "c", "d", "e", "f", "g", "h"};
-  std::vector<cudf::valid_type> ex_valid{1, 1, 1, 1, 1, 1, 1, 1};
-  cudf::test::strings_column_wrapper expected_wrapper{
-    expected.begin(), expected.end(), ex_valid.begin()};
+  cudf::test::strings_column_wrapper expected_wrapper{expected.begin(), expected.end()};
 
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected_wrapper);
 }
@@ -158,7 +155,6 @@ TEST_F(ReplaceStringsTest, StringsResultAllEmpty)
   std::vector<std::string> replacement{"a", ""};
   std::vector<cudf::valid_type> replacement_valid{1, 1};
   std::vector<std::string> expected{"", "", "", "", "", "", "", ""};
-  std::vector<cudf::valid_type> ex_valid{1, 1, 1, 1, 1, 1, 1, 1};
   cudf::test::strings_column_wrapper input_wrapper{input.begin(), input.end()};
   cudf::test::strings_column_wrapper values_to_replace_wrapper{values_to_replace.begin(),
                                                                values_to_replace.end()};
@@ -168,8 +164,7 @@ TEST_F(ReplaceStringsTest, StringsResultAllEmpty)
   std::unique_ptr<cudf::column> result;
   ASSERT_NO_THROW(result = cudf::find_and_replace_all(
                     input_wrapper, values_to_replace_wrapper, replacement_wrapper));
-  cudf::test::strings_column_wrapper expected_wrapper{
-    expected.begin(), expected.end(), ex_valid.begin()};
+  cudf::test::strings_column_wrapper expected_wrapper{expected.begin(), expected.end()};
 
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*result, expected_wrapper);
 }
@@ -357,7 +352,7 @@ void test_replace(cudf::host_span<T const> input_column,
 
   for (size_t i = 0; i < values_to_replace_column.size(); i++) {
     size_t k  = 0;
-    auto pred = [=, &k, &reference_result, &expected_valid, &isReplaced](T element) {
+    auto pred = [=, &k, &expected_valid, &isReplaced](T element) {
       bool toBeReplaced = false;
       if (!isReplaced[k]) {
         if (!input_has_nulls || expected_valid[k]) {
@@ -504,7 +499,7 @@ TYPED_TEST(ReplaceTest, LargeScaleReplaceTest)
   const size_t REPLACE_SIZE = 10000;
 
   thrust::host_vector<TypeParam> input_column(DATA_SIZE);
-  std::generate(std::begin(input_column), std::end(input_column), [REPLACE_SIZE]() {
+  std::generate(std::begin(input_column), std::end(input_column), []() {
     return std::rand() % (REPLACE_SIZE);
   });
 

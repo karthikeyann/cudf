@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,16 +14,16 @@
  * limitations under the License.
  */
 
+#include "io/json/nested_json.hpp"
+
 #include <benchmarks/common/generate_input.hpp>
 #include <benchmarks/fixture/benchmark_fixture.hpp>
-
-#include <io/json/nested_json.hpp>
-
 #include <tests/io/fst/common.hpp>
 
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/repeat_strings.hpp>
 #include <cudf/types.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <nvbench/nvbench.cuh>
 
@@ -171,7 +171,7 @@ void BM_NESTED_JSON(nvbench::state& state)
       cudf::device_span<char const>{input->data(), static_cast<size_t>(input->size())},
       default_options,
       cudf::get_default_stream(),
-      rmm::mr::get_current_device_resource());
+      cudf::get_current_device_resource_ref());
   });
 
   auto const time = state.get_summary("nv/cold/time/gpu/mean").get_float64("value");
@@ -202,7 +202,7 @@ void BM_NESTED_JSON_DEPTH(nvbench::state& state)
   state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
     // Allocate device-side temporary storage & run algorithm
     cudf::io::json::detail::device_parse_nested_json(
-      input, default_options, cudf::get_default_stream(), rmm::mr::get_current_device_resource());
+      input, default_options, cudf::get_default_stream(), cudf::get_current_device_resource_ref());
   });
 
   auto const time = state.get_summary("nv/cold/time/gpu/mean").get_float64("value");

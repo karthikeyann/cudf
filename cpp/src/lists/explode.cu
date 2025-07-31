@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -21,24 +21,23 @@
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
-#include <thrust/advance.h>
+#include <cuda/functional>
+#include <cuda/std/iterator>
+#include <cuda/std/optional>
 #include <thrust/binary_search.h>
-#include <thrust/distance.h>
 #include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
-#include <thrust/optional.h>
 #include <thrust/scan.h>
 #include <thrust/transform.h>
-
-#include <cuda/functional>
 
 #include <memory>
 #include <type_traits>
@@ -57,10 +56,10 @@ std::unique_ptr<table> build_table(
   size_type const explode_column_idx,
   column_view const& sliced_child,
   cudf::device_span<size_type const> gather_map,
-  thrust::optional<cudf::device_span<size_type const>> explode_col_gather_map,
-  thrust::optional<rmm::device_uvector<size_type>> position_array,
+  cuda::std::optional<cudf::device_span<size_type const>> explode_col_gather_map,
+  cuda::std::optional<rmm::device_uvector<size_type>> position_array,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   auto select_iter = thrust::make_transform_iterator(
     thrust::make_counting_iterator(0),
@@ -114,7 +113,7 @@ std::unique_ptr<table> build_table(
 std::unique_ptr<table> explode(table_view const& input_table,
                                size_type const explode_column_idx,
                                rmm::cuda_stream_view stream,
-                               rmm::mr::device_memory_resource* mr)
+                               rmm::device_async_resource_ref mr)
 {
   lists_column_view explode_col{input_table.column(explode_column_idx)};
   auto sliced_child = explode_col.get_sliced_child(stream);
@@ -124,7 +123,7 @@ std::unique_ptr<table> explode(table_view const& input_table,
   auto offsets = explode_col.offsets_begin();
   // offsets + 1 here to skip the 0th offset, which removes a - 1 operation later.
   auto offsets_minus_one = thrust::make_transform_iterator(
-    thrust::next(offsets), cuda::proclaim_return_type<size_type>([offsets] __device__(auto i) {
+    cuda::std::next(offsets), cuda::proclaim_return_type<size_type>([offsets] __device__(auto i) {
       return (i - offsets[0]) - 1;
     }));
   auto counting_iter = thrust::make_counting_iterator(0);
@@ -143,8 +142,8 @@ std::unique_ptr<table> explode(table_view const& input_table,
                      explode_column_idx,
                      sliced_child,
                      gather_map,
-                     thrust::nullopt,
-                     thrust::nullopt,
+                     cuda::std::nullopt,
+                     cuda::std::nullopt,
                      stream,
                      mr);
 }
@@ -152,7 +151,7 @@ std::unique_ptr<table> explode(table_view const& input_table,
 std::unique_ptr<table> explode_position(table_view const& input_table,
                                         size_type const explode_column_idx,
                                         rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::device_async_resource_ref mr)
 {
   lists_column_view explode_col{input_table.column(explode_column_idx)};
   auto sliced_child = explode_col.get_sliced_child(stream);
@@ -182,7 +181,7 @@ std::unique_ptr<table> explode_position(table_view const& input_table,
                                            offsets,
                                            offset_size =
                                              explode_col.size()] __device__(auto idx) -> size_type {
-      auto lb_idx = thrust::distance(
+      auto lb_idx = cuda::std::distance(
         offsets_minus_one,
         thrust::lower_bound(thrust::seq, offsets_minus_one, offsets_minus_one + offset_size, idx));
       position_array[idx] = idx - (offsets[lb_idx] - offsets[0]);
@@ -193,7 +192,7 @@ std::unique_ptr<table> explode_position(table_view const& input_table,
                      explode_column_idx,
                      sliced_child,
                      gather_map,
-                     thrust::nullopt,
+                     cuda::std::nullopt,
                      std::move(pos),
                      stream,
                      mr);
@@ -203,7 +202,7 @@ std::unique_ptr<table> explode_outer(table_view const& input_table,
                                      size_type const explode_column_idx,
                                      bool include_position,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
 {
   lists_column_view explode_col{input_table.column(explode_column_idx)};
   auto sliced_child  = explode_col.get_sliced_child(stream);
@@ -229,8 +228,8 @@ std::unique_ptr<table> explode_outer(table_view const& input_table,
   if (null_or_empty_count == 0) {
     // performance penalty to run the below loop if there are no nulls or empty lists.
     // run simple explode instead
-    return include_position ? explode_position(input_table, explode_column_idx, stream, mr)
-                            : explode(input_table, explode_column_idx, stream, mr);
+    return include_position ? detail::explode_position(input_table, explode_column_idx, stream, mr)
+                            : detail::explode(input_table, explode_column_idx, stream, mr);
   }
 
   auto gather_map_size = sliced_child.size() + null_or_empty_count;
@@ -241,7 +240,7 @@ std::unique_ptr<table> explode_outer(table_view const& input_table,
 
   // offsets + 1 here to skip the 0th offset, which removes a - 1 operation later.
   auto offsets_minus_one = thrust::make_transform_iterator(
-    thrust::next(offsets), cuda::proclaim_return_type<size_type>([offsets] __device__(auto i) {
+    cuda::std::next(offsets), cuda::proclaim_return_type<size_type>([offsets] __device__(auto i) {
       return (i - offsets[0]) - 1;
     }));
 
@@ -256,10 +255,10 @@ std::unique_ptr<table> explode_outer(table_view const& input_table,
                            null_or_empty,
                            offset_size = explode_col.offsets().size() - 1] __device__(auto idx) {
     if (idx < sliced_child_size) {
-      auto lb_idx =
-        thrust::distance(offsets_minus_one,
-                         thrust::lower_bound(
-                           thrust::seq, offsets_minus_one, offsets_minus_one + (offset_size), idx));
+      auto lb_idx = cuda::std::distance(
+        offsets_minus_one,
+        thrust::lower_bound(
+          thrust::seq, offsets_minus_one, offsets_minus_one + (offset_size), idx));
       auto index_to_write                      = null_or_empty_offset_p[lb_idx] + idx;
       gather_map_p[index_to_write]             = lb_idx;
       explode_col_gather_map_p[index_to_write] = idx;
@@ -292,7 +291,7 @@ std::unique_ptr<table> explode_outer(table_view const& input_table,
     sliced_child,
     gather_map,
     explode_col_gather_map,
-    include_position ? std::move(pos) : thrust::optional<rmm::device_uvector<size_type>>{},
+    include_position ? std::move(pos) : cuda::std::optional<rmm::device_uvector<size_type>>{},
     stream,
     mr);
 }
@@ -300,58 +299,63 @@ std::unique_ptr<table> explode_outer(table_view const& input_table,
 }  // namespace detail
 
 /**
- * @copydoc cudf::explode(table_view const&, size_type, rmm::mr::device_memory_resource*)
+ * @copydoc cudf::explode(table_view const&, size_type, rmm::cuda_stream_view,
+ * rmm::device_async_resource_ref)
  */
 std::unique_ptr<table> explode(table_view const& input_table,
                                size_type explode_column_idx,
-                               rmm::mr::device_memory_resource* mr)
+                               rmm::cuda_stream_view stream,
+                               rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(input_table.column(explode_column_idx).type().id() == type_id::LIST,
                "Unsupported non-list column");
-  return detail::explode(input_table, explode_column_idx, cudf::get_default_stream(), mr);
+  return detail::explode(input_table, explode_column_idx, stream, mr);
 }
 
 /**
- * @copydoc cudf::explode_position(table_view const&, size_type, rmm::mr::device_memory_resource*)
+ * @copydoc cudf::explode_position(table_view const&, size_type, rmm::cuda_stream_view,
+ * rmm::device_async_resource_ref)
  */
 std::unique_ptr<table> explode_position(table_view const& input_table,
                                         size_type explode_column_idx,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(input_table.column(explode_column_idx).type().id() == type_id::LIST,
                "Unsupported non-list column");
-  return detail::explode_position(input_table, explode_column_idx, cudf::get_default_stream(), mr);
+  return detail::explode_position(input_table, explode_column_idx, stream, mr);
 }
 
 /**
- * @copydoc cudf::explode_outer(table_view const&, size_type, rmm::mr::device_memory_resource*)
+ * @copydoc cudf::explode_outer(table_view const&, size_type, rmm::cuda_stream_view,
+ * rmm::device_async_resource_ref)
  */
 std::unique_ptr<table> explode_outer(table_view const& input_table,
                                      size_type explode_column_idx,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(input_table.column(explode_column_idx).type().id() == type_id::LIST,
                "Unsupported non-list column");
-  return detail::explode_outer(
-    input_table, explode_column_idx, false, cudf::get_default_stream(), mr);
+  return detail::explode_outer(input_table, explode_column_idx, false, stream, mr);
 }
 
 /**
  * @copydoc cudf::explode_outer_position(table_view const&, size_type,
- * rmm::mr::device_memory_resource*)
+ * rmm::cuda_stream_view, rmm::device_async_resource_ref)
  */
 std::unique_ptr<table> explode_outer_position(table_view const& input_table,
                                               size_type explode_column_idx,
-                                              rmm::mr::device_memory_resource* mr)
+                                              rmm::cuda_stream_view stream,
+                                              rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(input_table.column(explode_column_idx).type().id() == type_id::LIST,
                "Unsupported non-list column");
-  return detail::explode_outer(
-    input_table, explode_column_idx, true, cudf::get_default_stream(), mr);
+  return detail::explode_outer(input_table, explode_column_idx, true, stream, mr);
 }
 
 }  // namespace cudf

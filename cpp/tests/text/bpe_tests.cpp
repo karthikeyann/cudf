@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#include <nvtext/byte_pair_encoding.hpp>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
@@ -23,6 +21,8 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/strings/strings_column_view.hpp>
+
+#include <nvtext/byte_pair_encoding.hpp>
 
 struct TextBytePairEncoding : public cudf::test::BaseFixture {};
 
@@ -83,7 +83,7 @@ TEST_F(TextBytePairEncoding, BytePairEncodingSeparator)
     {"Ġthe test sentence", "test Ġthe sentence", "Ġthetest sentence", "testĠthesentence"});
   auto sv = cudf::strings_column_view(input);
 
-  auto results = nvtext::byte_pair_encoding(sv, *merge_pairs, std::string("$"));
+  auto results = nvtext::byte_pair_encoding(sv, *merge_pairs, std::string_view("$"));
 
   auto expected = cudf::test::strings_column_wrapper({"Ġthe$ $test$ $sent$ence",
                                                       "test$ $Ġthe$ $sent$ence",
@@ -129,6 +129,6 @@ TEST_F(TextBytePairEncoding, BPE_Error)
 {
   auto empty = cudf::make_empty_column(cudf::type_id::STRING);
   EXPECT_THROW(nvtext::load_merge_pairs(cudf::strings_column_view(*empty)), cudf::logic_error);
-  auto null_pairs = cudf::test::strings_column_wrapper({"", ""}, {1, 0});
+  auto null_pairs = cudf::test::strings_column_wrapper({"", ""}, {true, false});
   EXPECT_THROW(nvtext::load_merge_pairs(cudf::strings_column_view(null_pairs)), cudf::logic_error);
 }

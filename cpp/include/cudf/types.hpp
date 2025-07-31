@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,10 +17,26 @@
 #pragma once
 
 #ifdef __CUDACC__
+/**
+ * @brief Indicates that the function or method is usable on host and device
+ */
 #define CUDF_HOST_DEVICE __host__ __device__
+/**
+ * @brief Indicates that the function is a CUDA kernel
+ */
+#define CUDF_KERNEL __global__ static
 #else
+/**
+ * @brief Indicates that the function or method is usable on host and device
+ */
 #define CUDF_HOST_DEVICE
+/**
+ * @brief Indicates that the function is a CUDA kernel
+ */
+#define CUDF_KERNEL static
 #endif
+
+#include <cudf/utilities/export.hpp>
 
 #include <cassert>
 #include <cstddef>
@@ -40,7 +56,7 @@ class device_buffer;
 
 }  // namespace rmm
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 // Forward declaration
 class column;
 class column_view;
@@ -48,7 +64,6 @@ class mutable_column_view;
 class string_view;
 class list_view;
 class struct_view;
-
 class scalar;
 
 // clang-format off
@@ -81,6 +96,7 @@ using size_type         = int32_t;   ///< Row index type for columns and tables
 using bitmask_type      = uint32_t;  ///< Bitmask type stored as 32-bit unsigned integer
 using valid_type        = uint8_t;   ///< Valid type in host memory
 using thread_index_type = int64_t;   ///< Thread index type in kernels
+using char_utf8         = uint32_t;  ///< UTF-8 characters are 1-4 bytes
 
 /**
  * @brief Similar to `std::distance` but returns `cudf::size_type` and performs `static_cast`
@@ -250,7 +266,7 @@ class data_type {
    *
    * @param id The type's identifier
    */
-  explicit constexpr data_type(type_id id) : _id{id} {}
+  CUDF_HOST_DEVICE explicit constexpr data_type(type_id id) : _id{id} {}
 
   /**
    * @brief Construct a new `data_type` object for `numeric::fixed_point`
@@ -268,14 +284,17 @@ class data_type {
    *
    * @return The type identifier
    */
-  [[nodiscard]] constexpr type_id id() const noexcept { return _id; }
+  [[nodiscard]] CUDF_HOST_DEVICE constexpr type_id id() const noexcept { return _id; }
 
   /**
    * @brief Returns the scale (for fixed_point types)
    *
    * @return The scale
    */
-  [[nodiscard]] constexpr int32_t scale() const noexcept { return _fixed_point_scale; }
+  [[nodiscard]] CUDF_HOST_DEVICE constexpr int32_t scale() const noexcept
+  {
+    return _fixed_point_scale;
+  }
 
  private:
   type_id _id{type_id::EMPTY};
@@ -330,4 +349,4 @@ inline bool operator!=(data_type const& lhs, data_type const& rhs) { return !(lh
 std::size_t size_of(data_type t);
 
 /** @} */
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

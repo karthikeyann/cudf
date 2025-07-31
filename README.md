@@ -2,8 +2,9 @@
 
 ## 📢 cuDF can now be used as a no-code-change accelerator for pandas! To learn more, see [here](https://rapids.ai/cudf-pandas/)!
 
-cuDF is a GPU DataFrame library for loading joining, aggregating,
-filtering, and otherwise manipulating data. cuDF leverages
+cuDF (pronounced "KOO-dee-eff") is a GPU DataFrame library
+for loading, joining, aggregating, filtering, and otherwise
+manipulating data. cuDF leverages
 [libcudf](https://docs.rapids.ai/api/libcudf/stable/), a
 blazing-fast C++/CUDA dataframe library and the [Apache
 Arrow](https://arrow.apache.org/) columnar format to provide a
@@ -13,13 +14,8 @@ You can import `cudf` directly and use it like `pandas`:
 
 ```python
 import cudf
-import requests
-from io import StringIO
 
-url = "https://github.com/plotly/datasets/raw/master/tips.csv"
-content = requests.get(url).content.decode("utf-8")
-
-tips_df = cudf.read_csv(StringIO(content))
+tips_df = cudf.read_csv("https://github.com/plotly/datasets/raw/master/tips.csv")
 tips_df["tip_percentage"] = tips_df["tip"] / tips_df["total_bill"] * 100
 
 # display average tip by dining party size
@@ -35,13 +31,8 @@ supported operations and falling back to pandas when needed:
 %load_ext cudf.pandas  # pandas operations now use the GPU!
 
 import pandas as pd
-import requests
-from io import StringIO
 
-url = "https://github.com/plotly/datasets/raw/master/tips.csv"
-content = requests.get(url).content.decode("utf-8")
-
-tips_df = pd.read_csv(StringIO(content))
+tips_df = pd.read_csv("https://github.com/plotly/datasets/raw/master/tips.csv")
 tips_df["tip_percentage"] = tips_df["tip"] / tips_df["total_bill"] * 100
 
 # display average tip by dining party size
@@ -56,27 +47,39 @@ print(tips_df.groupby("size").tip_percentage.mean())
 - [libcudf (C++/CUDA) documentation](https://docs.rapids.ai/api/libcudf/stable/)
 - [RAPIDS Community](https://rapids.ai/learn-more/#get-involved): Get help, contribute, and collaborate.
 
+See the [RAPIDS install page](https://docs.rapids.ai/install) for
+the most up-to-date information and commands for installing cuDF
+and other RAPIDS packages.
+
 ## Installation
 
 ### CUDA/GPU requirements
 
-* CUDA 11.2+
-* NVIDIA driver 450.80.02+
-* Pascal architecture or better (Compute Capability >=6.0)
+* CUDA 12.0+ with a compatible NVIDIA driver
+* Volta architecture or better (Compute Capability >=7.0)
+
+### Pip
+
+cuDF can be installed via `pip` from the NVIDIA Python Package Index.
+Be sure to select the appropriate cuDF package depending
+on the major version of CUDA available in your environment:
+
+```bash
+pip install cudf-cu12
+```
 
 ### Conda
 
-cuDF can be installed with conda (via [miniconda](https://docs.conda.io/projects/miniconda/en/latest/) or the full [Anaconda distribution](https://www.anaconda.com/download) from the `rapidsai` channel:
+cuDF can be installed with conda (via [miniforge](https://github.com/conda-forge/miniforge)) from the `rapidsai` channel:
 
 ```bash
-conda install -c rapidsai -c conda-forge -c nvidia \
-    cudf=24.02 python=3.10 cuda-version=11.8
+conda install -c rapidsai -c conda-forge cudf=25.10
 ```
 
 We also provide [nightly Conda packages](https://anaconda.org/rapidsai-nightly) built from the HEAD
 of our latest development branch.
 
-Note: cuDF is supported only on Linux, and with Python versions 3.9 and later.
+Note: cuDF is supported only on Linux, and with Python versions 3.10 and later.
 
 See the [RAPIDS installation guide](https://docs.rapids.ai/install) for more OS and version info.
 

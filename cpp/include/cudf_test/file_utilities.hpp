@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,18 +17,20 @@
 #pragma once
 
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/export.hpp>
+
+#include <ftw.h>
 
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <ftw.h>
 #include <string>
 
 /**
  * @brief RAII class for creating a temporary directory.
  *
  */
-class temp_directory {
+class CUDF_EXPORT temp_directory {
   std::string _path;
 
  public:

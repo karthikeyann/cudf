@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,20 +14,21 @@
  * limitations under the License.
  */
 
+#include <cudf_test/base_fixture.hpp>
+#include <cudf_test/column_utilities.hpp>
+#include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/testing_main.hpp>
+#include <cudf_test/type_lists.hpp>
+
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/encode.hpp>
 #include <cudf/replace.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
-
-#include <cudf_test/base_fixture.hpp>
-#include <cudf_test/column_utilities.hpp>
-#include <cudf_test/column_wrapper.hpp>
-#include <cudf_test/cudf_gtest.hpp>
-#include <cudf_test/type_lists.hpp>
-
-#include <gtest/gtest.h>
+#include <cudf/utilities/error.hpp>
 
 #include <thrust/iterator/counting_iterator.h>
+
+#include <gtest/gtest.h>
 
 struct ClampErrorTest : public cudf::test::BaseFixture {};
 
@@ -40,7 +41,7 @@ TEST_F(ClampErrorTest, MisMatchingScalarTypes)
 
   cudf::test::fixed_width_column_wrapper<int32_t> input({1, 2, 3, 4, 5, 6});
 
-  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::logic_error);
+  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::data_type_error);
 }
 
 TEST_F(ClampErrorTest, MisMatchingInputAndScalarTypes)
@@ -52,7 +53,7 @@ TEST_F(ClampErrorTest, MisMatchingInputAndScalarTypes)
 
   cudf::test::fixed_width_column_wrapper<int64_t> input({1, 2, 3, 4, 5, 6});
 
-  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::logic_error);
+  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::data_type_error);
 }
 
 TEST_F(ClampErrorTest, MisMatchingReplaceScalarTypes)
@@ -68,7 +69,7 @@ TEST_F(ClampErrorTest, MisMatchingReplaceScalarTypes)
 
   cudf::test::fixed_width_column_wrapper<int64_t> input({1, 2, 3, 4, 5, 6});
 
-  EXPECT_THROW(cudf::clamp(input, *lo, *lo_replace, *hi, *hi_replace), cudf::logic_error);
+  EXPECT_THROW(cudf::clamp(input, *lo, *lo_replace, *hi, *hi_replace), cudf::data_type_error);
 }
 
 TEST_F(ClampErrorTest, InValidCase1)
@@ -639,7 +640,7 @@ TYPED_TEST(FixedPointTest, MismatchedScalarScales)
   auto const hi    = cudf::make_fixed_point_scalar<decimalXX>(8, scale);
   auto const input = fp_wrapper{{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, scale};
 
-  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::logic_error);
+  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::data_type_error);
 }
 
 TYPED_TEST(FixedPointTest, MismatchedColumnScalarScale)
@@ -654,7 +655,7 @@ TYPED_TEST(FixedPointTest, MismatchedColumnScalarScale)
   auto const hi    = cudf::make_fixed_point_scalar<decimalXX>(8, scale);
   auto const input = fp_wrapper{{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}, scale_type{-4}};
 
-  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::logic_error);
+  EXPECT_THROW(cudf::clamp(input, *lo, *hi), cudf::data_type_error);
 }
 
 CUDF_TEST_PROGRAM_MAIN()

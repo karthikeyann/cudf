@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/null_mask.hpp>
 #include <cudf/hashing/detail/hashing.hpp>
+#include <cudf/logger_macros.hpp>
+#include <cudf/strings/strings_column_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
@@ -25,51 +27,38 @@
 #include <thrust/iterator/transform_iterator.h>
 
 #include <algorithm>
-#include <exception>
 #include <numeric>
 #include <vector>
 
 namespace cudf {
 namespace detail {
-column_view_base::column_view_base(data_type type,
-                                   size_type size,
-                                   void const* data,
-                                   bitmask_type const* null_mask,
-                                   size_type null_count,
-                                   size_type offset)
-  : _type{type},
-    _size{size},
-    _data{data},
-    _null_mask{null_mask},
-    _null_count{null_count},
-    _offset{offset}
+namespace {
+
+template <typename ColumnView>
+void prefetch_col_data(ColumnView& col, void const* data_ptr, std::string_view key) noexcept
 {
-  CUDF_EXPECTS(size >= 0, "Column size cannot be negative.");
-
-  if (type.id() == type_id::EMPTY) {
-    _null_count = size;
-    CUDF_EXPECTS(nullptr == data, "EMPTY column should have no data.");
-    CUDF_EXPECTS(nullptr == null_mask, "EMPTY column should have no null mask.");
-  } else if (is_compound(type)) {
-    CUDF_EXPECTS(nullptr == data, "Compound (parent) columns cannot have data");
-  } else if (size > 0) {
-    CUDF_EXPECTS(nullptr != data, "Null data pointer.");
+  if (cudf::experimental::prefetch::detail::prefetch_config::instance().get(key)) {
+    if (col.type().id() == cudf::type_id::EMPTY) {
+      // Skip prefetching for empty columns
+      return;
+    } else if (cudf::is_fixed_width(col.type())) {
+      cudf::experimental::prefetch::detail::prefetch_noexcept(
+        key, data_ptr, col.size() * size_of(col.type()), cudf::get_default_stream());
+    } else if (col.type().id() == type_id::STRING) {
+      strings_column_view const scv{col};
+      if (data_ptr == nullptr) {
+        // Do not call chars_size if the data_ptr is nullptr.
+        return;
+      }
+      cudf::experimental::prefetch::detail::prefetch_noexcept(
+        key,
+        data_ptr,
+        scv.chars_size(cudf::get_default_stream()) * sizeof(char),
+        cudf::get_default_stream());
+    } else {
+      CUDF_LOG_DEBUG("Unsupported type: %d", static_cast<int32_t>(col.type().id()));
+    }
   }
-
-  CUDF_EXPECTS(offset >= 0, "Invalid offset.");
-
-  if ((null_count > 0) and (type.id() != type_id::EMPTY)) {
-    CUDF_EXPECTS(nullptr != null_mask, "Invalid null mask for non-zero null count.");
-  }
-}
-
-size_type column_view_base::null_count(size_type begin, size_type end) const
-{
-  CUDF_EXPECTS((begin >= 0) && (end <= size()) && (begin <= end), "Range is out of bounds.");
-  return (null_count() == 0)
-           ? 0
-           : cudf::detail::null_count(
-               null_mask(), offset() + begin, offset() + end, cudf::get_default_stream());
 }
 
 // Struct to use custom hash combine and fold expression
@@ -102,8 +91,6 @@ std::size_t shallow_hash_impl(column_view const& c, bool is_parent_empty = false
                          });
 }
 
-std::size_t shallow_hash(column_view const& input) { return shallow_hash_impl(input); }
-
 bool shallow_equivalent_impl(column_view const& lhs,
                              column_view const& rhs,
                              bool is_parent_empty = false)
@@ -120,10 +107,60 @@ bool shallow_equivalent_impl(column_view const& lhs,
                       return shallow_equivalent_impl(lhs_child, rhs_child, is_empty);
                     });
 }
+
+}  // namespace
+
+column_view_base::column_view_base(data_type type,
+                                   size_type size,
+                                   void const* data,
+                                   bitmask_type const* null_mask,
+                                   size_type null_count,
+                                   size_type offset)
+  : _type{type},
+    _size{size},
+    _data{data},
+    _null_mask{null_mask},
+    _null_count{null_count},
+    _offset{offset}
+{
+  CUDF_EXPECTS(size >= 0, "Column size cannot be negative.");
+
+  if (type.id() == type_id::EMPTY) {
+    _null_count = size;
+    CUDF_EXPECTS(nullptr == data, "EMPTY column should have no data.");
+    CUDF_EXPECTS(nullptr == null_mask, "EMPTY column should have no null mask.");
+  } else if (is_compound(type)) {
+    if (type.id() != type_id::STRING) {
+      CUDF_EXPECTS(nullptr == data, "Compound (parent) columns cannot have data");
+    }
+  } else if (size > 0) {
+    CUDF_EXPECTS(nullptr != data, "Null data pointer.");
+  }
+
+  CUDF_EXPECTS(offset >= 0, "Invalid offset.");
+
+  if ((null_count > 0) and (type.id() != type_id::EMPTY)) {
+    CUDF_EXPECTS(nullptr != null_mask, "Invalid null mask for non-zero null count.");
+  }
+}
+
+size_type column_view_base::null_count(size_type begin,
+                                       size_type end,
+                                       rmm::cuda_stream_view stream) const
+{
+  CUDF_EXPECTS((begin >= 0) && (end <= size()) && (begin <= end), "Range is out of bounds.");
+  return (null_count() == 0)
+           ? 0
+           : cudf::detail::null_count(null_mask(), offset() + begin, offset() + end, stream);
+}
+
 bool is_shallow_equivalent(column_view const& lhs, column_view const& rhs)
 {
   return shallow_equivalent_impl(lhs, rhs);
 }
+
+std::size_t shallow_hash(column_view const& input) { return shallow_hash_impl(input); }
+
 }  // namespace detail
 
 // Immutable view constructor
@@ -171,6 +208,18 @@ mutable_column_view::operator column_view() const
   std::vector<column_view> child_views(num_children());
   std::copy(std::cbegin(mutable_children), std::cend(mutable_children), std::begin(child_views));
   return column_view{_type, _size, _data, _null_mask, _null_count, _offset, std::move(child_views)};
+}
+
+void const* column_view::get_data() const noexcept
+{
+  detail::prefetch_col_data(*this, _data, "column_view::get_data");
+  return _data;
+}
+
+void const* mutable_column_view::get_data() const noexcept
+{
+  detail::prefetch_col_data(*this, _data, "mutable_column_view::get_data");
+  return _data;
 }
 
 size_type count_descendants(column_view parent)

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/null_mask.cuh>
 #include <cudf/reduction/detail/segmented_reduction.cuh>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
@@ -54,7 +55,7 @@ std::unique_ptr<column> compound_segmented_reduction(column_view const& col,
                                                      null_policy null_handling,
                                                      size_type ddof,
                                                      rmm::cuda_stream_view stream,
-                                                     rmm::mr::device_memory_resource* mr)
+                                                     rmm::device_async_resource_ref mr)
 {
   auto d_col              = cudf::column_device_view::create(col, stream);
   auto compound_op        = Op{};
@@ -71,7 +72,7 @@ std::unique_ptr<column> compound_segmented_reduction(column_view const& col,
                                               offsets,
                                               null_handling,
                                               stream,
-                                              rmm::mr::get_current_device_resource());
+                                              cudf::get_current_device_resource_ref());
 
   // Run segmented reduction
   if (col.has_nulls()) {
@@ -103,25 +104,27 @@ struct compound_float_output_dispatcher {
   }
 
  public:
-  template <typename ResultType, std::enable_if_t<is_supported_v<ResultType>()>* = nullptr>
+  template <typename ResultType>
   std::unique_ptr<column> operator()(column_view const& col,
                                      device_span<size_type const> offsets,
                                      null_policy null_handling,
                                      size_type ddof,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
+    requires(is_supported_v<ResultType>())
   {
     return compound_segmented_reduction<ElementType, ResultType, Op>(
       col, offsets, null_handling, ddof, stream, mr);
   }
 
-  template <typename ResultType, std::enable_if_t<not is_supported_v<ResultType>()>* = nullptr>
+  template <typename ResultType>
   std::unique_ptr<column> operator()(column_view const&,
                                      device_span<size_type const>,
                                      null_policy,
                                      size_type,
                                      rmm::cuda_stream_view,
-                                     rmm::mr::device_memory_resource*)
+                                     rmm::device_async_resource_ref)
+    requires(not is_supported_v<ResultType>())
   {
     CUDF_FAIL("Unsupported output data type");
   }
@@ -137,14 +140,15 @@ struct compound_segmented_dispatcher {
   }
 
  public:
-  template <typename ElementType, std::enable_if_t<is_supported_v<ElementType>()>* = nullptr>
+  template <typename ElementType>
   std::unique_ptr<column> operator()(column_view const& col,
                                      device_span<size_type const> offsets,
                                      cudf::data_type const output_dtype,
                                      null_policy null_handling,
                                      size_type ddof,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
+    requires(is_supported_v<ElementType>())
   {
     return cudf::type_dispatcher(output_dtype,
                                  compound_float_output_dispatcher<ElementType, Op>(),
@@ -156,14 +160,15 @@ struct compound_segmented_dispatcher {
                                  mr);
   }
 
-  template <typename ElementType, std::enable_if_t<not is_supported_v<ElementType>()>* = nullptr>
+  template <typename ElementType>
   std::unique_ptr<column> operator()(column_view const&,
                                      device_span<size_type const>,
                                      cudf::data_type const,
                                      null_policy,
                                      size_type,
                                      rmm::cuda_stream_view,
-                                     rmm::mr::device_memory_resource*)
+                                     rmm::device_async_resource_ref)
+    requires(not is_supported_v<ElementType>())
   {
     CUDF_FAIL("Compound operators are not supported for non-arithmetic types");
   }

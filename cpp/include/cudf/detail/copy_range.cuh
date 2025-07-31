@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,18 +18,20 @@
 #include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_view.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/grid_1d.cuh>
+#include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
-#include <rmm/device_scalar.hpp>
 
 #include <cub/cub.cuh>
-
 #include <cuda_runtime.h>
 
 #include <memory>
@@ -40,12 +42,12 @@ template <cudf::size_type block_size,
           typename SourceValidityIterator,
           typename T,
           bool has_validity>
-__global__ void copy_range_kernel(SourceValueIterator source_value_begin,
-                                  SourceValidityIterator source_validity_begin,
-                                  cudf::mutable_column_device_view target,
-                                  cudf::size_type target_begin,
-                                  cudf::size_type target_end,
-                                  cudf::size_type* __restrict__ const null_count)
+CUDF_KERNEL void copy_range_kernel(SourceValueIterator source_value_begin,
+                                   SourceValidityIterator source_validity_begin,
+                                   cudf::mutable_column_device_view target,
+                                   cudf::size_type target_begin,
+                                   cudf::size_type target_end,
+                                   cudf::size_type* __restrict__ const null_count)
 {
   using cudf::detail::warp_size;
 
@@ -56,15 +58,15 @@ __global__ void copy_range_kernel(SourceValueIterator source_value_begin,
   constexpr cudf::size_type leader_lane{0};
   int const lane_id = threadIdx.x % warp_size;
 
-  cudf::size_type const tid = threadIdx.x + blockIdx.x * blockDim.x;
-  int const warp_id         = tid / warp_size;
+  auto const tid     = cudf::detail::grid_1d::global_thread_id();
+  auto const warp_id = tid / warp_size;
 
   cudf::size_type const offset         = target.offset();
   cudf::size_type const begin_mask_idx = cudf::word_index(offset + target_begin);
   cudf::size_type const end_mask_idx   = cudf::word_index(offset + target_end);
 
   cudf::size_type mask_idx             = begin_mask_idx + warp_id;
-  cudf::size_type const masks_per_grid = gridDim.x * blockDim.x / warp_size;
+  cudf::size_type const masks_per_grid = cudf::detail::grid_1d::grid_stride() / warp_size;
 
   cudf::size_type target_offset = begin_mask_idx * warp_size - (offset + target_begin);
   cudf::size_type source_idx    = tid + target_offset;
@@ -92,7 +94,7 @@ __global__ void copy_range_kernel(SourceValueIterator source_value_begin,
       }
     }
 
-    source_idx += blockDim.x * gridDim.x;
+    source_idx += cudf::detail::grid_1d::grid_stride();
     mask_idx += masks_per_grid;
   }
 
@@ -154,7 +156,7 @@ void copy_range(SourceValueIterator source_value_begin,
   auto grid = cudf::detail::grid_1d{num_items, block_size, 1};
 
   if (target.nullable()) {
-    rmm::device_scalar<size_type> null_count(target.null_count(), stream);
+    cudf::detail::device_scalar<size_type> null_count(target.null_count(), stream);
 
     auto kernel =
       copy_range_kernel<block_size, SourceValueIterator, SourceValidityIterator, T, true>;
@@ -204,7 +206,7 @@ std::unique_ptr<column> copy_range(column_view const& source,
                                    size_type source_end,
                                    size_type target_begin,
                                    rmm::cuda_stream_view stream,
-                                   rmm::mr::device_memory_resource* mr);
+                                   rmm::device_async_resource_ref mr);
 
 }  // namespace detail
 }  // namespace cudf

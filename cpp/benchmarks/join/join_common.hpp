@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,212 +18,123 @@
 
 #include "generate_input_tables.cuh"
 
+#include <benchmarks/common/generate_input.hpp>
+#include <benchmarks/common/nvbench_utilities.hpp>
+#include <benchmarks/common/table_utilities.hpp>
 #include <benchmarks/fixture/benchmark_fixture.hpp>
-#include <benchmarks/synchronization/synchronization.hpp>
+#include <benchmarks/join/nvbench_helpers.hpp>
 
 #include <cudf/ast/expressions.hpp>
 #include <cudf/column/column_factories.hpp>
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/filling.hpp>
-#include <cudf/join.hpp>
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
-#include <nvbench/nvbench.cuh>
-
-#include <thrust/functional.h>
+#include <cuda/std/functional>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/random/linear_congruential_engine.h>
 #include <thrust/random/uniform_int_distribution.h>
 
+#include <nvbench/nvbench.cuh>
+
 #include <vector>
 
-struct null75_generator {
-  thrust::minstd_rand engine;
-  thrust::uniform_int_distribution<unsigned> rand_gen;
-  null75_generator() : engine(), rand_gen() {}
-  __device__ bool operator()(size_t i)
-  {
-    engine.discard(i);
-    // roughly 75% nulls
-    return (rand_gen(engine) & 3) == 0;
-  }
-};
+auto const JOIN_SIZE_RANGE = std::vector<nvbench::int64_t>{1000, 100'000, 10'000'000};
+using JOIN_NULLABLE_RANGE  = nvbench::enum_type_list<false, true>;
 
-enum class join_t { CONDITIONAL, MIXED, HASH };
+using JOIN_ALGORITHM = nvbench::enum_type_list<join_t::HASH, join_t::SORT_MERGE>;
+using JOIN_DATATYPES = nvbench::enum_type_list<data_type::INT32,
+                                               data_type::INT64,
+                                               data_type::FLOAT32,
+                                               data_type::FLOAT64,
+                                               data_type::STRING,
+                                               data_type::LIST,
+                                               data_type::STRUCT>;
+using JOIN_NULL_EQUALITY =
+  nvbench::enum_type_list<cudf::null_equality::EQUAL, cudf::null_equality::UNEQUAL>;
 
-inline void skip_helper(nvbench::state& state)
-{
-  auto const build_table_size = state.get_int64("Build Table Size");
-  auto const probe_table_size = state.get_int64("Probe Table Size");
+using DEFAULT_JOIN_DATATYPES     = nvbench::enum_type_list<data_type::INT32>;
+using DEFAULT_JOIN_NULL_EQUALITY = nvbench::enum_type_list<cudf::null_equality::UNEQUAL>;
 
-  if (build_table_size > probe_table_size) {
-    state.skip("Large build tables are skipped.");
-    return;
-  }
-
-  if (build_table_size * 100 <= probe_table_size) {
-    state.skip("Large probe tables are skipped.");
-    return;
-  }
-}
-
-template <typename key_type,
-          typename payload_type,
-          bool Nullable,
-          join_t join_type = join_t::HASH,
+template <bool Nullable,
+          join_t join_type                  = join_t::HASH,
+          cudf::null_equality compare_nulls = cudf::null_equality::UNEQUAL,
           typename state_type,
           typename Join>
-void BM_join(state_type& state, Join JoinFunc)
+void BM_join(state_type& state,
+             std::vector<cudf::type_id>& key_types,
+             Join JoinFunc,
+             int multiplicity   = 1,
+             double selectivity = 0.3)
 {
-  auto const build_table_size = [&]() {
-    if constexpr (std::is_same_v<state_type, benchmark::State>) {
-      return static_cast<cudf::size_type>(state.range(0));
-    }
-    if constexpr (std::is_same_v<state_type, nvbench::state>) {
-      return static_cast<cudf::size_type>(state.get_int64("Build Table Size"));
-    }
-  }();
-  auto const probe_table_size = [&]() {
-    if constexpr (std::is_same_v<state_type, benchmark::State>) {
-      return static_cast<cudf::size_type>(state.range(1));
-    }
-    if constexpr (std::is_same_v<state_type, nvbench::state>) {
-      return static_cast<cudf::size_type>(state.get_int64("Probe Table Size"));
-    }
-  }();
+  auto const right_size = static_cast<size_t>(state.get_int64("right_size"));
+  auto const left_size  = static_cast<size_t>(state.get_int64("left_size"));
 
-  double const selectivity = 0.3;
-  int const multiplicity   = 1;
+  if (right_size > left_size) {
+    state.skip("Skip large right table");
+    return;
+  }
 
-  // Generate build and probe tables
-  auto build_random_null_mask = [](int size) {
-    // roughly 75% nulls
-    auto validity =
-      thrust::make_transform_iterator(thrust::make_counting_iterator(0), null75_generator{});
-    return cudf::detail::valid_if(validity,
-                                  validity + size,
-                                  thrust::identity<bool>{},
-                                  cudf::get_default_stream(),
-                                  rmm::mr::get_current_device_resource());
-  };
+  auto const num_keys             = key_types.size();
+  auto const num_payload_cols     = 2;
+  auto [build_table, probe_table] = generate_input_tables<Nullable>(
+    key_types, right_size, left_size, num_payload_cols, multiplicity, selectivity);
+  auto const probe_view = probe_table->view();
+  auto const build_view = build_table->view();
 
-  std::unique_ptr<cudf::column> build_key_column0 = [&]() {
-    auto [null_mask, null_count] = build_random_null_mask(build_table_size);
-    return Nullable ? cudf::make_numeric_column(cudf::data_type(cudf::type_to_id<key_type>()),
-                                                build_table_size,
-                                                std::move(null_mask),
-                                                null_count)
-                    : cudf::make_numeric_column(cudf::data_type(cudf::type_to_id<key_type>()),
-                                                build_table_size);
-  }();
-  std::unique_ptr<cudf::column> probe_key_column0 = [&]() {
-    auto [null_mask, null_count] = build_random_null_mask(probe_table_size);
-    return Nullable ? cudf::make_numeric_column(cudf::data_type(cudf::type_to_id<key_type>()),
-                                                probe_table_size,
-                                                std::move(null_mask),
-                                                null_count)
-                    : cudf::make_numeric_column(cudf::data_type(cudf::type_to_id<key_type>()),
-                                                probe_table_size);
-  }();
-
-  generate_input_tables<key_type, cudf::size_type>(
-    build_key_column0->mutable_view().data<key_type>(),
-    build_table_size,
-    probe_key_column0->mutable_view().data<key_type>(),
-    probe_table_size,
-    selectivity,
-    multiplicity);
-
-  // Copy build_key_column0 and probe_key_column0 into new columns.
-  // If Nullable, the new columns will be assigned new nullmasks.
-  auto const build_key_column1 = [&]() {
-    auto col = std::make_unique<cudf::column>(build_key_column0->view());
-    if (Nullable) {
-      auto [null_mask, null_count] = build_random_null_mask(build_table_size);
-      col->set_null_mask(std::move(null_mask), null_count);
-    }
-    return col;
-  }();
-  auto const probe_key_column1 = [&]() {
-    auto col = std::make_unique<cudf::column>(probe_key_column0->view());
-    if (Nullable) {
-      auto [null_mask, null_count] = build_random_null_mask(probe_table_size);
-      col->set_null_mask(std::move(null_mask), null_count);
-    }
-    return col;
-  }();
-
-  auto init = cudf::make_fixed_width_scalar<payload_type>(static_cast<payload_type>(0));
-  auto build_payload_column = cudf::sequence(build_table_size, *init);
-  auto probe_payload_column = cudf::sequence(probe_table_size, *init);
-
-  CUDF_CHECK_CUDA(0);
-
-  cudf::table_view build_table(
-    {build_key_column0->view(), build_key_column1->view(), *build_payload_column});
-  cudf::table_view probe_table(
-    {probe_key_column0->view(), probe_key_column1->view(), *probe_payload_column});
+  auto const join_input_size = estimate_size(build_view) + estimate_size(probe_view);
 
   // Setup join parameters and result table
-  [[maybe_unused]] std::vector<cudf::size_type> columns_to_join = {0};
+  std::vector<cudf::size_type> columns_to_join(num_keys);
+  std::iota(columns_to_join.begin(), columns_to_join.end(), 0);
+  state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
 
-  // Benchmark the inner join operation
-  if constexpr (std::is_same_v<state_type, benchmark::State> and
-                (join_type != join_t::CONDITIONAL)) {
-    for (auto _ : state) {
-      cuda_event_timer raii(state, true, cudf::get_default_stream());
-
-      auto result = JoinFunc(probe_table.select(columns_to_join),
-                             build_table.select(columns_to_join),
-                             cudf::null_equality::UNEQUAL);
-    }
+  if constexpr (join_type == join_t::HASH || join_type == join_t::SORT_MERGE) {
+    state.add_element_count(join_input_size, "join_input_size");  // number of bytes
+    state.template add_global_memory_reads<nvbench::int8_t>(join_input_size);
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+      auto result = JoinFunc(
+        probe_view.select(columns_to_join), build_view.select(columns_to_join), compare_nulls);
+    });
+    set_throughputs(state);
   }
-  if constexpr (std::is_same_v<state_type, nvbench::state> and (join_type != join_t::CONDITIONAL)) {
-    if constexpr (join_type == join_t::MIXED) {
-      auto const col_ref_left_0 = cudf::ast::column_reference(0);
-      auto const col_ref_right_0 =
-        cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
-      auto left_zero_eq_right_zero =
-        cudf::ast::operation(cudf::ast::ast_operator::EQUAL, col_ref_left_0, col_ref_right_0);
-      state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        rmm::cuda_stream_view stream_view{launch.get_stream()};
-        auto result = JoinFunc(probe_table.select(columns_to_join),
-                               build_table.select(columns_to_join),
-                               probe_table.select({1}),
-                               build_table.select({1}),
-                               left_zero_eq_right_zero,
-                               cudf::null_equality::UNEQUAL,
-                               stream_view);
-      });
-    }
-    if constexpr (join_type == join_t::HASH) {
-      state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
-        rmm::cuda_stream_view stream_view{launch.get_stream()};
-        auto result = JoinFunc(probe_table.select(columns_to_join),
-                               build_table.select(columns_to_join),
-                               cudf::null_equality::UNEQUAL,
-                               stream_view);
-      });
-    }
-  }
-
-  // Benchmark conditional join
-  if constexpr (std::is_same_v<state_type, benchmark::State> and join_type == join_t::CONDITIONAL) {
-    // Common column references.
+  if constexpr (join_type == join_t::CONDITIONAL) {
     auto const col_ref_left_0  = cudf::ast::column_reference(0);
     auto const col_ref_right_0 = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
     auto left_zero_eq_right_zero =
       cudf::ast::operation(cudf::ast::ast_operator::EQUAL, col_ref_left_0, col_ref_right_0);
-
-    for (auto _ : state) {
-      cuda_event_timer raii(state, true, cudf::get_default_stream());
-
-      auto result =
-        JoinFunc(probe_table, build_table, left_zero_eq_right_zero, cudf::null_equality::UNEQUAL);
-    }
+    state.add_element_count(join_input_size, "join_input_size");  // number of bytes
+    state.template add_global_memory_reads<nvbench::int8_t>(join_input_size);
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+      auto result = JoinFunc(probe_view, build_view, left_zero_eq_right_zero, compare_nulls);
+      ;
+    });
+    set_throughputs(state);
+  }
+  if constexpr (join_type == join_t::MIXED) {
+    auto const col_ref_left_0  = cudf::ast::column_reference(0);
+    auto const col_ref_right_0 = cudf::ast::column_reference(0, cudf::ast::table_reference::RIGHT);
+    auto left_zero_eq_right_zero =
+      cudf::ast::operation(cudf::ast::ast_operator::EQUAL, col_ref_left_0, col_ref_right_0);
+    state.add_element_count(join_input_size, "join_input_size");  // number of bytes
+    state.template add_global_memory_reads<nvbench::int8_t>(join_input_size);
+    state.exec(nvbench::exec_tag::sync, [&](nvbench::launch& launch) {
+      auto result = JoinFunc(probe_view.select(std::vector<cudf::size_type>(
+                               columns_to_join.begin(), columns_to_join.begin() + num_keys / 2)),
+                             build_view.select(std::vector<cudf::size_type>(
+                               columns_to_join.begin(), columns_to_join.begin() + num_keys / 2)),
+                             probe_view.select(std::vector<cudf::size_type>(
+                               columns_to_join.begin() + num_keys / 2, columns_to_join.end())),
+                             build_view.select(std::vector<cudf::size_type>(
+                               columns_to_join.begin() + num_keys / 2, columns_to_join.end())),
+                             left_zero_eq_right_zero,
+                             compare_nulls);
+    });
+    set_throughputs(state);
   }
 }

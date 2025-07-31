@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,20 +16,21 @@
 
 #pragma once
 
+#include <cudf/io/detail/utils.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
-
-#include <rmm/mr/device/per_device_resource.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <variant>
 #include <vector>
 
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace io {
 
 /**
@@ -105,6 +106,9 @@ class csv_reader_options {
   char _quotechar = '"';
   // Whether a quote inside a value is double-quoted
   bool _doublequote = true;
+  // Whether to detect quotes surrounded by spaces e.g. `   "data"   `. This flag has no effect when
+  // _doublequote is true
+  bool _detect_whitespace_around_quotes = false;
   // Names of columns to read as datetime
   std::vector<std::string> _parse_dates_names;
   // Indexes of columns to read as datetime
@@ -375,6 +379,17 @@ class csv_reader_options {
   [[nodiscard]] bool is_enabled_doublequote() const { return _doublequote; }
 
   /**
+   * @brief Whether to detect quotes surrounded by spaces e.g. `   "data"   `. This flag has no
+   * effect when _doublequote is true
+   *
+   * @return `true` if detect_whitespace_around_quotes is enabled
+   */
+  [[nodiscard]] bool is_enabled_detect_whitespace_around_quotes() const
+  {
+    return _detect_whitespace_around_quotes;
+  }
+
+  /**
    * @brief Returns names of columns to read as datetime.
    *
    * @return Names of columns to read as datetime
@@ -416,7 +431,8 @@ class csv_reader_options {
    *
    * @return Per-column types
    */
-  std::variant<std::vector<data_type>, std::map<std::string, data_type>> const& get_dtypes() const
+  [[nodiscard]] std::variant<std::vector<data_type>, std::map<std::string, data_type>> const&
+  get_dtypes() const
   {
     return _dtypes;
   }
@@ -426,49 +442,49 @@ class csv_reader_options {
    *
    * @return Additional values to recognize as boolean true values
    */
-  std::vector<std::string> const& get_true_values() const { return _true_values; }
+  [[nodiscard]] std::vector<std::string> const& get_true_values() const { return _true_values; }
 
   /**
    * @brief Returns additional values to recognize as boolean false values.
    *
    * @return Additional values to recognize as boolean false values
    */
-  std::vector<std::string> const& get_false_values() const { return _false_values; }
+  [[nodiscard]] std::vector<std::string> const& get_false_values() const { return _false_values; }
 
   /**
    * @brief Returns additional values to recognize as null values.
    *
    * @return Additional values to recognize as null values
    */
-  std::vector<std::string> const& get_na_values() const { return _na_values; }
+  [[nodiscard]] std::vector<std::string> const& get_na_values() const { return _na_values; }
 
   /**
    * @brief Whether to keep the built-in default NA values.
    *
    * @return `true` if the built-in default NA values are kept
    */
-  bool is_enabled_keep_default_na() const { return _keep_default_na; }
+  [[nodiscard]] bool is_enabled_keep_default_na() const { return _keep_default_na; }
 
   /**
    * @brief Whether to disable null filter.
    *
    * @return `true` if null filter is enabled
    */
-  bool is_enabled_na_filter() const { return _na_filter; }
+  [[nodiscard]] bool is_enabled_na_filter() const { return _na_filter; }
 
   /**
    * @brief Whether to parse dates as DD/MM versus MM/DD.
    *
    * @return True if dates are parsed as DD/MM, false if MM/DD
    */
-  bool is_enabled_dayfirst() const { return _dayfirst; }
+  [[nodiscard]] bool is_enabled_dayfirst() const { return _dayfirst; }
 
   /**
    * @brief Returns timestamp_type to which all timestamp columns will be cast.
    *
    * @return timestamp_type to which all timestamp columns will be cast
    */
-  data_type get_timestamp_type() const { return _timestamp_type; }
+  [[nodiscard]] data_type get_timestamp_type() const { return _timestamp_type; }
 
   /**
    * @brief Sets compression format of the source.
@@ -698,6 +714,14 @@ class csv_reader_options {
   void enable_doublequote(bool val) { _doublequote = val; }
 
   /**
+   * @brief Sets whether to detect quotes surrounded by spaces e.g. `   "data"   `. This flag has no
+   * effect when _doublequote is true
+   *
+   * @param val Boolean value to enable/disable
+   */
+  void enable_detect_whitespace_around_quotes(bool val) { _detect_whitespace_around_quotes = val; }
+
+  /**
    * @brief Sets names of columns to read as datetime.
    *
    * @param col_names Vector of column names to infer as datetime
@@ -893,7 +917,7 @@ class csv_reader_options_builder {
    */
   csv_reader_options_builder& prefix(std::string pfx)
   {
-    options._prefix = pfx;
+    options._prefix = std::move(pfx);
     return *this;
   }
 
@@ -1126,6 +1150,19 @@ class csv_reader_options_builder {
   }
 
   /**
+   * @brief Sets whether to detect quotes surrounded by spaces e.g. `   "data"   `. This flag has no
+   * effect when _doublequote is true
+   *
+   * @param val Boolean value to enable/disable
+   * @return this for chaining
+   */
+  csv_reader_options_builder& detect_whitespace_around_quotes(bool val)
+  {
+    options._detect_whitespace_around_quotes = val;
+    return *this;
+  }
+
+  /**
    * @brief Sets names of columns to read as datetime.
    *
    * @param col_names Vector of column names to read as datetime
@@ -1315,8 +1352,8 @@ class csv_reader_options_builder {
  */
 table_with_metadata read_csv(
   csv_reader_options options,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 /**
@@ -1326,7 +1363,7 @@ table_with_metadata read_csv(
  */
 
 /**
- *@brief Builder to build options for `writer_csv()`.
+ *@brief Builder to build options for `write_csv()`.
  */
 class csv_writer_options_builder;
 
@@ -1363,8 +1400,8 @@ class csv_writer_options {
    * @param sink The sink used for writer output
    * @param table Table to be written to output
    */
-  explicit csv_writer_options(sink_info const& sink, table_view const& table)
-    : _sink(sink), _table(table), _rows_per_chunk(table.num_rows())
+  explicit csv_writer_options(sink_info sink, table_view const& table)
+    : _sink(std::move(sink)), _table(table), _rows_per_chunk(table.num_rows())
   {
   }
 
@@ -1414,7 +1451,7 @@ class csv_writer_options {
    *
    * @return string to used for null entries
    */
-  [[nodiscard]] std::string get_na_rep() const { return _na_rep; }
+  [[nodiscard]] std::string const& get_na_rep() const { return _na_rep; }
 
   /**
    * @brief Whether to write headers to csv.
@@ -1435,7 +1472,7 @@ class csv_writer_options {
    *
    * @return Character used for separating lines
    */
-  [[nodiscard]] std::string get_line_terminator() const { return _line_terminator; }
+  [[nodiscard]] std::string const& get_line_terminator() const { return _line_terminator; }
 
   /**
    * @brief Returns character used for separating column values.
@@ -1449,14 +1486,14 @@ class csv_writer_options {
    *
    * @return string used for values != 0 in INT8 types
    */
-  [[nodiscard]] std::string get_true_value() const { return _true_value; }
+  [[nodiscard]] std::string const& get_true_value() const { return _true_value; }
 
   /**
    * @brief Returns string used for values == 0 in INT8 types.
    *
    * @return string used for values == 0 in INT8 types
    */
-  [[nodiscard]] std::string get_false_value() const { return _false_value; }
+  [[nodiscard]] std::string const& get_false_value() const { return _false_value; }
 
   /**
    * @brief Returns the quote style for the writer.
@@ -1483,7 +1520,7 @@ class csv_writer_options {
    *
    * @param val String to represent null value
    */
-  void set_na_rep(std::string val) { _na_rep = val; }
+  void set_na_rep(std::string val) { _na_rep = std::move(val); }
 
   /**
    * @brief Enables/Disables headers being written to csv.
@@ -1504,7 +1541,7 @@ class csv_writer_options {
    *
    * @param term Character to represent line termination
    */
-  void set_line_terminator(std::string term) { _line_terminator = term; }
+  void set_line_terminator(std::string term) { _line_terminator = std::move(term); }
 
   /**
    * @brief Sets character used for separating column values.
@@ -1518,14 +1555,14 @@ class csv_writer_options {
    *
    * @param val String to represent values != 0 in INT8 types
    */
-  void set_true_value(std::string val) { _true_value = val; }
+  void set_true_value(std::string val) { _true_value = std::move(val); }
 
   /**
    * @brief Sets string used for values == 0 in INT8 types.
    *
    * @param val String to represent values == 0 in INT8 types
    */
-  void set_false_value(std::string val) { _false_value = val; }
+  void set_false_value(std::string val) { _false_value = std::move(val); }
 
   /**
    * @brief (Re)sets the table being written.
@@ -1718,12 +1755,31 @@ class csv_writer_options_builder {
  *
  * @param options Settings for controlling writing behavior
  * @param stream CUDA stream used for device memory operations and kernel launches
- * @param mr Device memory resource to use for device memory allocation
  */
 void write_csv(csv_writer_options const& options,
-               rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-               rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+               rmm::cuda_stream_view stream = cudf::get_default_stream());
+
+/// @cond
+struct is_supported_csv_write_type_fn {
+  template <typename T>
+  constexpr bool operator()() const
+  {
+    return cudf::io::detail::is_convertible_to_string_column<T>();
+  }
+};
+/// @endcond
+
+/**
+ * @brief Checks if a cudf::data_type is supported for CSV writing.
+ *
+ * @param type The data_type to check.
+ * @return true if the type is supported for CSV writing, false otherwise.
+ */
+constexpr bool is_supported_write_csv(data_type type)
+{
+  return cudf::type_dispatcher(type, is_supported_csv_write_type_fn{});
+}
 
 /** @} */  // end of group
 }  // namespace io
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

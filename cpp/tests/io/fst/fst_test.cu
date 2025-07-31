@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,12 +14,14 @@
  * limitations under the License.
  */
 
-#include <io/fst/lookup_tables.cuh>
-#include <io/utilities/hostdevice_vector.hpp>
+#include "io/fst/lookup_tables.cuh"
+#include "io/utilities/hostdevice_vector.hpp"
+
 #include <tests/io/fst/common.hpp>
 
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/cudf_gtest.hpp>
+#include <cudf_test/testing_main.hpp>
 
 #include <cudf/scalar/scalar_factories.hpp>
 #include <cudf/strings/repeat_strings.hpp>
@@ -167,7 +169,9 @@ TEST_F(FstTest, GroundTruth)
   auto parser = cudf::io::fst::detail::make_fst(
     cudf::io::fst::detail::make_symbol_group_lut(pda_sgs),
     cudf::io::fst::detail::make_transition_table(pda_state_tt),
-    cudf::io::fst::detail::make_translation_table<TT_NUM_STATES * NUM_SYMBOL_GROUPS>(pda_out_tt),
+    cudf::io::fst::detail::make_translation_table<TT_NUM_STATES * NUM_SYMBOL_GROUPS,
+                                                  min_translated_out,
+                                                  max_translated_out>(pda_out_tt),
     stream);
 
   // Allocate device-side temporary storage & run algorithm

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,10 +18,9 @@
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/strings/strings_column_view.hpp>
 #include <cudf/table/table.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
-#include <rmm/mr/device/per_device_resource.hpp>
-
-namespace cudf {
+namespace CUDF_EXPORT cudf {
 namespace strings {
 /**
  * @addtogroup strings_split
@@ -54,10 +53,10 @@ namespace strings {
  */
 std::unique_ptr<table> split(
   strings_column_view const& strings_column,
-  string_scalar const& delimiter      = string_scalar(""),
-  size_type maxsplit                  = -1,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  string_scalar const& delimiter    = string_scalar(""),
+  size_type maxsplit                = -1,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a list of columns by splitting each string using the
@@ -84,10 +83,10 @@ std::unique_ptr<table> split(
  */
 std::unique_ptr<table> rsplit(
   strings_column_view const& strings_column,
-  string_scalar const& delimiter      = string_scalar(""),
-  size_type maxsplit                  = -1,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  string_scalar const& delimiter    = string_scalar(""),
+  size_type maxsplit                = -1,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Splits individual strings elements into a list of strings.
@@ -143,7 +142,7 @@ std::unique_ptr<table> rsplit(
  *
  * A null string element will result in a null list item for that row.
  *
- * @throw cudf:logic_error if `delimiter` is invalid.
+ * @throw cudf::logic_error if `delimiter` is invalid.
  *
  * @param strings A column of string elements to be split
  * @param delimiter The string to identify split points in each string;
@@ -158,10 +157,10 @@ std::unique_ptr<table> rsplit(
  */
 std::unique_ptr<column> split_record(
   strings_column_view const& strings,
-  string_scalar const& delimiter      = string_scalar(""),
-  size_type maxsplit                  = -1,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  string_scalar const& delimiter    = string_scalar(""),
+  size_type maxsplit                = -1,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /**
  * @brief  Splits individual strings elements into a list of strings starting
@@ -222,7 +221,7 @@ std::unique_ptr<column> split_record(
  *
  * A null string element will result in a null list item for that row.
  *
- * @throw cudf:logic_error if `delimiter` is invalid.
+ * @throw cudf::logic_error if `delimiter` is invalid.
  *
  * @param strings A column of string elements to be split
  * @param delimiter The string to identify split points in each string;
@@ -237,11 +236,34 @@ std::unique_ptr<column> split_record(
  */
 std::unique_ptr<column> rsplit_record(
   strings_column_view const& strings,
-  string_scalar const& delimiter      = string_scalar(""),
-  size_type maxsplit                  = -1,
-  rmm::cuda_stream_view stream        = cudf::get_default_stream(),
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource());
+  string_scalar const& delimiter    = string_scalar(""),
+  size_type maxsplit                = -1,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+/**
+ * @brief Returns a columns of strings by splitting each input string using the
+ * specified delimiter and returning the string at the specified index
+ *
+ * Any null rows in the input return corresponding null output rows.
+ * A null row is also returned if the number of tokens computed by splitting
+ * the string for that row is less than the `index`.
+ *
+ * @param input Strings instance for this operation
+ * @param delimiter UTF-8 encoded string indicating the split points in each string;
+ *        Default of empty string indicates split on whitespace
+ * @param index The 0-based index of the string to return from the split
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return New column of strings
+ */
+std::unique_ptr<column> split_part(
+  strings_column_view const& input,
+  string_scalar const& delimiter    = string_scalar(""),
+  size_type index                   = 0,
+  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
+  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of doxygen group
 }  // namespace strings
-}  // namespace cudf
+}  // namespace CUDF_EXPORT cudf

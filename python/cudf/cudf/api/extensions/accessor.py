@@ -1,10 +1,12 @@
-# Copyright (c) 2020-2022, NVIDIA CORPORATION.
+# Copyright (c) 2020-2025, NVIDIA CORPORATION.
 
 import warnings
 
 from pandas.core.accessor import CachedAccessor
 
-import cudf
+from cudf.core.dataframe import DataFrame
+from cudf.core.index import Index
+from cudf.core.series import Series
 from cudf.utils.docutils import docfmt_partial
 
 _docstring_register_accessor = """
@@ -37,8 +39,8 @@ _docstring_register_accessor = """
 _dataframe_example = """
     In your library code:
 
-        >>> import cudf as gd
-        >>> @gd.api.extensions.register_dataframe_accessor("point")
+        >>> import cudf
+        >>> @cudf.api.extensions.register_dataframe_accessor("point")
         ... class PointsAccessor:
         ...     def __init__(self, obj):
         ...         self._validate(obj)
@@ -57,7 +59,7 @@ _dataframe_example = """
 
     Then in user code:
 
-        >>> df = gd.DataFrame({'x': [1,2,3,4,5,6], 'y':[7,6,5,4,3,2]})
+        >>> df = cudf.DataFrame({'x': [1,2,3,4,5,6], 'y':[7,6,5,4,3,2]})
         >>> df.point.bounding_box
         (1, 2, 6, 7)
 
@@ -66,8 +68,8 @@ _dataframe_example = """
 _index_example = """
     In your library code:
 
-        >>> import cudf as gd
-        >>> @gd.api.extensions.register_index_accessor("odd")
+        >>> import cudf
+        >>> @cudf.api.extensions.register_index_accessor("odd")
         ... class OddRowAccessor:
         ...     def __init__(self, obj):
         ...         self._obj = obj
@@ -76,7 +78,7 @@ _index_example = """
 
     Then in user code:
 
-        >>> gs = gd.Index(list(range(0, 50)))
+        >>> gs = cudf.Index(list(range(0, 50)))
         >>> gs.odd[1]
         1
         >>> gs.odd[2]
@@ -89,8 +91,8 @@ _index_example = """
 _series_example = """
     In your library code:
 
-        >>> import cudf as gd
-        >>> @gd.api.extensions.register_series_accessor("odd")
+        >>> import cudf
+        >>> @cudf.api.extensions.register_series_accessor("odd")
         ... class OddRowAccessor:
         ...     def __init__(self, obj):
         ...         self._obj = obj
@@ -99,7 +101,7 @@ _series_example = """
 
     Then in user code:
 
-        >>> gs = gd.Series(list(range(0, 50)))
+        >>> gs = cudf.Series(list(range(0, 50)))
         >>> gs.odd[1]
         1
         >>> gs.odd[2]
@@ -146,16 +148,16 @@ def _register_accessor(name, cls):
 @doc_register_dataframe_accessor()
 def register_dataframe_accessor(name):
     """{docstring}"""
-    return _register_accessor(name, cudf.DataFrame)
+    return _register_accessor(name, DataFrame)
 
 
 @doc_register_index_accessor()
 def register_index_accessor(name):
     """{docstring}"""
-    return _register_accessor(name, cudf.BaseIndex)
+    return _register_accessor(name, Index)
 
 
 @doc_register_series_accessor()
 def register_series_accessor(name):
     """{docstring}"""
-    return _register_accessor(name, cudf.Series)
+    return _register_accessor(name, Series)

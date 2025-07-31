@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,9 +22,11 @@
 #include <cudf/lists/detail/dremel.hpp>
 #include <cudf/lists/lists_column_view.hpp>
 #include <cudf/table/table_device_view.cuh>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/functional>
 #include <thrust/copy.h>
 #include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
@@ -34,7 +36,7 @@
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/discard_iterator.h>
 
-#include <cuda/functional>
+#include <functional>
 
 namespace cudf::detail {
 namespace {
@@ -129,7 +131,8 @@ dremel_data get_encoding(column_view h_col,
   }
   std::unique_ptr<column> empty_list_offset_col;
   if (has_empty_list_offsets) {
-    empty_list_offset_col = make_fixed_width_column(data_type(type_id::INT32), 1);
+    empty_list_offset_col = make_fixed_width_column(
+      data_type(type_to_id<size_type>()), 1, mask_state::UNALLOCATED, stream);
     CUDF_CUDA_TRY(cudaMemsetAsync(
       empty_list_offset_col->mutable_view().head(), 0, sizeof(size_type), stream.value()));
     std::function<column_view(column_view const&)> normalize_col = [&](column_view const& col) {
@@ -257,10 +260,8 @@ dremel_data get_encoding(column_view h_col,
     },
     stream);
 
-  thrust::host_vector<size_type> column_offsets =
-    cudf::detail::make_host_vector_async(d_column_offsets, stream);
-  thrust::host_vector<size_type> column_ends =
-    cudf::detail::make_host_vector_async(d_column_ends, stream);
+  auto column_offsets = cudf::detail::make_host_vector_async(d_column_offsets, stream);
+  auto column_ends    = cudf::detail::make_host_vector_async(d_column_ends, stream);
   stream.synchronize();
 
   size_t max_vals_size = 0;
@@ -269,7 +270,7 @@ dremel_data get_encoding(column_view h_col,
   }
 
   auto d_nullability = cudf::detail::make_device_uvector_async(
-    nullability, stream, rmm::mr::get_current_device_resource());
+    nullability, stream, cudf::get_current_device_resource_ref());
 
   rmm::device_uvector<uint8_t> rep_level(max_vals_size, stream);
   rmm::device_uvector<uint8_t> def_level(max_vals_size, stream);

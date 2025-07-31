@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2024, NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -9,8 +9,10 @@ Usage:
     python analyze-test-failures.py <path-to-test-log> <file-or-pattern>
 
 Example:
+-------
     python analyze-test-failures.py log.json frame/*
 """
+
 import json
 import sys
 from collections import Counter
@@ -39,7 +41,7 @@ def count_failures(log_file_name, pattern):
                     PANDAS_TEST_PREFIX
                 )
                 if fnmatch(line_module_name, pattern):
-                    if "longrepr" in line and line["longrepr"]:
+                    if line.get("longrepr"):
                         if isinstance(line["longrepr"], (tuple, list)):
                             message = line["longrepr"][2].splitlines()[0]
                         elif isinstance(line["longrepr"], str):

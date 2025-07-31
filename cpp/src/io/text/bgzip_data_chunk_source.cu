@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,16 @@
  * limitations under the License.
  */
 
+#include "io/comp/common.hpp"
+#include "io/comp/decompression.hpp"
 #include "io/text/device_data_chunks.hpp"
 
-#include <io/comp/nvcomp_adapter.hpp>
-#include <io/utilities/config_utils.hpp>
-
 #include <cudf/detail/nvtx/ranges.hpp>
+#include <cudf/detail/utilities/host_vector.hpp>
 #include <cudf/detail/utilities/integer_utils.hpp>
-#include <cudf/detail/utilities/pinned_host_vector.hpp>
+#include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/io/config_utils.hpp>
+#include <cudf/io/detail/codec.hpp>
 #include <cudf/io/text/data_chunk_source_factories.hpp>
 #include <cudf/io/text/detail/bgzip_utils.hpp>
 #include <cudf/utilities/default_stream.hpp>
@@ -67,15 +69,16 @@ struct bgzip_nvcomp_transform_functor {
 class bgzip_data_chunk_reader : public data_chunk_reader {
  private:
   template <typename T>
-  static void copy_to_device(cudf::detail::pinned_host_vector<T> const& host,
+  static void copy_to_device(cudf::detail::host_vector<T> const& host,
                              rmm::device_uvector<T>& device,
                              rmm::cuda_stream_view stream)
   {
     // Buffer needs to be padded.
     // Required by `inflate_kernel`.
-    device.resize(cudf::util::round_up_safe(host.size(), BUFFER_PADDING_MULTIPLE), stream);
-    CUDF_CUDA_TRY(cudaMemcpyAsync(
-      device.data(), host.data(), host.size() * sizeof(T), cudaMemcpyDefault, stream.value()));
+    device.resize(cudf::util::round_up_safe(host.size(), cudf::io::detail::BUFFER_PADDING_MULTIPLE),
+                  stream);
+    cudf::detail::cuda_memcpy_async<T>(
+      device_span<T>{device}.subspan(0, host.size()), host, stream);
   }
 
   struct decompression_blocks {
@@ -85,16 +88,16 @@ class bgzip_data_chunk_reader : public data_chunk_reader {
       1 << 16;  // 64k offset allocation, resized on demand
 
     cudaEvent_t event;
-    cudf::detail::pinned_host_vector<char> h_compressed_blocks;
-    cudf::detail::pinned_host_vector<std::size_t> h_compressed_offsets;
-    cudf::detail::pinned_host_vector<std::size_t> h_decompressed_offsets;
+    cudf::detail::host_vector<char> h_compressed_blocks;
+    cudf::detail::host_vector<std::size_t> h_compressed_offsets;
+    cudf::detail::host_vector<std::size_t> h_decompressed_offsets;
     rmm::device_uvector<char> d_compressed_blocks;
     rmm::device_uvector<char> d_decompressed_blocks;
     rmm::device_uvector<std::size_t> d_compressed_offsets;
     rmm::device_uvector<std::size_t> d_decompressed_offsets;
     rmm::device_uvector<device_span<uint8_t const>> d_compressed_spans;
     rmm::device_uvector<device_span<uint8_t>> d_decompressed_spans;
-    rmm::device_uvector<compression_result> d_decompression_results;
+    rmm::device_uvector<cudf::io::detail::codec_exec_result> d_decompression_results;
     std::size_t compressed_size_with_headers{};
     std::size_t max_decompressed_size{};
     // this is usually equal to decompressed_size()
@@ -104,7 +107,10 @@ class bgzip_data_chunk_reader : public data_chunk_reader {
     bool is_decompressed{};
 
     decompression_blocks(rmm::cuda_stream_view init_stream)
-      : d_compressed_blocks(0, init_stream),
+      : h_compressed_blocks{cudf::detail::make_pinned_vector_async<char>(0, init_stream)},
+        h_compressed_offsets{cudf::detail::make_pinned_vector_async<std::size_t>(0, init_stream)},
+        h_decompressed_offsets{cudf::detail::make_pinned_vector_async<std::size_t>(0, init_stream)},
+        d_compressed_blocks(0, init_stream),
         d_decompressed_blocks(0, init_stream),
         d_compressed_offsets(0, init_stream),
         d_decompressed_offsets(0, init_stream),
@@ -144,23 +150,14 @@ class bgzip_data_chunk_reader : public data_chunk_reader {
         span_it,
         bgzip_nvcomp_transform_functor{reinterpret_cast<uint8_t const*>(d_compressed_blocks.data()),
                                        reinterpret_cast<uint8_t*>(d_decompressed_blocks.data())});
-      if (decompressed_size() > 0) {
-        if (nvcomp::is_decompression_disabled(nvcomp::compression_type::DEFLATE)) {
-          gpuinflate(d_compressed_spans,
-                     d_decompressed_spans,
-                     d_decompression_results,
-                     gzip_header_included::NO,
-                     stream);
-        } else {
-          cudf::io::nvcomp::batched_decompress(cudf::io::nvcomp::compression_type::DEFLATE,
-                                               d_compressed_spans,
-                                               d_decompressed_spans,
-                                               d_decompression_results,
-                                               max_decompressed_size,
-                                               decompressed_size(),
-                                               stream);
-        }
-      }
+
+      cudf::io::detail::decompress(cudf::io::compression_type::ZLIB,
+                                   d_compressed_spans,
+                                   d_decompressed_spans,
+                                   d_decompression_results,
+                                   max_decompressed_size,
+                                   decompressed_size(),
+                                   stream);
       is_decompressed = true;
     }
 

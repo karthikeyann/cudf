@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -31,11 +31,6 @@ static void bench_replace(nvbench::state& state)
   auto const num_rows  = static_cast<cudf::size_type>(state.get_int64("num_rows"));
   auto const row_width = static_cast<cudf::size_type>(state.get_int64("row_width"));
 
-  if (static_cast<std::size_t>(num_rows) * static_cast<std::size_t>(row_width) >=
-      static_cast<std::size_t>(std::numeric_limits<cudf::size_type>::max())) {
-    state.skip("Skip benchmarks greater than size_type limit");
-  }
-
   std::vector<std::string> words{" ",        "one  ",    "two ",       "three ",     "four ",
                                  "five ",    "six  ",    "sevén  ",    "eight ",     "nine ",
                                  "ten   ",   "eleven ",  "twelve ",    "thirteen  ", "fourteen ",
@@ -59,7 +54,7 @@ static void bench_replace(nvbench::state& state)
 
   state.set_cuda_stream(nvbench::make_cuda_stream_view(cudf::get_default_stream().value()));
 
-  auto chars_size = view.chars_size();
+  auto chars_size = view.chars_size(cudf::get_default_stream());
   state.add_global_memory_reads<nvbench::int8_t>(chars_size);
   state.add_global_memory_writes<nvbench::int8_t>(chars_size);
 
@@ -71,5 +66,5 @@ static void bench_replace(nvbench::state& state)
 
 NVBENCH_BENCH(bench_replace)
   .set_name("replace")
-  .add_int64_axis("row_width", {32, 64, 128, 256, 512, 1024})
-  .add_int64_axis("num_rows", {4096, 32768, 262144, 2097152, 16777216});
+  .add_int64_axis("row_width", {32, 64, 128, 256})
+  .add_int64_axis("num_rows", {32768, 262144, 2097152});

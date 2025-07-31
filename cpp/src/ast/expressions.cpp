@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,42 +17,44 @@
 #include <cudf/ast/detail/expression_transformer.hpp>
 #include <cudf/ast/detail/operators.hpp>
 #include <cudf/ast/expressions.hpp>
-#include <cudf/scalar/scalar.hpp>
-#include <cudf/scalar/scalar_device_view.cuh>
-#include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
+
+#include <stdexcept>
 
 namespace cudf {
 namespace ast {
 
-operation::operation(ast_operator op, expression const& input) : op(op), operands({input})
+operation::operation(ast_operator op, expression const& input) : op{op}, operands{input}
 {
-  if (cudf::ast::detail::ast_operator_arity(op) != 1) {
-    CUDF_FAIL("The provided operator is not a unary operator.");
-  }
+  CUDF_EXPECTS(cudf::ast::detail::ast_operator_arity(op) == 1,
+               "The provided operator is not a unary operator.",
+               std::invalid_argument);
 }
 
 operation::operation(ast_operator op, expression const& left, expression const& right)
-  : op(op), operands({left, right})
+  : op{op}, operands{left, right}
 {
-  if (cudf::ast::detail::ast_operator_arity(op) != 2) {
-    CUDF_FAIL("The provided operator is not a binary operator.");
-  }
+  CUDF_EXPECTS(cudf::ast::detail::ast_operator_arity(op) == 2,
+               "The provided operator is not a binary operator.",
+               std::invalid_argument);
 }
 
 cudf::size_type literal::accept(detail::expression_parser& visitor) const
 {
   return visitor.visit(*this);
 }
+
 cudf::size_type column_reference::accept(detail::expression_parser& visitor) const
 {
   return visitor.visit(*this);
 }
+
 cudf::size_type operation::accept(detail::expression_parser& visitor) const
 {
   return visitor.visit(*this);
 }
+
 cudf::size_type column_name_reference::accept(detail::expression_parser& visitor) const
 {
   return visitor.visit(*this);
@@ -63,16 +65,30 @@ auto literal::accept(detail::expression_transformer& visitor) const
 {
   return visitor.visit(*this);
 }
+
 auto column_reference::accept(detail::expression_transformer& visitor) const
   -> decltype(visitor.visit(*this))
 {
   return visitor.visit(*this);
 }
+
 auto operation::accept(detail::expression_transformer& visitor) const
   -> decltype(visitor.visit(*this))
 {
   return visitor.visit(*this);
 }
+
+bool operation::may_evaluate_null(table_view const& left,
+                                  table_view const& right,
+                                  rmm::cuda_stream_view stream) const
+{
+  return std::any_of(operands.cbegin(),
+                     operands.cend(),
+                     [&left, &right, &stream](std::reference_wrapper<expression const> subexpr) {
+                       return subexpr.get().may_evaluate_null(left, right, stream);
+                     });
+};
+
 auto column_name_reference::accept(detail::expression_transformer& visitor) const
   -> decltype(visitor.visit(*this))
 {

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,8 +13,6 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-
-#include <cuda_runtime.h>
 
 #include <cudf/strings/string_view.hpp>
 #include <cudf/utilities/traits.hpp>
@@ -129,6 +127,22 @@ struct is_index_type_impl {
  */
 bool is_index_type(data_type type) { return cudf::type_dispatcher(type, is_index_type_impl{}); }
 
+struct is_signed_impl {
+  template <typename T>
+  constexpr bool operator()()
+  {
+    return is_signed<T>();
+  }
+};
+
+/**
+ * @brief Indicates whether `type` is a signed numeric `data_type`.
+ *
+ * @param type The `data_type` to verify
+ * @return true `type` is signed numeric
+ */
+bool is_signed(data_type type) { return cudf::type_dispatcher(type, is_signed_impl{}); }
+
 struct is_unsigned_impl {
   template <typename T>
   constexpr bool operator()()
@@ -169,6 +183,19 @@ struct is_integral_not_bool_impl {
 bool is_integral_not_bool(data_type type)
 {
   return cudf::type_dispatcher(type, is_integral_not_bool_impl{});
+}
+
+struct is_numeric_not_bool_impl {
+  template <typename T>
+  constexpr bool operator()()
+  {
+    return is_numeric_not_bool<T>();
+  }
+};
+
+bool is_numeric_not_bool(data_type type)
+{
+  return cudf::type_dispatcher(type, is_numeric_not_bool_impl{});
 }
 
 struct is_floating_point_impl {
@@ -367,14 +394,16 @@ bool is_nested(data_type type) { return cudf::type_dispatcher(type, is_nested_im
 namespace {
 template <typename FromType>
 struct is_bit_castable_to_impl {
-  template <typename ToType, std::enable_if_t<is_compound<ToType>()>* = nullptr>
+  template <typename ToType>
   constexpr bool operator()()
+    requires(is_compound<ToType>())
   {
     return false;
   }
 
-  template <typename ToType, std::enable_if_t<not is_compound<ToType>()>* = nullptr>
+  template <typename ToType>
   constexpr bool operator()()
+    requires(not is_compound<ToType>())
   {
     if (not cuda::std::is_trivially_copyable_v<FromType> ||
         not cuda::std::is_trivially_copyable_v<ToType>) {
@@ -387,14 +416,16 @@ struct is_bit_castable_to_impl {
 };
 
 struct is_bit_castable_from_impl {
-  template <typename FromType, std::enable_if_t<is_compound<FromType>()>* = nullptr>
+  template <typename FromType>
   constexpr bool operator()(data_type)
+    requires(is_compound<FromType>())
   {
     return false;
   }
 
-  template <typename FromType, std::enable_if_t<not is_compound<FromType>()>* = nullptr>
+  template <typename FromType>
   constexpr bool operator()(data_type to)
+    requires(not is_compound<FromType>())
   {
     return cudf::type_dispatcher(to, is_bit_castable_to_impl<FromType>{});
   }

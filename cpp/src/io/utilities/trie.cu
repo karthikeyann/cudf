@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -22,6 +22,7 @@
 #include "trie.cuh"
 
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <cuda_runtime.h>
@@ -93,7 +94,7 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
           nodes[idx].children_offset = static_cast<uint16_t>(nodes.size() - idx);
         }
         // Add node to the trie
-        nodes.push_back(serial_trie_node(static_cast<char>(i), node->children[i]->is_end_of_word));
+        nodes.emplace_back(static_cast<char>(i), node->children[i]->is_end_of_word);
         // Add to the queue, with the index within the new trie
         to_visit.emplace_back(node->children[i].get(), static_cast<uint16_t>(nodes.size()) - 1);
 
@@ -101,10 +102,9 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
       }
     }
     // Only add the terminating character if any nodes were added
-    if (has_children) { nodes.push_back(serial_trie_node(trie_terminating_character)); }
+    if (has_children) { nodes.emplace_back(trie_terminating_character); }
   }
-  return cudf::detail::make_device_uvector_sync(
-    nodes, stream, rmm::mr::get_current_device_resource());
+  return cudf::detail::make_device_uvector(nodes, stream, cudf::get_current_device_resource_ref());
 }
 
 }  // namespace detail

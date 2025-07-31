@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,15 @@
 
 #pragma once
 
-#include <cudf/detail/normalizing_iterator.cuh>
-
 #include <cudf/column/column_view.hpp>
 #include <cudf/detail/iterator.cuh>
+#include <cudf/detail/normalizing_iterator.cuh>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <cuda/std/optional>
 #include <thrust/iterator/constant_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
-#include <thrust/optional.h>
 #include <thrust/pair.h>
 
 namespace cudf {
@@ -94,7 +93,7 @@ struct input_indexalator : base_normalator<input_indexalator, cudf::size_type> {
    */
   __device__ inline cudf::size_type operator[](size_type idx) const
   {
-    void const* tp = p_ + (idx * this->width_);
+    void const* tp = p_ + (static_cast<std::ptrdiff_t>(idx) * this->width_);
     return type_dispatcher(this->dtype_, normalize_type{}, tp);
   }
 
@@ -110,7 +109,7 @@ struct input_indexalator : base_normalator<input_indexalator, cudf::size_type> {
   CUDF_HOST_DEVICE input_indexalator(void const* data, data_type dtype, cudf::size_type offset = 0)
     : base_normalator<input_indexalator, cudf::size_type>(dtype), p_{static_cast<char const*>(data)}
   {
-    p_ += offset * this->width_;
+    p_ += static_cast<std::ptrdiff_t>(offset) * this->width_;
   }
 
  protected:
@@ -138,7 +137,7 @@ struct input_indexalator : base_normalator<input_indexalator, cudf::size_type> {
  *                      values->begin<Element>(),
  *                      values->end<Element>(),
  *                      result_itr,
- *                      thrust::less<Element>());
+ *                      cuda::std::less<Element>());
  * @endcode
  */
 struct output_indexalator : base_normalator<output_indexalator, cudf::size_type> {
@@ -166,7 +165,7 @@ struct output_indexalator : base_normalator<output_indexalator, cudf::size_type>
   __device__ inline output_indexalator const operator[](size_type idx) const
   {
     output_indexalator tmp{*this};
-    tmp.p_ += (idx * this->width_);
+    tmp.p_ += static_cast<std::ptrdiff_t>(idx) * this->width_;
     return tmp;
   }
 
@@ -377,10 +376,10 @@ struct indexalator_factory {
       iter = make_input_iterator(col);
     }
 
-    __device__ thrust::optional<size_type> operator()(size_type i) const
+    __device__ cuda::std::optional<size_type> operator()(size_type i) const
     {
-      return has_nulls && !bit_is_set(null_mask, i + offset) ? thrust::nullopt
-                                                             : thrust::make_optional(iter[i]);
+      return has_nulls && !bit_is_set(null_mask, i + offset) ? cuda::std::nullopt
+                                                             : cuda::std::make_optional(iter[i]);
     }
   };
 
@@ -401,9 +400,9 @@ struct indexalator_factory {
       iter = indexalator_factory::make_input_iterator(input);
     }
 
-    __device__ thrust::optional<size_type> operator()(size_type) const
+    __device__ cuda::std::optional<size_type> operator()(size_type) const
     {
-      return is_null ? thrust::nullopt : thrust::make_optional(*iter);
+      return is_null ? cuda::std::nullopt : cuda::std::make_optional(*iter);
     }
   };
 

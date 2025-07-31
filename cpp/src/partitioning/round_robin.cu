@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,17 +20,20 @@
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/partitioning.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/types.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/functional>
 #include <thrust/copy.h>
 #include <thrust/execution_policy.h>
 #include <thrust/for_each.h>
@@ -39,8 +42,6 @@
 #include <thrust/scan.h>
 #include <thrust/sequence.h>
 #include <thrust/tuple.h>
-
-#include <cuda/functional>
 
 #include <algorithm>
 #include <cmath>  // for std::ceil()
@@ -84,7 +85,7 @@ std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>> degenerate
   cudf::size_type num_partitions,
   cudf::size_type start_partition,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   auto nrows = input.num_rows();
 
@@ -107,8 +108,7 @@ std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>> degenerate
                                          stream,
                                          mr);
 
-    return std::pair(std::move(uniq_tbl),
-                     cudf::detail::make_std_vector_sync(partition_offsets, stream));
+    return std::pair(std::move(uniq_tbl), cudf::detail::make_std_vector(partition_offsets, stream));
   } else {  //( num_partitions > nrows )
     rmm::device_uvector<cudf::size_type> d_row_indices(nrows, stream);
 
@@ -145,8 +145,7 @@ std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>> degenerate
                            nedges_iter_begin + num_partitions,
                            partition_offsets.begin());
 
-    return std::pair(std::move(uniq_tbl),
-                     cudf::detail::make_std_vector_sync(partition_offsets, stream));
+    return std::pair(std::move(uniq_tbl), cudf::detail::make_std_vector(partition_offsets, stream));
   }
 }
 }  // namespace
@@ -158,7 +157,7 @@ std::pair<std::unique_ptr<table>, std::vector<cudf::size_type>> round_robin_part
   cudf::size_type num_partitions,
   cudf::size_type start_partition,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr)
+  rmm::device_async_resource_ref mr)
 {
   auto nrows = input.num_rows();
 
@@ -271,12 +270,12 @@ std::pair<std::unique_ptr<table>, std::vector<cudf::size_type>> round_robin_part
 std::pair<std::unique_ptr<cudf::table>, std::vector<cudf::size_type>> round_robin_partition(
   table_view const& input,
   cudf::size_type num_partitions,
-  cudf::size_type start_partition     = 0,
-  rmm::mr::device_memory_resource* mr = rmm::mr::get_current_device_resource())
+  cudf::size_type start_partition,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::round_robin_partition(
-    input, num_partitions, start_partition, cudf::get_default_stream(), mr);
+  return detail::round_robin_partition(input, num_partitions, start_partition, stream, mr);
 }
 
 }  // namespace cudf

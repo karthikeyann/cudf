@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2021-2022, NVIDIA CORPORATION.
+ * Copyright (c) 2021-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,7 @@
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/type_lists.hpp>
 
-#include <cudf/column/column.hpp>
 #include <cudf/fixed_point/fixed_point.hpp>
-#include <cudf/strings/string_view.hpp>
 #include <cudf/utilities/span.hpp>
 #include <cudf/utilities/traits.hpp>
 
@@ -30,7 +28,6 @@
 
 #include <initializer_list>
 #include <type_traits>
-#include <vector>
 
 template <typename T>
 struct TypeParam_to_host_type {
@@ -58,24 +55,22 @@ struct TypeParam_to_host_type<numeric::decimal128> {
 };
 
 template <typename TypeParam, typename T>
-std::enable_if_t<std::is_same_v<TypeParam, cudf::string_view>, thrust::host_vector<std::string>>
-make_vector(std::initializer_list<T> const& init)
+thrust::host_vector<std::string> make_vector(std::initializer_list<T> const& init)
+  requires(std::is_same_v<TypeParam, cudf::string_view>)
 {
   return cudf::test::make_type_param_vector<std::string, T>(init);
 }
 
 template <typename TypeParam, typename T>
-std::enable_if_t<cudf::is_fixed_point<TypeParam>(), thrust::host_vector<typename TypeParam::rep>>
-make_vector(std::initializer_list<T> const& init)
+thrust::host_vector<typename TypeParam::rep> make_vector(std::initializer_list<T> const& init)
+  requires(cudf::is_fixed_point<TypeParam>())
 {
   return cudf::test::make_type_param_vector<typename TypeParam::rep, T>(init);
 }
 
 template <typename TypeParam, typename T>
-std::enable_if_t<not(std::is_same_v<TypeParam, cudf::string_view> ||
-                     cudf::is_fixed_point<TypeParam>()),
-                 thrust::host_vector<TypeParam>>
-make_vector(std::initializer_list<T> const& init)
+thrust::host_vector<TypeParam> make_vector(std::initializer_list<T> const& init)
+  requires(not(std::is_same_v<TypeParam, cudf::string_view> || cudf::is_fixed_point<TypeParam>()))
 {
   return cudf::test::make_type_param_vector<TypeParam, T>(init);
 }

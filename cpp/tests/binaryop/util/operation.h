@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2022, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Copyright 2018-2019 BlazingDB, Inc.
  *     Copyright 2018 Christian Noboa Mardini <christian@blazingdb.com>
@@ -19,9 +19,10 @@
 
 #pragma once
 
+#include <cudf/utilities/traits.hpp>
+
 #include <cmath>
 #include <cstdint>
-#include <cudf/utilities/traits.hpp>
 #include <type_traits>
 
 namespace cudf {
@@ -32,22 +33,18 @@ template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct Add {
   // Allow sum between chronos only when both input and output types
   // are chronos. Unsupported combinations will fail to compile
-  template <typename OutT           = TypeOut,
-            std::enable_if_t<cudf::is_chrono<OutT>() && cudf::is_chrono<TypeLhs>() &&
-                               cudf::is_chrono<TypeRhs>(),
-                             void>* = nullptr>
+  template <typename OutT = TypeOut>
   OutT operator()(TypeLhs lhs, TypeRhs rhs) const
+    requires(cudf::is_chrono<OutT>() && cudf::is_chrono<TypeLhs>() && cudf::is_chrono<TypeRhs>())
   {
     return lhs + rhs;
   }
 
-  template <typename OutT           = TypeOut,
-            std::enable_if_t<!cudf::is_chrono<OutT>() || !cudf::is_chrono<TypeLhs>() ||
-                               !cudf::is_chrono<TypeRhs>(),
-                             void>* = nullptr>
+  template <typename OutT = TypeOut>
   OutT operator()(TypeLhs lhs, TypeRhs rhs) const
+    requires(!cudf::is_chrono<OutT>() || !cudf::is_chrono<TypeLhs>() || !cudf::is_chrono<TypeRhs>())
   {
-    using TypeCommon = typename std::common_type<OutT, TypeLhs, TypeRhs>::type;
+    using TypeCommon = std::common_type_t<OutT, TypeLhs, TypeRhs>;
     return static_cast<OutT>(static_cast<TypeCommon>(lhs) + static_cast<TypeCommon>(rhs));
   }
 };
@@ -56,50 +53,43 @@ template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct Sub {
   // Allow difference between chronos only when both input and output types
   // are chronos. Unsupported combinations will fail to compile
-  template <typename OutT           = TypeOut,
-            std::enable_if_t<cudf::is_chrono<OutT>() && cudf::is_chrono<TypeLhs>() &&
-                               cudf::is_chrono<TypeRhs>(),
-                             void>* = nullptr>
+  template <typename OutT = TypeOut>
   OutT operator()(TypeLhs lhs, TypeRhs rhs) const
+    requires(cudf::is_chrono<OutT>() && cudf::is_chrono<TypeLhs>() && cudf::is_chrono<TypeRhs>())
   {
     return lhs - rhs;
   }
 
-  template <typename OutT           = TypeOut,
-            std::enable_if_t<!cudf::is_chrono<OutT>() || !cudf::is_chrono<TypeLhs>() ||
-                               !cudf::is_chrono<TypeRhs>(),
-                             void>* = nullptr>
+  template <typename OutT = TypeOut>
   OutT operator()(TypeLhs lhs, TypeRhs rhs) const
+    requires(!cudf::is_chrono<OutT>() || !cudf::is_chrono<TypeLhs>() || !cudf::is_chrono<TypeRhs>())
   {
-    using TypeCommon = typename std::common_type<OutT, TypeLhs, TypeRhs>::type;
+    using TypeCommon = std::common_type_t<OutT, TypeLhs, TypeRhs>;
     return static_cast<OutT>(static_cast<TypeCommon>(lhs) - static_cast<TypeCommon>(rhs));
   }
 };
 
 template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct Mul {
-  template <typename OutT                                              = TypeOut,
-            std::enable_if_t<!cudf::is_duration_t<OutT>::value, void>* = nullptr>
+  template <typename OutT = TypeOut>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs) const
+    requires(!cudf::is_duration_t<OutT>::value)
   {
-    using TypeCommon = typename std::common_type<TypeOut, TypeLhs, TypeRhs>::type;
+    using TypeCommon = std::common_type_t<TypeOut, TypeLhs, TypeRhs>;
     return static_cast<TypeOut>(static_cast<TypeCommon>(lhs) * static_cast<TypeCommon>(rhs));
   }
 
-  template <typename OutT                                             = TypeOut,
-            std::enable_if_t<cudf::is_duration_t<OutT>::value, void>* = nullptr>
+  template <typename OutT = TypeOut>
   TypeOut operator()(TypeLhs x, TypeRhs y) const
+    requires(cudf::is_duration_t<OutT>::value)
   {
     return DurationProduct<TypeOut>(x, y);
   }
 
-  template <typename OutT,
-            typename LhsT,
-            typename RhsT,
-            std::enable_if_t<(cudf::is_duration_t<LhsT>::value && std::is_integral_v<RhsT>) ||
-                               (cudf::is_duration_t<RhsT>::value && std::is_integral_v<LhsT>),
-                             void>* = nullptr>
-  OutT DurationProduct(LhsT x, RhsT y) const
+  template <typename OutT, typename LhsT, typename RhsT>
+  [[nodiscard]] OutT DurationProduct(LhsT x, RhsT y) const
+    requires((cudf::is_duration_t<LhsT>::value && std::is_integral_v<RhsT>) ||
+             (cudf::is_duration_t<RhsT>::value && std::is_integral_v<LhsT>))
   {
     return x * y;
   }
@@ -107,27 +97,24 @@ struct Mul {
 
 template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct Div {
-  template <typename LhsT                                              = TypeLhs,
-            std::enable_if_t<!cudf::is_duration_t<LhsT>::value, void>* = nullptr>
+  template <typename LhsT = TypeLhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(!cudf::is_duration_t<LhsT>::value)
   {
-    using TypeCommon = typename std::common_type<TypeOut, TypeLhs, TypeRhs>::type;
+    using TypeCommon = std::common_type_t<TypeOut, TypeLhs, TypeRhs>;
     return static_cast<TypeOut>(static_cast<TypeCommon>(lhs) / static_cast<TypeCommon>(rhs));
   }
 
-  template <typename LhsT                                             = TypeLhs,
-            std::enable_if_t<cudf::is_duration_t<LhsT>::value, void>* = nullptr>
+  template <typename LhsT = TypeLhs>
   TypeOut operator()(TypeLhs x, TypeRhs y) const
+    requires(cudf::is_duration_t<LhsT>::value)
   {
     return DurationDivide<TypeOut>(x, y);
   }
 
-  template <
-    typename OutT,
-    typename LhsT,
-    typename RhsT,
-    std::enable_if_t<(std::is_integral_v<RhsT> || cudf::is_duration<RhsT>()), void>* = nullptr>
-  OutT DurationDivide(LhsT x, RhsT y) const
+  template <typename OutT, typename LhsT, typename RhsT>
+  [[nodiscard]] OutT DurationDivide(LhsT x, RhsT y) const
+    requires(std::is_integral_v<RhsT> || cudf::is_duration<RhsT>())
   {
     return x / y;
   }
@@ -143,12 +130,10 @@ struct TrueDiv {
 
 template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct FloorDiv {
-  template <typename OutT                                                         = TypeOut,
-            typename LhsT                                                         = TypeLhs,
-            typename RhsT                                                         = TypeRhs,
-            std::enable_if_t<(std::is_integral_v<std::common_type_t<LhsT, RhsT>> and
-                              std::is_signed_v<std::common_type_t<LhsT, RhsT>>)>* = nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_integral_v<std::common_type_t<LhsT, RhsT>> and
+             std::is_signed_v<std::common_type_t<LhsT, RhsT>>)
   {
     if ((lhs ^ rhs) >= 0) {
       return lhs / rhs;
@@ -159,30 +144,24 @@ struct FloorDiv {
     }
   }
 
-  template <typename OutT                                                          = TypeOut,
-            typename LhsT                                                          = TypeLhs,
-            typename RhsT                                                          = TypeRhs,
-            std::enable_if_t<(std::is_integral_v<std::common_type_t<LhsT, RhsT>> and
-                              !std::is_signed_v<std::common_type_t<LhsT, RhsT>>)>* = nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_integral_v<std::common_type_t<LhsT, RhsT>> and
+             !std::is_signed_v<std::common_type_t<LhsT, RhsT>>)
   {
     return lhs / rhs;
   }
 
-  template <typename OutT                                                              = TypeOut,
-            typename LhsT                                                              = TypeLhs,
-            typename RhsT                                                              = TypeRhs,
-            std::enable_if_t<(std::is_same_v<std::common_type_t<LhsT, RhsT>, float>)>* = nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_same_v<std::common_type_t<LhsT, RhsT>, float>)
   {
     return static_cast<TypeOut>(std::floor(lhs / rhs));
   }
 
-  template <typename OutT                                                               = TypeOut,
-            typename LhsT                                                               = TypeLhs,
-            typename RhsT                                                               = TypeRhs,
-            std::enable_if_t<(std::is_same_v<std::common_type_t<LhsT, RhsT>, double>)>* = nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_same_v<std::common_type_t<LhsT, RhsT>, double>)
   {
     return static_cast<TypeOut>(std::floor(lhs / rhs));
   }
@@ -190,44 +169,32 @@ struct FloorDiv {
 
 template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct Mod {
-  template <typename OutT = TypeOut,
-            typename LhsT = TypeLhs,
-            typename RhsT = TypeRhs,
-            std::enable_if_t<
-              (std::is_integral_v<typename std::common_type<OutT, LhsT, RhsT>::type>)>* = nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_integral_v<std::common_type_t<OutT, LhsT, RhsT>>)
   {
-    using TypeCommon = typename std::common_type<TypeOut, TypeLhs, TypeRhs>::type;
+    using TypeCommon = std::common_type_t<TypeOut, TypeLhs, TypeRhs>;
     return static_cast<TypeOut>(static_cast<TypeCommon>(lhs) % static_cast<TypeCommon>(rhs));
   }
 
-  template <typename OutT                                                                 = TypeOut,
-            typename LhsT                                                                 = TypeLhs,
-            typename RhsT                                                                 = TypeRhs,
-            std::enable_if_t<(
-              std::is_same_v<typename std::common_type<OutT, LhsT, RhsT>::type, float>)>* = nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_same_v<std::common_type_t<OutT, LhsT, RhsT>, float>)
   {
     return static_cast<TypeOut>(fmod(static_cast<float>(lhs), static_cast<float>(rhs)));
   }
 
-  template <
-    typename OutT = TypeOut,
-    typename LhsT = TypeLhs,
-    typename RhsT = TypeRhs,
-    std::enable_if_t<(std::is_same_v<typename std::common_type<OutT, LhsT, RhsT>::type, double>)>* =
-      nullptr>
+  template <typename OutT = TypeOut, typename LhsT = TypeLhs, typename RhsT = TypeRhs>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(std::is_same_v<std::common_type_t<OutT, LhsT, RhsT>, double>)
   {
     return static_cast<TypeOut>(fmod(static_cast<double>(lhs), static_cast<double>(rhs)));
   }
 
   // Mod with duration types - duration % (integral or a duration) = duration
-  template <typename LhsT                                       = TypeLhs,
-            typename OutT                                       = TypeOut,
-            std::enable_if_t<cudf::is_duration_t<LhsT>::value &&
-                             cudf::is_duration_t<OutT>::value>* = nullptr>
+  template <typename LhsT = TypeLhs, typename OutT = TypeOut>
   TypeOut operator()(TypeLhs lhs, TypeRhs rhs)
+    requires(cudf::is_duration_t<LhsT>::value && cudf::is_duration_t<OutT>::value)
   {
     return lhs % rhs;
   }
@@ -325,7 +292,7 @@ struct LogBase {
 
 template <typename TypeOut, typename TypeLhs, typename TypeRhs>
 struct PMod {
-  using CommonArgsT = typename std::common_type<TypeLhs, TypeRhs>::type;
+  using CommonArgsT = std::common_type_t<TypeLhs, TypeRhs>;
 
   TypeOut operator()(TypeLhs x, TypeRhs y) const
   {
@@ -350,8 +317,8 @@ struct PyMod {
   TypeOut operator()(TypeLhs x, TypeRhs y) const
   {
     if constexpr (std::is_floating_point_v<TypeLhs> or std::is_floating_point_v<TypeRhs>) {
-      double x1 = static_cast<double>(x);
-      double y1 = static_cast<double>(y);
+      auto x1 = static_cast<double>(x);
+      auto y1 = static_cast<double>(y);
       return fmod(fmod(x1, y1) + y1, y1);
     } else {
       return ((x % y) + y) % y;
@@ -411,6 +378,14 @@ struct NullEquals {
     using common_t = std::common_type_t<TypeLhs, TypeRhs>;
     if (lhs_valid && rhs_valid) return static_cast<common_t>(x) == static_cast<common_t>(y);
     return false;
+  }
+};
+
+template <typename TypeOut, typename TypeLhs, typename TypeRhs>
+struct NullNotEquals {
+  TypeOut operator()(TypeLhs x, TypeRhs y, bool lhs_valid, bool rhs_valid, bool& output_valid) const
+  {
+    return !NullEquals<TypeOut, TypeLhs, TypeRhs>()(x, y, lhs_valid, rhs_valid, output_valid);
   }
 };
 

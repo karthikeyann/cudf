@@ -1,5 +1,7 @@
-# Copyright (c) 2022-2023, NVIDIA CORPORATION.
+# Copyright (c) 2022-2025, NVIDIA CORPORATION.
 
+
+from functools import cache
 
 import cupy as cp
 import numpy as np
@@ -8,27 +10,26 @@ from numba.core.errors import TypingError
 from numba.cuda.cudadrv.devices import get_context
 from numba.np import numpy_support
 
-import cudf.core.udf.utils
+from cudf.core.column import as_column, column_empty
 from cudf.core.udf.groupby_typing import (
     SUPPORTED_GROUPBY_NUMPY_TYPES,
     Group,
+    GroupByJITDataFrame,
     GroupType,
 )
 from cudf.core.udf.templates import (
     group_initializer_template,
     groupby_apply_kernel_template,
 )
+from cudf.core.udf.udf_kernel_base import ApplyKernelBase
 from cudf.core.udf.utils import (
-    Row,
-    _compile_or_get,
+    UDFError,
+    _all_dtypes_from_frame,
     _get_extensionty_size,
-    _get_kernel,
-    _get_udf_return_type,
     _supported_cols_from_frame,
-    _supported_dtypes_from_frame,
 )
 from cudf.utils._numba import _CUDFNumbaConfig
-from cudf.utils.nvtx_annotation import _cudf_nvtx_annotate
+from cudf.utils.performance_tracking import _performance_tracking
 
 
 def _get_frame_groupby_type(dtype, index_dtype):
@@ -74,7 +75,7 @@ def _get_frame_groupby_type(dtype, index_dtype):
 
     # Numba requires that structures are aligned for the CUDA target
     _is_aligned_struct = True
-    return Row(fields, offset, _is_aligned_struct)
+    return GroupByJITDataFrame(fields, offset, _is_aligned_struct)
 
 
 def _groupby_apply_kernel_string_from_template(frame, args):
@@ -103,33 +104,7 @@ def _groupby_apply_kernel_string_from_template(frame, args):
     )
 
 
-def _get_groupby_apply_kernel(frame, func, args):
-    np_field_types = np.dtype(
-        list(
-            _supported_dtypes_from_frame(
-                frame, supported_types=SUPPORTED_GROUPBY_NUMPY_TYPES
-            ).items()
-        )
-    )
-    dataframe_group_type = _get_frame_groupby_type(
-        np_field_types, frame.index.dtype
-    )
-    return_type = _get_udf_return_type(dataframe_group_type, func, args)
-
-    # Dict of 'local' variables into which `_kernel` is defined
-    global_exec_context = {
-        "cuda": cuda,
-        "Group": Group,
-        "dataframe_group_type": dataframe_group_type,
-        "types": types,
-    }
-    kernel_string = _groupby_apply_kernel_string_from_template(frame, args)
-    kernel = _get_kernel(kernel_string, global_exec_context, None, func)
-
-    return kernel, return_type
-
-
-@_cudf_nvtx_annotate
+@_performance_tracking
 def jit_groupby_apply(offsets, grouped_values, function, *args):
     """
     Main entrypoint for JIT Groupby.apply via Numba.
@@ -146,19 +121,12 @@ def jit_groupby_apply(offsets, grouped_values, function, *args):
         The user-defined function to execute
     """
 
-    kernel, return_type = _compile_or_get(
-        grouped_values,
-        function,
-        args,
-        kernel_getter=_get_groupby_apply_kernel,
-        suffix="__GROUPBY_APPLY_UDF",
-    )
-
-    offsets = cp.asarray(offsets)
+    kr = GroupByApplyKernel(grouped_values, function, args)
+    kernel, return_type = kr.get_kernel()
+    offsets = as_column(offsets)
     ngroups = len(offsets) - 1
 
-    output = cudf.core.column.column_empty(ngroups, dtype=return_type)
-
+    output = column_empty(ngroups, dtype=return_type, for_numba=True)
     launch_args = [
         offsets,
         output,
@@ -212,18 +180,73 @@ def _can_be_jitted(frame, func, args):
         # Numba requires bytecode to be present to proceed.
         # See https://github.com/numba/numba/issues/4587
         return False
-    np_field_types = np.dtype(
-        list(
-            _supported_dtypes_from_frame(
-                frame, supported_types=SUPPORTED_GROUPBY_NUMPY_TYPES
-            ).items()
-        )
-    )
-    dataframe_group_type = _get_frame_groupby_type(
-        np_field_types, frame.index.dtype
-    )
-    try:
-        _get_udf_return_type(dataframe_group_type, func, args)
-        return True
-    except TypingError:
+
+    if any(col.has_nulls() for col in frame._columns):
         return False
+    kr = GroupByApplyKernel(frame, func, args)
+    try:
+        kr._get_udf_return_type()
+        return True
+    except (UDFError, TypingError):
+        return False
+
+
+class GroupByApplyKernel(ApplyKernelBase):
+    """
+    Class representing a kernel that computes the result of
+    a GroupBy.apply operation. Expects that the user passed
+    a function that operates on a single group of the data,
+    for example
+
+    def f(group):
+        return group['x'].sum() + group['y'].sum()
+    """
+
+    @property
+    def kernel_type(self):
+        return "groupby_apply"
+
+    def _get_frame_type(self):
+        return _get_frame_groupby_type(
+            np.dtype(list(_all_dtypes_from_frame(self.frame).items())),
+            self.frame.index.dtype,
+        )
+
+    def _get_kernel_string(self):
+        # Create argument list for kernel
+        frame = _supported_cols_from_frame(
+            self.frame, supported_types=SUPPORTED_GROUPBY_NUMPY_TYPES
+        )
+        input_columns = ", ".join(
+            [f"input_col_{i}" for i in range(len(frame))]
+        )
+        extra_args = ", ".join(
+            [f"extra_arg_{i}" for i in range(len(self.args))]
+        )
+
+        # Generate the initializers for each device function argument
+        initializers = []
+        for i, colname in enumerate(frame.keys()):
+            initializers.append(
+                group_initializer_template.format(idx=i, name=colname)
+            )
+
+        return groupby_apply_kernel_template.format(
+            input_columns=input_columns,
+            extra_args=extra_args,
+            group_initializers="\n".join(initializers),
+        )
+
+    @cache
+    def _get_kernel_string_exec_context(self):
+        dataframe_group_type = self._get_frame_type()
+        global_exec_context = {
+            "cuda": cuda,
+            "Group": Group,
+            "dataframe_group_type": dataframe_group_type,
+            "types": types,
+        }
+        return global_exec_context
+
+    def _construct_signature(self, return_type):
+        return None

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023, NVIDIA CORPORATION.
+ * Copyright (c) 2023-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,7 +16,13 @@
 
 #pragma once
 
+#ifndef CUDF_RUNTIME_JIT
+
 #include <cudf/utilities/type_dispatcher.hpp>
+
+#endif
+
+#include <cudf/utilities/traits.hpp>
 
 #include <type_traits>
 
@@ -51,7 +57,7 @@ struct alignas(16) base_normalator {
    */
   CUDF_HOST_DEVICE inline Derived& operator++()
   {
-    Derived& derived = static_cast<Derived&>(*this);
+    auto& derived = static_cast<Derived&>(*this);
     derived.p_ += width_;
     return derived;
   }
@@ -71,7 +77,7 @@ struct alignas(16) base_normalator {
    */
   CUDF_HOST_DEVICE inline Derived& operator--()
   {
-    Derived& derived = static_cast<Derived&>(*this);
+    auto& derived = static_cast<Derived&>(*this);
     derived.p_ -= width_;
     return derived;
   }
@@ -91,7 +97,7 @@ struct alignas(16) base_normalator {
    */
   CUDF_HOST_DEVICE inline Derived& operator+=(difference_type offset)
   {
-    Derived& derived = static_cast<Derived&>(*this);
+    auto& derived = static_cast<Derived&>(*this);
     derived.p_ += offset * width_;
     return derived;
   }
@@ -121,7 +127,7 @@ struct alignas(16) base_normalator {
    */
   CUDF_HOST_DEVICE inline Derived& operator-=(difference_type offset)
   {
-    Derived& derived = static_cast<Derived&>(*this);
+    auto& derived = static_cast<Derived&>(*this);
     derived.p_ -= offset * width_;
     return derived;
   }
@@ -204,8 +210,8 @@ struct alignas(16) base_normalator {
 
  private:
   struct integer_sizeof_fn {
-    template <typename T, CUDF_ENABLE_IF(not cudf::is_fixed_width<T>())>
-    CUDF_HOST_DEVICE constexpr std::size_t operator()() const
+    template <typename T, CUDF_ENABLE_IF(not cudf::is_integral_not_bool<T>())>
+    CUDF_HOST_DEVICE std::size_t operator()() const
     {
 #ifndef __CUDA_ARCH__
       CUDF_FAIL("only integral types are supported");
@@ -213,14 +219,16 @@ struct alignas(16) base_normalator {
       CUDF_UNREACHABLE("only integral types are supported");
 #endif
     }
-    template <typename T, CUDF_ENABLE_IF(cudf::is_fixed_width<T>())>
-    CUDF_HOST_DEVICE constexpr std::size_t operator()() const noexcept
+    template <typename T, CUDF_ENABLE_IF(cudf::is_integral_not_bool<T>())>
+    CUDF_HOST_DEVICE std::size_t operator()() const noexcept
     {
       return sizeof(T);
     }
   };
 
  protected:
+#ifndef CUDF_RUNTIME_JIT  // TODO: refactor type_dispatcher to support NVRTC
+
   /**
    * @brief Constructor assigns width and type member variables for base class.
    */
@@ -228,6 +236,8 @@ struct alignas(16) base_normalator {
   {
     width_ = static_cast<int32_t>(type_dispatcher(dtype, integer_sizeof_fn{}));
   }
+
+#endif
 
   /**
    * @brief Constructor assigns width and type member variables for base class.

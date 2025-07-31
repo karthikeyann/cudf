@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -66,6 +66,7 @@ void BM_parquet_read_options(nvbench::state& state,
   auto const data_types =
     dtypes_for_column_selection(get_type_or_group({static_cast<int32_t>(data_type::INTEGRAL),
                                                    static_cast<int32_t>(data_type::FLOAT),
+                                                   static_cast<int32_t>(data_type::BOOL8),
                                                    static_cast<int32_t>(data_type::DECIMAL),
                                                    static_cast<int32_t>(data_type::TIMESTAMP),
                                                    static_cast<int32_t>(data_type::DURATION),
@@ -83,6 +84,7 @@ void BM_parquet_read_options(nvbench::state& state,
 
   auto const cols_to_read =
     select_column_names(get_top_level_col_names(source_sink.make_source_info()), ColSelection);
+  cudf::size_type const expected_num_cols = cols_to_read.size();
   cudf::io::parquet_reader_options read_options =
     cudf::io::parquet_reader_options::builder(source_sink.make_source_info())
       .columns(cols_to_read)
@@ -98,9 +100,8 @@ void BM_parquet_read_options(nvbench::state& state,
   state.exec(
     nvbench::exec_tag::sync | nvbench::exec_tag::timer, [&](nvbench::launch& launch, auto& timer) {
       try_drop_l3_cache();
-
+      cudf::size_type num_rows_read = 0;
       timer.start();
-      cudf::size_type rows_read = 0;
       for (int32_t chunk = 0; chunk < num_chunks; ++chunk) {
         switch (RowSelection) {
           case row_selection::ALL: break;
@@ -114,11 +115,15 @@ void BM_parquet_read_options(nvbench::state& state,
           default: CUDF_FAIL("Unsupported row selection method");
         }
 
-        rows_read += cudf::io::read_parquet(read_options).tbl->num_rows();
+        auto const result = cudf::io::read_parquet(read_options);
+
+        num_rows_read += result.tbl->num_rows();
+        CUDF_EXPECTS(result.tbl->num_columns() == expected_num_cols,
+                     "Unexpected number of columns");
       }
 
-      CUDF_EXPECTS(rows_read == view.num_rows(), "Benchmark did not read the entire table");
       timer.stop();
+      CUDF_EXPECTS(num_rows_read == view.num_rows(), "Benchmark did not read the entire table");
     });
 
   auto const elapsed_time   = state.get_summary("nv/cold/time/gpu/mean").get_float64("value");

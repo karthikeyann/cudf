@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,7 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 #include <cudf/wrappers/durations.hpp>
@@ -43,19 +44,6 @@
 namespace cudf {
 namespace datetime {
 namespace detail {
-enum class datetime_component {
-  INVALID = 0,
-  YEAR,
-  MONTH,
-  DAY,
-  WEEKDAY,
-  HOUR,
-  MINUTE,
-  SECOND,
-  MILLISECOND,
-  MICROSECOND,
-  NANOSECOND
-};
 
 enum class rounding_function {
   CEIL,   ///< Rounds up to the next integer multiple of the provided frequency
@@ -249,12 +237,12 @@ struct is_leap_year_op {
 // Specific function for applying ceil/floor/round date ops
 struct dispatch_round {
   template <typename Timestamp>
-  std::enable_if_t<cudf::is_timestamp<Timestamp>(), std::unique_ptr<cudf::column>> operator()(
-    rounding_function round_kind,
-    rounding_frequency component,
-    cudf::column_view const& column,
-    rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr) const
+  std::unique_ptr<cudf::column> operator()(rounding_function round_kind,
+                                           rounding_frequency component,
+                                           cudf::column_view const& column,
+                                           rmm::cuda_stream_view stream,
+                                           rmm::device_async_resource_ref mr) const
+    requires(cudf::is_timestamp<Timestamp>())
   {
     auto size            = column.size();
     auto output_col_type = data_type{cudf::type_to_id<Timestamp>()};
@@ -281,8 +269,8 @@ struct dispatch_round {
   }
 
   template <typename Timestamp, typename... Args>
-  std::enable_if_t<!cudf::is_timestamp<Timestamp>(), std::unique_ptr<cudf::column>> operator()(
-    Args&&...)
+  std::unique_ptr<cudf::column> operator()(Args&&...)
+    requires(!cudf::is_timestamp<Timestamp>())
   {
     CUDF_FAIL("Must be cudf::timestamp");
   }
@@ -297,15 +285,15 @@ struct launch_functor {
   launch_functor(column_view inp, mutable_column_view out) : input(inp), output(out) {}
 
   template <typename Element>
-  std::enable_if_t<!cudf::is_timestamp_t<Element>::value, void> operator()(
-    rmm::cuda_stream_view stream) const
+  void operator()(rmm::cuda_stream_view stream) const
+    requires(!cudf::is_timestamp_t<Element>::value)
   {
     CUDF_FAIL("Cannot extract datetime component from non-timestamp column.");
   }
 
   template <typename Timestamp>
-  std::enable_if_t<cudf::is_timestamp_t<Timestamp>::value, void> operator()(
-    rmm::cuda_stream_view stream) const
+  void operator()(rmm::cuda_stream_view stream) const
+    requires(cudf::is_timestamp_t<Timestamp>::value)
   {
     thrust::transform(rmm::exec_policy(stream),
                       input.begin<Timestamp>(),
@@ -319,7 +307,7 @@ struct launch_functor {
 template <typename TransformFunctor, cudf::type_id OutputColCudfT>
 std::unique_ptr<column> apply_datetime_op(column_view const& column,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(is_timestamp(column.type()), "Column type should be timestamp");
   auto size            = column.size();
@@ -344,18 +332,18 @@ std::unique_ptr<column> apply_datetime_op(column_view const& column,
 
 struct add_calendrical_months_functor {
   template <typename Element, typename... Args>
-  std::enable_if_t<!cudf::is_timestamp_t<Element>::value, std::unique_ptr<column>> operator()(
-    Args&&...) const
+  std::unique_ptr<column> operator()(Args&&...) const
+    requires(!cudf::is_timestamp_t<Element>::value)
   {
     CUDF_FAIL("Cannot extract datetime component from non-timestamp column.");
   }
 
   template <typename Timestamp, typename MonthIterator>
-  std::enable_if_t<cudf::is_timestamp_t<Timestamp>::value, std::unique_ptr<column>> operator()(
-    column_view timestamp_column,
-    MonthIterator months_begin,
-    rmm::cuda_stream_view stream,
-    rmm::mr::device_memory_resource* mr) const
+  std::unique_ptr<column> operator()(column_view timestamp_column,
+                                     MonthIterator months_begin,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr) const
+    requires(cudf::is_timestamp_t<Timestamp>::value)
   {
     auto size            = timestamp_column.size();
     auto output_col_type = timestamp_column.type();
@@ -386,7 +374,7 @@ struct add_calendrical_months_functor {
 std::unique_ptr<column> add_calendrical_months(column_view const& timestamp_column,
                                                column_view const& months_column,
                                                rmm::cuda_stream_view stream,
-                                               rmm::mr::device_memory_resource* mr)
+                                               rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(is_timestamp(timestamp_column.type()), "Column type should be timestamp");
   CUDF_EXPECTS(
@@ -413,7 +401,7 @@ std::unique_ptr<column> add_calendrical_months(column_view const& timestamp_colu
 std::unique_ptr<column> add_calendrical_months(column_view const& timestamp_column,
                                                scalar const& months,
                                                rmm::cuda_stream_view stream,
-                                               rmm::mr::device_memory_resource* mr)
+                                               rmm::device_async_resource_ref mr)
 {
   CUDF_EXPECTS(is_timestamp(timestamp_column.type()), "Column type should be timestamp");
   CUDF_EXPECTS(months.type().id() == type_id::INT16 or months.type().id() == type_id::INT32,
@@ -442,105 +430,15 @@ std::unique_ptr<column> round_general(rounding_function round_kind,
                                       rounding_frequency component,
                                       column_view const& column,
                                       rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::device_async_resource_ref mr)
 {
   return cudf::type_dispatcher(
     column.type(), dispatch_round{}, round_kind, component, column, stream, mr);
 }
 
-std::unique_ptr<column> extract_year(column_view const& column,
-                                     rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::YEAR>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_month(column_view const& column,
-                                      rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::MONTH>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_day(column_view const& column,
-                                    rmm::cuda_stream_view stream,
-                                    rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::DAY>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_weekday(column_view const& column,
-                                        rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::WEEKDAY>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_hour(column_view const& column,
-                                     rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::HOUR>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_minute(column_view const& column,
-                                       rmm::cuda_stream_view stream,
-                                       rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::MINUTE>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_second(column_view const& column,
-                                       rmm::cuda_stream_view stream,
-                                       rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::SECOND>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_millisecond_fraction(column_view const& column,
-                                                     rmm::cuda_stream_view stream,
-                                                     rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::MILLISECOND>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_microsecond_fraction(column_view const& column,
-                                                     rmm::cuda_stream_view stream,
-                                                     rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::MICROSECOND>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
-std::unique_ptr<column> extract_nanosecond_fraction(column_view const& column,
-                                                    rmm::cuda_stream_view stream,
-                                                    rmm::mr::device_memory_resource* mr)
-{
-  return detail::apply_datetime_op<
-    detail::extract_component_operator<detail::datetime_component::NANOSECOND>,
-    cudf::type_id::INT16>(column, stream, mr);
-}
-
 std::unique_ptr<column> last_day_of_month(column_view const& column,
                                           rmm::cuda_stream_view stream,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::device_async_resource_ref mr)
 {
   return detail::apply_datetime_op<detail::extract_last_day_of_month,
                                    cudf::type_id::TIMESTAMP_DAYS>(column, stream, mr);
@@ -548,7 +446,7 @@ std::unique_ptr<column> last_day_of_month(column_view const& column,
 
 std::unique_ptr<column> day_of_year(column_view const& column,
                                     rmm::cuda_stream_view stream,
-                                    rmm::mr::device_memory_resource* mr)
+                                    rmm::device_async_resource_ref mr)
 {
   return detail::apply_datetime_op<detail::extract_day_num_of_year, cudf::type_id::INT16>(
     column, stream, mr);
@@ -556,169 +454,145 @@ std::unique_ptr<column> day_of_year(column_view const& column,
 
 std::unique_ptr<column> is_leap_year(column_view const& column,
                                      rmm::cuda_stream_view stream,
-                                     rmm::mr::device_memory_resource* mr)
+                                     rmm::device_async_resource_ref mr)
 {
   return apply_datetime_op<is_leap_year_op, type_id::BOOL8>(column, stream, mr);
 }
 
 std::unique_ptr<column> days_in_month(column_view const& column,
                                       rmm::cuda_stream_view stream,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::device_async_resource_ref mr)
 {
   return apply_datetime_op<days_in_month_op, type_id::INT16>(column, stream, mr);
 }
 
 std::unique_ptr<column> extract_quarter(column_view const& column,
                                         rmm::cuda_stream_view stream,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::device_async_resource_ref mr)
 {
   return apply_datetime_op<extract_quarter_op, type_id::INT16>(column, stream, mr);
+}
+
+std::unique_ptr<cudf::column> extract_datetime_component(cudf::column_view const& column,
+                                                         datetime_component component,
+                                                         rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr)
+{
+#define extract(field)                                                                 \
+  case field:                                                                          \
+    return apply_datetime_op<extract_component_operator<field>, cudf::type_id::INT16>( \
+      column, stream, mr)
+
+  switch (component) {
+    extract(datetime_component::YEAR);
+    extract(datetime_component::MONTH);
+    extract(datetime_component::DAY);
+    extract(datetime_component::WEEKDAY);
+    extract(datetime_component::HOUR);
+    extract(datetime_component::MINUTE);
+    extract(datetime_component::SECOND);
+    extract(datetime_component::MILLISECOND);
+    extract(datetime_component::MICROSECOND);
+    extract(datetime_component::NANOSECOND);
+    default: CUDF_FAIL("Unsupported datetime component.");
+  }
+#undef extract
 }
 
 }  // namespace detail
 
 std::unique_ptr<column> ceil_datetimes(column_view const& column,
                                        rounding_frequency freq,
-                                       rmm::mr::device_memory_resource* mr)
+                                       rmm::cuda_stream_view stream,
+                                       rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::round_general(
-    detail::rounding_function::CEIL, freq, column, cudf::get_default_stream(), mr);
+  return detail::round_general(detail::rounding_function::CEIL, freq, column, stream, mr);
 }
 
 std::unique_ptr<column> floor_datetimes(column_view const& column,
                                         rounding_frequency freq,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::round_general(
-    detail::rounding_function::FLOOR, freq, column, cudf::get_default_stream(), mr);
+  return detail::round_general(detail::rounding_function::FLOOR, freq, column, stream, mr);
 }
 
 std::unique_ptr<column> round_datetimes(column_view const& column,
                                         rounding_frequency freq,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::round_general(
-    detail::rounding_function::ROUND, freq, column, cudf::get_default_stream(), mr);
+  return detail::round_general(detail::rounding_function::ROUND, freq, column, stream, mr);
 }
 
-std::unique_ptr<column> extract_year(column_view const& column, rmm::mr::device_memory_resource* mr)
+std::unique_ptr<cudf::column> extract_datetime_component(cudf::column_view const& column,
+                                                         datetime_component component,
+                                                         rmm::cuda_stream_view stream,
+                                                         rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::extract_year(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_month(column_view const& column,
-                                      rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_month(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_day(column_view const& column, rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_day(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_weekday(column_view const& column,
-                                        rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_weekday(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_hour(column_view const& column, rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_hour(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_minute(column_view const& column,
-                                       rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_minute(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_second(column_view const& column,
-                                       rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_second(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_millisecond_fraction(column_view const& column,
-                                                     rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_millisecond_fraction(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_microsecond_fraction(column_view const& column,
-                                                     rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_microsecond_fraction(column, cudf::get_default_stream(), mr);
-}
-
-std::unique_ptr<column> extract_nanosecond_fraction(column_view const& column,
-                                                    rmm::mr::device_memory_resource* mr)
-{
-  CUDF_FUNC_RANGE();
-  return detail::extract_nanosecond_fraction(column, cudf::get_default_stream(), mr);
+  return detail::extract_datetime_component(column, component, stream, mr);
 }
 
 std::unique_ptr<column> last_day_of_month(column_view const& column,
-                                          rmm::mr::device_memory_resource* mr)
+                                          rmm::cuda_stream_view stream,
+                                          rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::last_day_of_month(column, cudf::get_default_stream(), mr);
+  return detail::last_day_of_month(column, stream, mr);
 }
 
-std::unique_ptr<column> day_of_year(column_view const& column, rmm::mr::device_memory_resource* mr)
+std::unique_ptr<column> day_of_year(column_view const& column,
+                                    rmm::cuda_stream_view stream,
+                                    rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::day_of_year(column, cudf::get_default_stream(), mr);
+  return detail::day_of_year(column, stream, mr);
 }
 
 std::unique_ptr<cudf::column> add_calendrical_months(cudf::column_view const& timestamp_column,
                                                      cudf::column_view const& months_column,
-                                                     rmm::mr::device_memory_resource* mr)
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::add_calendrical_months(
-    timestamp_column, months_column, cudf::get_default_stream(), mr);
+  return detail::add_calendrical_months(timestamp_column, months_column, stream, mr);
 }
 
 std::unique_ptr<cudf::column> add_calendrical_months(cudf::column_view const& timestamp_column,
                                                      cudf::scalar const& months,
-                                                     rmm::mr::device_memory_resource* mr)
+                                                     rmm::cuda_stream_view stream,
+                                                     rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::add_calendrical_months(timestamp_column, months, cudf::get_default_stream(), mr);
+  return detail::add_calendrical_months(timestamp_column, months, stream, mr);
 }
 
-std::unique_ptr<column> is_leap_year(column_view const& column, rmm::mr::device_memory_resource* mr)
+std::unique_ptr<column> is_leap_year(column_view const& column,
+                                     rmm::cuda_stream_view stream,
+                                     rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::is_leap_year(column, cudf::get_default_stream(), mr);
+  return detail::is_leap_year(column, stream, mr);
 }
 
 std::unique_ptr<column> days_in_month(column_view const& column,
-                                      rmm::mr::device_memory_resource* mr)
+                                      rmm::cuda_stream_view stream,
+                                      rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::days_in_month(column, cudf::get_default_stream(), mr);
+  return detail::days_in_month(column, stream, mr);
 }
 
 std::unique_ptr<column> extract_quarter(column_view const& column,
-                                        rmm::mr::device_memory_resource* mr)
+                                        rmm::cuda_stream_view stream,
+                                        rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::extract_quarter(column, cudf::get_default_stream(), mr);
+  return detail::extract_quarter(column, stream, mr);
 }
 
 }  // namespace datetime

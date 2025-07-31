@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,14 +14,13 @@
  * limitations under the License.
  */
 
-#include <io/utilities/column_type_histogram.hpp>
-#include <io/utilities/string_parsing.hpp>
-#include <io/utilities/trie.cuh>
+#include "io/utilities/column_type_histogram.hpp"
+#include "io/utilities/string_parsing.hpp"
+#include "io/utilities/trie.cuh"
 
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/utilities/error.hpp>
-
-#include <rmm/device_scalar.hpp>
 
 #include <cub/block/block_reduce.cuh>
 
@@ -112,11 +111,11 @@ __device__ __inline__ bool is_like_float(std::size_t len,
  * @param[out] column_info Histogram of column type counters
  */
 template <int BlockSize, typename OptionsView, typename ColumnStringIter>
-__global__ void infer_column_type_kernel(OptionsView options,
-                                         device_span<char const> data,
-                                         ColumnStringIter offset_length_begin,
-                                         std::size_t size,
-                                         cudf::io::column_type_histogram* column_info)
+CUDF_KERNEL void infer_column_type_kernel(OptionsView options,
+                                          device_span<char const> data,
+                                          ColumnStringIter offset_length_begin,
+                                          std::size_t size,
+                                          cudf::io::column_type_histogram* column_info)
 {
   auto thread_type_histogram = cudf::io::column_type_histogram{};
 
@@ -242,7 +241,7 @@ cudf::io::column_type_histogram infer_column_type(OptionsView const& options,
   constexpr int block_size = 128;
 
   auto const grid_size = (size + block_size - 1) / block_size;
-  auto d_column_info   = rmm::device_scalar<cudf::io::column_type_histogram>(stream);
+  auto d_column_info   = cudf::detail::device_scalar<cudf::io::column_type_histogram>(stream);
   CUDF_CUDA_TRY(cudaMemsetAsync(
     d_column_info.data(), 0, sizeof(cudf::io::column_type_histogram), stream.value()));
 
@@ -255,7 +254,7 @@ cudf::io::column_type_histogram infer_column_type(OptionsView const& options,
 cudf::data_type infer_data_type(
   cudf::io::json_inference_options_view const& options,
   device_span<char const> data,
-  thrust::zip_iterator<thrust::tuple<const size_type*, const size_type*>> offset_length_begin,
+  thrust::zip_iterator<thrust::tuple<size_type const*, size_type const*>> offset_length_begin,
   std::size_t const size,
   rmm::cuda_stream_view stream)
 {

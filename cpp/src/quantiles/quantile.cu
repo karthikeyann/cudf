@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include <quantiles/quantiles_util.hpp>
+#include "quantiles/quantiles_util.hpp"
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
@@ -25,21 +25,22 @@
 #include <cudf/detail/valid_if.cuh>
 #include <cudf/dictionary/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
+#include <cudf/quantiles.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
 #include <cudf/utilities/error.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuda/functional>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/permutation_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 #include <thrust/transform.h>
-
-#include <cuda/functional>
 
 #include <memory>
 #include <vector>
@@ -54,19 +55,18 @@ struct quantile_functor {
   interpolation interp;
   bool retain_types;
   rmm::cuda_stream_view stream;
-  rmm::mr::device_memory_resource* mr;
+  rmm::device_async_resource_ref mr;
 
   template <typename T>
-  std::enable_if_t<not std::is_arithmetic_v<T> and not cudf::is_fixed_point<T>(),
-                   std::unique_ptr<column>>
-  operator()(column_view const& input)
+  std::unique_ptr<column> operator()(column_view const& input)
+    requires(not std::is_arithmetic_v<T> and not cudf::is_fixed_point<T>())
   {
     CUDF_FAIL("quantile does not support non-numeric types");
   }
 
   template <typename T>
-  std::enable_if_t<std::is_arithmetic_v<T> or cudf::is_fixed_point<T>(), std::unique_ptr<column>>
-  operator()(column_view const& input)
+  std::unique_ptr<column> operator()(column_view const& input)
+    requires(std::is_arithmetic_v<T> or cudf::is_fixed_point<T>())
   {
     using StorageType   = cudf::device_storage_type_t<T>;
     using ExactResult   = std::conditional_t<exact and not cudf::is_fixed_point<T>(), double, T>;
@@ -88,7 +88,7 @@ struct quantile_functor {
     auto d_output = mutable_column_device_view::create(output->mutable_view(), stream);
 
     auto q_device =
-      cudf::detail::make_device_uvector_sync(q, stream, rmm::mr::get_current_device_resource());
+      cudf::detail::make_device_uvector(q, stream, cudf::get_current_device_resource_ref());
 
     if (!cudf::is_dictionary(input.type())) {
       auto sorted_data =
@@ -146,7 +146,7 @@ std::unique_ptr<column> quantile(column_view const& input,
                                  interpolation interp,
                                  bool retain_types,
                                  rmm::cuda_stream_view stream,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::device_async_resource_ref mr)
 {
   auto functor = quantile_functor<exact, SortMapIterator>{
     ordered_indices, size, q, interp, retain_types, stream, mr};
@@ -164,7 +164,7 @@ std::unique_ptr<column> quantile(column_view const& input,
                                  column_view const& indices,
                                  bool exact,
                                  rmm::cuda_stream_view stream,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::device_async_resource_ref mr)
 {
   if (indices.is_empty()) {
     auto begin = thrust::make_counting_iterator<size_type>(0);
@@ -194,10 +194,11 @@ std::unique_ptr<column> quantile(column_view const& input,
                                  interpolation interp,
                                  column_view const& ordered_indices,
                                  bool exact,
-                                 rmm::mr::device_memory_resource* mr)
+                                 rmm::cuda_stream_view stream,
+                                 rmm::device_async_resource_ref mr)
 {
   CUDF_FUNC_RANGE();
-  return detail::quantile(input, q, interp, ordered_indices, exact, cudf::get_default_stream(), mr);
+  return detail::quantile(input, q, interp, ordered_indices, exact, stream, mr);
 }
 
 }  // namespace cudf

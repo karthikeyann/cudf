@@ -15,13 +15,10 @@ Developers are strongly recommended to set up `pre-commit` prior to any developm
 The `.pre-commit-config.yaml` file at the root of the repo is the primary source of truth linting.
 Specifically, cuDF uses the following tools:
 
-- [`ruff`](https://beta.ruff.rs/) checks for general code formatting compliance.
-- [`black`](https://github.com/psf/black) is an automatic code formatter.
-- [`isort`](https://pycqa.github.io/isort/) ensures imports are sorted consistently.
+- [`ruff`](https://docs.astral.sh/ruff/) checks for general code formatting compliance.
 - [`mypy`](http://mypy-lang.org/) performs static type checking.
   In conjunction with [type hints](https://docs.python.org/3/library/typing.html),
   `mypy` can help catch various bugs that are otherwise difficult to find.
-- [`pydocstyle`](https://github.com/PyCQA/pydocstyle/) lints docstring style.
 - [`codespell`](https://github.com/codespell-project/codespell) finds spelling errors.
 
 Linter config data is stored in a number of files.
@@ -97,18 +94,11 @@ For more information on how to do that, see [our documentation on pandas compari
 
 ## Python vs Cython
 
-cuDF makes substantial use of [Cython](https://cython.org/).
+cuDF has minimal direct use of [Cython](https://cython.org/). It it used indirectly though using `pylibcudf`.
 Cython is a powerful tool, but it is less user-friendly than pure Python.
 It is also more difficult to debug or profile.
-Therefore, developers should generally prefer Python code over Cython where possible.
-
-The primary use-case for Cython in cuDF is to expose libcudf C++ APIs to Python.
-This Cython usage is generally composed of two parts:
-1. A `pxd` file declaring C++ APIs so that they may be used in Cython, and
-2. A `pyx` file containing Cython functions that wrap those C++ APIs so that they can be called from Python.
-
-The latter wrappers should generally be kept as thin as possible to minimize Cython usage.
-For more information see [our Cython layer design documentation](./library_design.md#the-cython-layer).
+Therefore, developers should generally prefer Python code and using [`pylibcudf`](#pylibcudf-developer-docs)
+over Cython where possible.
 
 In some rare cases we may actually benefit from writing pure Cython code to speed up particular code paths.
 Given that most numerical computations in cuDF actually happen in libcudf, however,

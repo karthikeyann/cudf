@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,12 +19,14 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/default_stream.hpp>
+#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 
-namespace cudf::structs::detail {
+namespace CUDF_EXPORT cudf {
+namespace structs::detail {
 
 enum class column_nullability {
   MATCH_INCOMING,  ///< generate a null column if the incoming column has nulls
@@ -85,7 +87,7 @@ std::vector<std::vector<column_view>> extract_ordered_struct_children(
  * @brief Check whether the specified column is of type LIST, or any LISTs in its descendent
  * columns.
  * @param col column to check for lists.
- * @return true if the column or any of it's children is a list, false otherwise.
+ * @return true if the column or any of its children is a list, false otherwise.
  */
 bool is_or_has_nested_lists(cudf::column_view const& col);
 
@@ -111,12 +113,12 @@ class flattened_table {
    * @param columns_ Newly allocated columns to back the table_view
    * @param nullable_data_ Newly generated temporary data that needs to be kept alive
    */
-  flattened_table(table_view const& flattened_columns_,
+  flattened_table(table_view flattened_columns_,
                   std::vector<order> const& orders_,
                   std::vector<null_order> const& null_orders_,
                   std::vector<std::unique_ptr<column>>&& columns_,
                   temporary_nullable_data&& nullable_data_)
-    : _flattened_columns{flattened_columns_},
+    : _flattened_columns{std::move(flattened_columns_)},
       _orders{orders_},
       _null_orders{null_orders_},
       _columns{std::move(columns_)},
@@ -169,22 +171,21 @@ class flattened_table {
  *         orders, flattened null precedence, alongside the supporting columns and device_buffers
  *         for the flattened table.
  */
-[[nodiscard]] std::unique_ptr<flattened_table> flatten_nested_columns(
+[[nodiscard]] std::unique_ptr<cudf::structs::detail::flattened_table> flatten_nested_columns(
   table_view const& input,
-  std::vector<order> const& column_order,
-  std::vector<null_order> const& null_precedence,
-  column_nullability nullability,
+  std::vector<cudf::order> const& column_order,
+  std::vector<cudf::null_order> const& null_precedence,
+  cudf::structs::detail::column_nullability nullability,
   rmm::cuda_stream_view stream,
-  rmm::mr::device_memory_resource* mr);
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Superimpose nulls from a given null mask into the input column, using bitwise AND.
+ * Any null strings/lists in the input (if any) will also be sanitized to make sure nulls in the
+ * output always have their sizes equal to 0.
  *
  * This function will recurse through all struct descendants. It is expected that the size of
  * the given null mask in bits is the same as size of the input column.
- *
- * Any null strings/lists in the input (if any) will also be sanitized to make sure nulls in the
- * output always have their sizes equal to 0.
  *
  * @param null_mask Null mask to be applied to the input column
  * @param null_count Null count in the given null mask
@@ -193,11 +194,56 @@ class flattened_table {
  * @param mr Device memory resource used to allocate new device memory
  * @return A new column with potentially new null mask
  */
-[[nodiscard]] std::unique_ptr<column> superimpose_nulls(bitmask_type const* null_mask,
-                                                        size_type null_count,
-                                                        std::unique_ptr<column>&& input,
-                                                        rmm::cuda_stream_view stream,
-                                                        rmm::mr::device_memory_resource* mr);
+[[nodiscard]] std::unique_ptr<cudf::column> superimpose_and_sanitize_nulls(
+  bitmask_type const* null_mask,
+  cudf::size_type null_count,
+  std::unique_ptr<cudf::column>&& input,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Superimpose nulls from multiple null masks into corresponding input columns
+ *
+ * This function applies each null mask to its corresponding input column using bitwise AND
+ * operations. For each column, nulls are propagated from the mask to the column and its
+ * descendants, and any null strings/lists in the descendant columns are sanitized to ensure nulls
+ * always have their sizes equal to 0.
+ *
+ * The function recursively processes struct descendants in each column. Each null mask is
+ * expected to have the same size in bits as its corresponding input column.
+ *
+ * @param null_masks Vector of null mask pointers to be applied to the input columns
+ * @param inputs Vector of input columns to apply the null masks to
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate new device memory
+ * @return A vector of new columns with the null masks applied and nulls sanitized
+ */
+[[nodiscard]] std::vector<std::unique_ptr<column>> superimpose_and_sanitize_nulls(
+  host_span<bitmask_type const* const> null_masks,
+  std::vector<std::unique_ptr<column>> inputs,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Enforces null consistency in struct columns by propagating nulls from parent to
+ * descendants.
+ *
+ * For each struct column in the input vector, this function ensures that nulls from the root-level
+ * null mask are properly superimposed onto all descendant columns in the struct hierarchy.
+ * The function also sanitizes null strings/lists in the descendant columns to ensure nulls always
+ * have their sizes equal to 0, maintaining consistent null semantics throughout the column
+ * hierarchy.
+ *
+ * @param columns Vector of columns to process, with struct columns getting null consistency
+ * enforcement
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate new device memory
+ * @return A vector of columns with nulls properly propagated from parent structs to all descendants
+ */
+[[nodiscard]] std::vector<std::unique_ptr<column>> enforce_null_consistency(
+  std::vector<std::unique_ptr<column>> columns,
+  rmm::cuda_stream_view stream,
+  rmm::device_async_resource_ref mr);
 
 /**
  * @brief Push down nulls from the given input column into its children columns, using bitwise AND.
@@ -222,7 +268,7 @@ class flattened_table {
  *         to be kept alive.
  */
 [[nodiscard]] std::pair<column_view, temporary_nullable_data> push_down_nulls(
-  column_view const& input, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr);
+  column_view const& input, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
 
 /**
  * @brief Push down nulls from columns of the input table into their children columns, using
@@ -249,7 +295,7 @@ class flattened_table {
  *         to be kept alive.
  */
 [[nodiscard]] std::pair<table_view, temporary_nullable_data> push_down_nulls(
-  table_view const& input, rmm::cuda_stream_view stream, rmm::mr::device_memory_resource* mr);
+  table_view const& input, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
 
 /**
  * @brief Checks if a column or any of its children is a struct column with structs that are null.
@@ -265,4 +311,5 @@ class flattened_table {
  */
 bool contains_null_structs(column_view const& col);
 
-}  // namespace cudf::structs::detail
+}  // namespace structs::detail
+}  // namespace CUDF_EXPORT cudf

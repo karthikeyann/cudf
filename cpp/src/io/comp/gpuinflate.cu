@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -43,15 +43,21 @@ misrepresented as being the original software.
 Mark Adler    madler@alumni.caltech.edu
 */
 
+#include "common_internal.hpp"
 #include "gpuinflate.hpp"
-#include "io_uncomp.hpp"
+#include "io/utilities/block_utils.cuh"
 
-#include <io/utilities/block_utils.cuh>
+#include <cudf/detail/nvtx/ranges.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_uvector.hpp>
+#include <rmm/exec_policy.hpp>
 
-namespace cudf {
-namespace io {
+#include <thrust/gather.h>
+#include <thrust/sequence.h>
+#include <thrust/sort.h>
+
+namespace cudf::io::detail {
 
 constexpr int max_bits    = 15;   // maximum bits in a code
 constexpr int max_l_codes = 286;  // maximum number of literal/length codes
@@ -300,7 +306,7 @@ __device__ int construct(
     left <<= 1;                 // one more bit, double codes left
     left -= counts[len];        // deduct count from possible codes
     if (left < 0) return left;  // over-subscribed--return negative
-  }                             // left > 0 means incomplete
+  }  // left > 0 means incomplete
 
   // generate offsets into symbol table for each length for sorting
   offs[1] = 0;
@@ -805,8 +811,7 @@ __device__ void process_symbols(inflate_state_s* s, int t)
       dist   = symbol >> 16;
       for (int i = t; i < len; i += 32) {
         uint8_t const* src = out + ((i >= dist) ? (i % dist) : i) - dist;
-        uint8_t b          = (src < outbase) ? 0 : *src;
-        if (out + i < outend) { out[i] = b; }
+        if (out + i < outend and src >= outbase) { out[i] = *src; }
       }
       out += len;
       pos++;
@@ -982,27 +987,27 @@ __device__ int parse_gzip_header(uint8_t const* src, size_t src_size)
     {
       uint8_t flags = src[3];
       hdr_len       = 10;
-      if (flags & GZIPHeaderFlag::fextra)  // Extra fields present
+      if (flags & detail::GZIPHeaderFlag::fextra)  // Extra fields present
       {
         int xlen = src[hdr_len] | (src[hdr_len + 1] << 8);
         hdr_len += xlen;
         if (hdr_len >= src_size) return -1;
       }
-      if (flags & GZIPHeaderFlag::fname)  // Original file name present
+      if (flags & detail::GZIPHeaderFlag::fname)  // Original file name present
       {
         // Skip zero-terminated string
         do {
           if (hdr_len >= src_size) return -1;
         } while (src[hdr_len++] != 0);
       }
-      if (flags & GZIPHeaderFlag::fcomment)  // Comment present
+      if (flags & detail::GZIPHeaderFlag::fcomment)  // Comment present
       {
         // Skip zero-terminated string
         do {
           if (hdr_len >= src_size) return -1;
         } while (src[hdr_len++] != 0);
       }
-      if (flags & GZIPHeaderFlag::fhcrc)  // Header CRC present
+      if (flags & detail::GZIPHeaderFlag::fhcrc)  // Header CRC present
       {
         hdr_len += 2;
       }
@@ -1024,10 +1029,10 @@ __device__ int parse_gzip_header(uint8_t const* src, size_t src_size)
  * @param parse_hdr If nonzero, indicates that the compressed bitstream includes a GZIP header
  */
 template <int block_size>
-__global__ void __launch_bounds__(block_size)
+CUDF_KERNEL void __launch_bounds__(block_size)
   inflate_kernel(device_span<device_span<uint8_t const> const> inputs,
                  device_span<device_span<uint8_t> const> outputs,
-                 device_span<compression_result> results,
+                 device_span<codec_exec_result> results,
                  gzip_header_included parse_hdr)
 {
   __shared__ __align__(16) inflate_state_s state_g;
@@ -1136,12 +1141,11 @@ __global__ void __launch_bounds__(block_size)
     results[z].bytes_written = state->out - state->outbase;
     results[z].status        = [&]() {
       switch (state->err) {
-        case 0: return compression_status::SUCCESS;
-        case 1: return compression_status::OUTPUT_OVERFLOW;
-        default: return compression_status::FAILURE;
+        case 0: return codec_status::SUCCESS;
+        case 1: return codec_status::OUTPUT_OVERFLOW;
+        default: return codec_status::FAILURE;
       }
     }();
-    results[z].reserved = (int)(state->end - state->cur);  // Here mainly for debug purposes
   }
 }
 
@@ -1152,7 +1156,7 @@ __global__ void __launch_bounds__(block_size)
  *
  * @param inputs Source and destination information per block
  */
-__global__ void __launch_bounds__(1024)
+CUDF_KERNEL void __launch_bounds__(1024)
   copy_uncompressed_kernel(device_span<device_span<uint8_t const> const> inputs,
                            device_span<device_span<uint8_t> const> outputs)
 {
@@ -1206,7 +1210,7 @@ __global__ void __launch_bounds__(1024)
 
 void gpuinflate(device_span<device_span<uint8_t const> const> inputs,
                 device_span<device_span<uint8_t> const> outputs,
-                device_span<compression_result> results,
+                device_span<codec_exec_result> results,
                 gzip_header_included parse_hdr,
                 rmm::cuda_stream_view stream)
 {
@@ -1226,5 +1230,48 @@ void gpu_copy_uncompressed_blocks(device_span<device_span<uint8_t const> const> 
   }
 }
 
-}  // namespace io
-}  // namespace cudf
+sorted_codec_parameters sort_tasks(device_span<device_span<uint8_t const> const> inputs,
+                                   device_span<device_span<uint8_t> const> outputs,
+                                   rmm::cuda_stream_view stream,
+                                   rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  rmm::device_uvector<std::size_t> order(inputs.size(), stream, mr);
+  thrust::sequence(rmm::exec_policy_nosync(stream), order.begin(), order.end());
+  thrust::sort(rmm::exec_policy_nosync(stream),
+               order.begin(),
+               order.end(),
+               [inputs] __device__(std::size_t a, std::size_t b) {
+                 return inputs[a].size() > inputs[b].size();
+               });
+
+  auto sorted_inputs = rmm::device_uvector<device_span<uint8_t const>>(inputs.size(), stream, mr);
+  thrust::gather(rmm::exec_policy_nosync(stream),
+                 order.begin(),
+                 order.end(),
+                 inputs.begin(),
+                 sorted_inputs.begin());
+
+  auto sorted_outputs = rmm::device_uvector<device_span<uint8_t>>(outputs.size(), stream, mr);
+  thrust::gather(rmm::exec_policy_nosync(stream),
+                 order.begin(),
+                 order.end(),
+                 outputs.begin(),
+                 sorted_outputs.begin());
+
+  return {std::move(sorted_inputs), std::move(sorted_outputs), std::move(order)};
+}
+
+void copy_results_to_original_order(device_span<codec_exec_result const> sorted_results,
+                                    device_span<codec_exec_result> original_results,
+                                    device_span<std::size_t const> order,
+                                    rmm::cuda_stream_view stream)
+{
+  thrust::scatter(rmm::exec_policy_nosync(stream),
+                  sorted_results.begin(),
+                  sorted_results.end(),
+                  order.begin(),
+                  original_results.begin());
+}
+
+}  // namespace cudf::io::detail

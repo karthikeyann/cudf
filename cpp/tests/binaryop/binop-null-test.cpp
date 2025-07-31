@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Copyright 2018-2019 BlazingDB, Inc.
  *     Copyright 2018 Christian Noboa Mardini <christian@blazingdb.com>
@@ -17,21 +17,13 @@
  * limitations under the License.
  */
 
-#include <tests/binaryop/util/runtime_support.h>
-
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
 
 #include <cudf/binaryop.hpp>
 
-struct BinaryOperationNullTest : public cudf::test::BaseFixture {
- protected:
-  void SetUp() override
-  {
-    if (!can_do_runtime_jit()) { GTEST_SKIP() << "Skipping tests that require 11.5 runtime"; }
-  }
-};
+struct BinaryOperationNullTest : public cudf::test::BaseFixture {};
 
 TEST_F(BinaryOperationNullTest, Scalar_Null_Vector_Valid)
 {

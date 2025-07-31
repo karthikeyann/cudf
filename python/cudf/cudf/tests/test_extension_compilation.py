@@ -1,4 +1,4 @@
-# Copyright (c) 2021-2023, NVIDIA CORPORATION.
+# Copyright (c) 2021-2025, NVIDIA CORPORATION.
 import operator
 
 import cupy as cp
@@ -8,6 +8,7 @@ from numba import cuda, types
 from numba.cuda import compile_ptx
 from numba.np.numpy_support import from_dtype
 
+import cudf
 from cudf import NA
 from cudf.core.udf.api import Masked
 from cudf.core.udf.masked_typing import MaskedType
@@ -106,7 +107,7 @@ def test_execute_masked_binary(op, ty):
         if u != r1.value:
             err[0] = 3
 
-    err = cp.asarray([0], dtype="int8")
+    err = cudf.Series([0], dtype="int8")
     with _CUDFNumbaConfig():
         test_kernel[1, 1](1, 2, err)
     assert err[0] == 0
@@ -198,7 +199,6 @@ def func_na_is_x(x):
 
 @pytest.mark.parametrize("fn", (func_x_is_na, func_na_is_x))
 def test_is_na(fn):
-
     valid = Masked(1, True)
     invalid = Masked(1, False)
 
@@ -215,7 +215,7 @@ def test_is_na(fn):
         if not invalid_is_na:
             err[0] = 2
 
-    err = cp.asarray([0], dtype="int8")
+    err = cudf.Series([0], dtype="int8")
     with _CUDFNumbaConfig():
         test_kernel[1, 1](err)
     assert err[0] == 0
@@ -288,7 +288,6 @@ na_comparison_funcs = (
 @pytest.mark.parametrize("fn", na_comparison_funcs)
 @pytest.mark.parametrize("ty", number_types, ids=number_ids)
 def test_na_masked_comparisons(fn, ty):
-
     device_fn = cuda.jit(device=True)(fn)
 
     @cuda.jit
@@ -306,7 +305,7 @@ def test_na_masked_comparisons(fn, ty):
         if invalid_cmp_na:
             err[0] = 2
 
-    err = cp.asarray([0], dtype="int8")
+    err = cudf.Series(cp.asarray([0], dtype="int8"))
     with _CUDFNumbaConfig():
         test_kernel[1, 1](err)
     assert err[0] == 0
@@ -317,7 +316,6 @@ def test_na_masked_comparisons(fn, ty):
 @pytest.mark.parametrize("fn", na_comparison_funcs)
 @pytest.mark.parametrize("ty", number_types, ids=number_ids)
 def test_na_scalar_comparisons(fn, ty):
-
     device_fn = cuda.jit(device=True)(fn)
 
     @cuda.jit

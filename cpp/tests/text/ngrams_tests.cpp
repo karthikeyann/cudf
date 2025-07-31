@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,6 +17,8 @@
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
+#include <cudf_test/iterator_utilities.hpp>
+#include <cudf_test/testing_main.hpp>
 
 #include <cudf/column/column.hpp>
 #include <cudf/scalar/scalar.hpp>
@@ -25,8 +27,6 @@
 #include <nvtext/generate_ngrams.hpp>
 
 #include <thrust/iterator/transform_iterator.h>
-
-#include <vector>
 
 struct TextGenerateNgramsTest : public cudf::test::BaseFixture {};
 
@@ -49,29 +49,24 @@ TEST_F(TextGenerateNgramsTest, Ngrams)
     auto const results = nvtext::generate_ngrams(strings_view, 3, separator);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
+  using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
   {
-    cudf::test::strings_column_wrapper expected{"th",
-                                                "he",
-                                                "fo",
-                                                "ox",
-                                                "ju",
-                                                "um",
-                                                "mp",
-                                                "pe",
-                                                "ed",
-                                                "ov",
-                                                "ve",
-                                                "er",
-                                                "th",
-                                                "hé",
-                                                "do",
-                                                "og"};
+    LCW expected({LCW({"th", "he"}),
+                  LCW({"fo", "ox"}),
+                  LCW({"ju", "um", "mp", "pe", "ed"}),
+                  LCW({"ov", "ve", "er"}),
+                  LCW({"th", "hé"}),
+                  LCW({"do", "og"})});
     auto const results = nvtext::generate_character_ngrams(strings_view, 2);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
   {
-    cudf::test::strings_column_wrapper expected{
-      "the", "fox", "jum", "ump", "mpe", "ped", "ove", "ver", "thé", "dog"};
+    LCW expected({LCW({"the"}),
+                  LCW({"fox"}),
+                  LCW({"jum", "ump", "mpe", "ped"}),
+                  LCW({"ove", "ver"}),
+                  LCW({"thé"}),
+                  LCW({"dog"})});
     auto const results = nvtext::generate_character_ngrams(strings_view, 3);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
@@ -79,24 +74,29 @@ TEST_F(TextGenerateNgramsTest, Ngrams)
 
 TEST_F(TextGenerateNgramsTest, NgramsWithNulls)
 {
-  std::vector<char const*> h_strings{"the", "fox", "", "jumped", "over", nullptr, "the", "dog"};
-  cudf::test::strings_column_wrapper strings(
-    h_strings.begin(),
-    h_strings.end(),
-    thrust::make_transform_iterator(h_strings.begin(), [](auto str) { return str != nullptr; }));
+  auto validity = cudf::test::iterators::null_at(5);
+  cudf::test::strings_column_wrapper input({"the", "fox", "", "jumped", "over", "", "the", "dog"},
+                                           validity);
   auto const separator = cudf::string_scalar("_");
 
-  cudf::strings_column_view strings_view(strings);
+  cudf::strings_column_view sv(input);
   {
-    auto const results = nvtext::generate_ngrams(strings_view, 3, separator);
+    auto const results = nvtext::generate_ngrams(sv, 3, separator);
     cudf::test::strings_column_wrapper expected{
       "the_fox_jumped", "fox_jumped_over", "jumped_over_the", "over_the_dog"};
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
   {
-    cudf::test::strings_column_wrapper expected{
-      "the", "fox", "jum", "ump", "mpe", "ped", "ove", "ver", "the", "dog"};
-    auto const results = nvtext::generate_character_ngrams(strings_view, 3);
+    using LCW = cudf::test::lists_column_wrapper<cudf::string_view>;
+    LCW expected({LCW({"the"}),
+                  LCW({"fox"}),
+                  LCW{},
+                  LCW({"jum", "ump", "mpe", "ped"}),
+                  LCW({"ove", "ver"}),
+                  LCW{},
+                  LCW({"the"}),
+                  LCW({"dog"})});
+    auto const results = nvtext::generate_character_ngrams(sv, 3);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
   }
 }
@@ -120,9 +120,12 @@ TEST_F(TextGenerateNgramsTest, Errors)
   auto const separator = cudf::string_scalar("_");
   // invalid parameter value
   EXPECT_THROW(nvtext::generate_ngrams(cudf::strings_column_view(strings), 1, separator),
-               cudf::logic_error);
+               std::invalid_argument);
   EXPECT_THROW(nvtext::generate_character_ngrams(cudf::strings_column_view(strings), 1),
-               cudf::logic_error);
+               std::invalid_argument);
+  auto const invalid_separator = cudf::string_scalar("", false);
+  EXPECT_THROW(nvtext::generate_ngrams(cudf::strings_column_view(strings), 2, invalid_separator),
+               std::invalid_argument);
   // not enough strings to generate ngrams
   EXPECT_THROW(nvtext::generate_ngrams(cudf::strings_column_view(strings), 3, separator),
                cudf::logic_error);
@@ -156,6 +159,17 @@ TEST_F(TextGenerateNgramsTest, NgramsHash)
                     2319357747u}});
   // clang-format on
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected);
+
+  results = nvtext::hash_character_ngrams(view, 10, 10);
+  // clang-format off
+  LCW expected2({LCW{2818025299u, 4026424618u, 578054337u, 2107870805u, 3942221995u,
+                     2802685757u, 2686450821u, 584898501u, 2206824201u, 487979059u},
+                 LCW{1154048732u, 3209682333u, 3246563372u, 3789750511u, 1287153502u,
+                     3759561568u, 1092423314u,  339538635u, 4265577390u,  879551618u,
+                     4222824617u, 1774528854u, 1028254379u,  485918316u,  879142987u, 3619248543u}
+  });
+  // clang-format on
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(*results, expected2);
 }
 
 TEST_F(TextGenerateNgramsTest, NgramsHashErrors)
@@ -164,7 +178,7 @@ TEST_F(TextGenerateNgramsTest, NgramsHashErrors)
   auto view  = cudf::strings_column_view(input);
 
   // invalid parameter value
-  EXPECT_THROW(nvtext::hash_character_ngrams(view, 1), cudf::logic_error);
+  EXPECT_THROW(nvtext::hash_character_ngrams(view, 1), std::invalid_argument);
   // strings not long enough to generate ngrams
   EXPECT_THROW(nvtext::hash_character_ngrams(view), cudf::logic_error);
 }

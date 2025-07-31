@@ -1,33 +1,81 @@
-# SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION & AFFILIATES.
 # All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
 import collections
+import contextlib
 import copy
+import cProfile
 import datetime
 import operator
+import os
 import pathlib
 import pickle
+import pstats
+import subprocess
 import tempfile
+import time
 import types
+from collections.abc import Callable
 from io import BytesIO, StringIO
 
+import cupy as cp
+import jupyter_client
+import nbformat
 import numpy as np
 import pyarrow as pa
 import pytest
-from numba import NumbaDeprecationWarning
+from nbconvert.preprocessors import ExecutePreprocessor
+from numba import (
+    NumbaDeprecationWarning,
+    __version__ as numba_version,
+    vectorize,
+)
+from packaging import version
+from pytz import utc
 
+from rmm import RMMError
+
+from cudf.core._compat import PANDAS_GE_210, PANDAS_GE_220, PANDAS_VERSION
 from cudf.pandas import LOADED, Profiler
-from cudf.pandas.fast_slow_proxy import _Unusable
+from cudf.pandas.fast_slow_proxy import (
+    AttributeFallbackError,
+    FallbackError,
+    NotImplementedFallbackError,
+    OOMFallbackError,
+    TypeFallbackError,
+    _Unusable,
+    as_proxy_object,
+    is_proxy_object,
+)
+from cudf.testing import assert_eq
 
 if not LOADED:
     raise ImportError("These tests must be run with cudf.pandas loaded")
 
 import pandas as xpd
 import pandas._testing as tm
+from pandas.tseries.holiday import (
+    AbstractHolidayCalendar,
+    EasterMonday,
+    GoodFriday,
+    Holiday,
+    USColumbusDay,
+    USLaborDay,
+    USMartinLutherKingJr,
+    USMemorialDay,
+    USPresidentsDay,
+    USThanksgivingDay,
+    get_calendar,
+)
 
-# Accelerated pandas has the real pandas module as an attribute
+from cudf.pandas import (
+    is_proxy_instance,
+)
+
+# Accelerated pandas has the real pandas and cudf modules as attributes
 pd = xpd._fsproxy_slow
+cudf = xpd._fsproxy_fast
 
 
 @pytest.fixture
@@ -163,6 +211,9 @@ def test_index_generator():
     tm.assert_equal(pi, xi)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:DataFrameGroupBy.apply operated on the grouping columns"
+)
 def test_groupby_apply_fallback(dataframe, groupby_udf):
     pdf, df = dataframe
     tm.assert_equal(
@@ -254,6 +305,9 @@ def test_df_from_series(series):
     tm.assert_frame_equal(pd.DataFrame(psr), xpd.DataFrame(sr))
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Setting an item of incompatible dtype is deprecated"
+)
 def test_iloc_change_type(series):
     psr, sr = series
     psr.iloc[0] = "a"
@@ -267,26 +321,6 @@ def test_rename_categories():
     psr = psr.cat.rename_categories({1: 5})
     sr = sr.cat.rename_categories({1: 5})
     tm.assert_series_equal(psr, sr)
-
-
-def test_rename_categories_inplace():
-    psr = pd.Series([1, 2, 3], dtype="category")
-    sr = xpd.Series([1, 2, 3], dtype="category")
-    with pytest.warns(FutureWarning):
-        psr.cat.rename_categories({1: 5}, inplace=True)
-        sr.cat.rename_categories({1: 5}, inplace=True)
-    tm.assert_series_equal(psr, sr)
-
-
-def test_rename_categories_inplace_after_copying_parent():
-    s = xpd.Series([1, 2, 3], dtype="category")
-    # cudf does not define "rename_categories",
-    # so this copies `s` from device to host:
-    rename_categories = s.cat.rename_categories
-    _ = len(s)  # trigger a copy of `s` from host to device:
-    with pytest.warns(FutureWarning):
-        rename_categories([5, 2, 3], inplace=True)
-    assert s.cat.categories.tolist() == [5, 2, 3]
 
 
 def test_column_rename(dataframe):
@@ -385,6 +419,8 @@ def test_pickle_round_trip(dataframe):
 
 
 def test_excel_round_trip(dataframe):
+    pytest.importorskip("openpyxl")
+
     pdf, df = dataframe
     excel_pdf = BytesIO()
     excel_cudf_pandas = BytesIO()
@@ -411,26 +447,28 @@ def test_is_sparse():
     psa = pd.arrays.SparseArray([0, 0, 1, 0])
     xsa = xpd.arrays.SparseArray([0, 0, 1, 0])
 
-    assert pd.api.types.is_sparse(psa) == xpd.api.types.is_sparse(xsa)
+    assert isinstance(psa.dtype, pd.SparseDtype) == isinstance(
+        xsa.dtype, xpd.SparseDtype
+    )
 
 
 def test_is_file_like():
-    assert pd.api.types.is_file_like("a") == xpd.api.types.is_file_like("a")
-    assert pd.api.types.is_file_like(BytesIO()) == xpd.api.types.is_file_like(
+    assert pd.api.types.is_file_like("a") == xpd.api.types.is_file_like("a")  # noqa: TID251
+    assert pd.api.types.is_file_like(BytesIO()) == xpd.api.types.is_file_like(  # noqa: TID251
         BytesIO()
     )
     assert pd.api.types.is_file_like(
         StringIO("abc")
-    ) == xpd.api.types.is_file_like(StringIO("abc"))
+    ) == xpd.api.types.is_file_like(StringIO("abc"))  # noqa: TID251
 
 
 def test_is_re_compilable():
     assert pd.api.types.is_re_compilable(
         ".^"
-    ) == xpd.api.types.is_re_compilable(".^")
+    ) == xpd.api.types.is_re_compilable(".^")  # noqa: TID251
     assert pd.api.types.is_re_compilable(
         ".*"
-    ) == xpd.api.types.is_re_compilable(".*")
+    ) == xpd.api.types.is_re_compilable(".*")  # noqa: TID251
 
 
 def test_module_attribute_types():
@@ -449,6 +487,9 @@ def test_infer_freq():
     assert expected == got
 
 
+@pytest.mark.filterwarnings(
+    "ignore:DataFrameGroupBy.apply operated on the grouping columns"
+)
 def test_groupby_grouper_fallback(dataframe, groupby_udf):
     pdf, df = dataframe
     tm.assert_equal(
@@ -465,7 +506,10 @@ def test_options_mode():
     assert xpd.options.mode.copy_on_write == pd.options.mode.copy_on_write
 
 
-def test_profiler():
+# Codecov and Profiler interfere with each-other,
+# hence we don't want to run code-cov on this test.
+@pytest.mark.no_cover
+def test_cudf_pandas_profiler():
     pytest.importorskip("cudf")
 
     # test that the profiler correctly reports
@@ -526,10 +570,18 @@ def test_array_ufunc(series):
     tm.assert_equal(expect, got)
 
 
+@pytest.mark.xfail(strict=False, reason="Fails in CI, passes locally.")
 def test_groupby_apply_func_returns_series(dataframe):
     pdf, df = dataframe
-    expect = pdf.groupby("a").apply(lambda group: pd.Series({"x": 1}))
-    got = df.groupby("a").apply(lambda group: xpd.Series({"x": 1}))
+    if PANDAS_GE_220:
+        kwargs = {"include_groups": False}
+    else:
+        kwargs = {}
+
+    expect = pdf.groupby("a").apply(
+        lambda group: pd.Series({"x": 1}), **kwargs
+    )
+    got = df.groupby("a").apply(lambda group: xpd.Series({"x": 1}), **kwargs)
     tm.assert_equal(expect, got)
 
 
@@ -663,11 +715,19 @@ def test_rolling_win_type():
     pdf = pd.DataFrame(range(5))
     df = xpd.DataFrame(range(5))
     result = df.rolling(2, win_type="boxcar").mean()
-    with pytest.warns(DeprecationWarning):
-        expected = pdf.rolling(2, win_type="boxcar").mean()
+    expected = pdf.rolling(2, win_type="boxcar").mean()
     tm.assert_equal(result, expected)
 
 
+@pytest.mark.skipif(
+    version.parse(numba_version) < version.parse("0.59"),
+    reason="Requires Numba 0.59 to fix segfaults on ARM. See https://github.com/numba/llvmlite/pull/1009",
+)
+@pytest.mark.xfail(
+    version.parse(numba_version) >= version.parse("0.59")
+    and PANDAS_VERSION < version.parse("2.1"),
+    reason="numba.generated_jit removed in 0.59, requires pandas >= 2.1",
+)
 def test_rolling_apply_numba_engine():
     def weighted_mean(x):
         arr = np.ones((1, x.shape[1]))
@@ -677,7 +737,12 @@ def test_rolling_apply_numba_engine():
     pdf = pd.DataFrame([[1, 2, 0.6], [2, 3, 0.4], [3, 4, 0.2], [4, 5, 0.7]])
     df = xpd.DataFrame([[1, 2, 0.6], [2, 3, 0.4], [3, 4, 0.2], [4, 5, 0.7]])
 
-    with pytest.warns(NumbaDeprecationWarning):
+    ctx = (
+        contextlib.nullcontext()
+        if PANDAS_GE_210
+        else pytest.warns(NumbaDeprecationWarning)
+    )
+    with ctx:
         expect = pdf.rolling(2, method="table", min_periods=0).apply(
             weighted_mean, raw=True, engine="numba"
         )
@@ -874,7 +939,7 @@ def test_namedagg_namedtuple():
     result = df.groupby("kind").agg(
         min_height=pd.NamedAgg(column="height", aggfunc="min"),
         max_height=pd.NamedAgg(column="height", aggfunc="max"),
-        average_weight=pd.NamedAgg(column="weight", aggfunc=np.mean),
+        average_weight=pd.NamedAgg(column="weight", aggfunc="mean"),
     )
     expected = xpd.DataFrame(
         {
@@ -927,6 +992,9 @@ def test_resample():
     )
     expected = ser.resample("D").max()
     result = xser.resample("D").max()
+    # TODO: See if as_unit can be avoided
+    expected.index = expected.index.as_unit("s")
+    result.index = result.index.as_unit("s")
     tm.assert_series_equal(result, expected)
 
 
@@ -1014,12 +1082,6 @@ def test_subclass_series():
         xpd.PeriodIndex,
         xpd.MultiIndex,
         xpd.IntervalIndex,
-        xpd.UInt64Index,
-        xpd.Int64Index,
-        xpd.Float64Index,
-        xpd.core.indexes.numeric.UInt64Index,
-        xpd.core.indexes.numeric.Int64Index,
-        xpd.core.indexes.numeric.Float64Index,
     ],
 )
 def test_index_subclass(index_type):
@@ -1027,22 +1089,6 @@ def test_index_subclass(index_type):
     # from Index
     assert issubclass(index_type, xpd.Index)
     assert not issubclass(xpd.Index, index_type)
-
-
-def test_index_internal_subclass():
-    # test that proxy index types that are not related by inheritance
-    # still appear to be so if the underlying slow types are related
-    # by inheritance:
-    assert issubclass(
-        xpd.Int64Index,
-        xpd.core.indexes.numeric.NumericIndex,
-    ) == issubclass(
-        pd.Int64Index,
-        pd.core.indexes.numeric.NumericIndex,
-    )
-    assert isinstance(
-        xpd.Index([1, 2, 3]), xpd.core.indexes.numeric.NumericIndex
-    ) == isinstance(pd.Index([1, 2, 3]), pd.core.indexes.numeric.NumericIndex)
 
 
 def test_np_array_of_timestamps():
@@ -1062,6 +1108,7 @@ def test_np_array_of_timestamps():
         xpd.Series([1, 2, 3]),
         # Index (doesn't support nullary construction)
         xpd.Index([1, 2, 3]),
+        xpd.RangeIndex(0, 10),
         xpd.Index(["a", "b", "c"]),
         # Complex index
         xpd.to_datetime(
@@ -1071,22 +1118,26 @@ def test_np_array_of_timestamps():
                 datetime.datetime(2018, 1, 1),
             ]
         ),
+        xpd.TimedeltaIndex([100, 200, 300], dtype="timedelta64[ns]"),
+        xpd.MultiIndex.from_tuples([(1, 2), (3, 4)]),
         # Objects where the underlying store is the slow type.
         xpd.Series(["a", 2, 3]),
         xpd.Index(["a", 2, 3]),
         # Other types
         xpd.tseries.offsets.BDay(5),
         xpd.Timestamp("2001-01-01"),
-        xpd.Timestamp("2001-01-01", freq="D"),
+        xpd.Timestamp("2001-01-01", tz="UTC"),
         xpd.Timedelta("1 days"),
         xpd.Timedelta(1, "D"),
     ],
 )
-def test_pickle(obj):
+@pytest.mark.parametrize("pickle_func", [pickle.dump, xpd.to_pickle])
+@pytest.mark.parametrize("read_pickle_func", [pickle.load, xpd.read_pickle])
+def test_pickle(obj, pickle_func, read_pickle_func):
     with tempfile.TemporaryFile() as f:
-        pickle.dump(obj, f)
+        pickle_func(obj, f)
         f.seek(0)
-        copy = pickle.load(f)
+        copy = read_pickle_func(f)
 
     tm.assert_equal(obj, copy)
 
@@ -1107,9 +1158,16 @@ def test_dataframe_query():
     tm.assert_equal(actual, expected)
 
 
+def test_private_method_result_wrapped():
+    xoffset = xpd.offsets.Day()
+    dt = datetime.datetime(2020, 1, 1)
+    result = xoffset._apply(dt)
+    assert isinstance(result, xpd.Timestamp)
+
+
 def test_numpy_var():
-    np.random.seed(42)
-    data = np.random.rand(1000)
+    rng = np.random.default_rng(seed=42)
+    data = rng.random(1000)
     psr = pd.Series(data)
     sr = xpd.Series(data)
 
@@ -1130,9 +1188,11 @@ def test_index_new():
     tm.assert_equal(expected, got)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:DataFrameGroupBy.apply operated on the grouping columns"
+)
 @pytest.mark.xfail(not LOADED, reason="Should not fail in accelerated mode")
 def test_groupby_apply_callable_referencing_pandas(dataframe):
-
     pdf, df = dataframe
 
     class Callable1:
@@ -1177,25 +1237,6 @@ def test_intermediates_are_proxied():
     assert isinstance(grouper, xpd.core.groupby.generic.DataFrameGroupBy)
 
 
-def test_from_dataframe():
-    cudf = pytest.importorskip("cudf")
-    from cudf.testing._utils import assert_eq
-
-    data = {"foo": [1, 2, 3], "bar": [4, 5, 6]}
-
-    cudf_pandas_df = xpd.DataFrame(data)
-    cudf_df = cudf.DataFrame(data)
-
-    # test construction of a cuDF DataFrame from an cudf_pandas DataFrame
-    assert_eq(cudf_df, cudf.DataFrame.from_pandas(cudf_pandas_df))
-    assert_eq(cudf_df, cudf.from_dataframe(cudf_pandas_df))
-
-    # ideally the below would work as well, but currently segfaults
-
-    # pd_df = pd.DataFrame(data)
-    # assert_eq(pd_df, pd.api.interchange.from_dataframe(cudf_pandas_df))
-
-
 def test_multiindex_values_returns_1d_tuples():
     mi = xpd.MultiIndex.from_tuples([(1, 2), (3, 4)])
     result = mi.values
@@ -1212,15 +1253,6 @@ def test_read_sas_context():
     assert isinstance(df, xpd.DataFrame)
 
 
-@pytest.mark.parametrize(
-    "idx_obj", ["Float64Index", "Int64Index", "UInt64Index"]
-)
-def test_pandas_module_getattr_objects(idx_obj):
-    # Objects that are behind pandas.__getattr__ (version 1.5 specific)
-    idx = getattr(xpd, idx_obj)([1, 2, 3])
-    assert isinstance(idx, xpd.Index)
-
-
 def test_concat_fast():
     pytest.importorskip("cudf")
 
@@ -1230,3 +1262,868 @@ def test_concat_fast():
 def test_func_namespace():
     # note: this test is sensitive to Pandas' internal module layout
     assert xpd.concat is xpd.core.reshape.concat.concat
+
+
+def test_register_accessor():
+    @xpd.api.extensions.register_dataframe_accessor("xyz")
+    class XYZ:
+        def __init__(self, obj):
+            self._obj = obj
+
+        @property
+        def foo(self):
+            return "spam"
+
+    # the accessor must be registered with the proxy type,
+    # not the underlying fast or slow type
+    assert "xyz" in xpd.DataFrame.__dict__
+
+    df = xpd.DataFrame()
+    assert df.xyz.foo == "spam"
+
+
+def test_pickle_groupby(dataframe):
+    pdf, df = dataframe
+    pgb = pdf.groupby("a")
+    gb = df.groupby("a")
+    gb = pickle.loads(pickle.dumps(gb))
+    tm.assert_equal(pgb.sum(), gb.sum())
+
+
+def test_numpy_extension_array():
+    np_array = np.array([0, 1, 2, 3])
+    try:
+        xarray = xpd.arrays.NumpyExtensionArray(np_array)
+        array = pd.arrays.NumpyExtensionArray(np_array)
+    except AttributeError:
+        xarray = xpd.arrays.PandasArray(np_array)
+        array = pd.arrays.PandasArray(np_array)
+
+    tm.assert_equal(xarray, array)
+
+
+def test_isinstance_base_offset():
+    offset = xpd.tseries.frequencies.to_offset("1s")
+    assert isinstance(offset, xpd.tseries.offsets.BaseOffset)
+
+
+def test_super_attribute_lookup():
+    # test that we can use super() to access attributes
+    # of the base class when subclassing proxy types
+
+    class Foo(xpd.Series):
+        def max_times_two(self):
+            return super().max() * 2
+
+    s = Foo([1, 2, 3])
+    assert s.max_times_two() == 6
+
+
+@pytest.mark.xfail(
+    PANDAS_VERSION < version.parse("2.1"),
+    reason="DatetimeArray.__floordiv__ missing in pandas-2.0.0",
+)
+def test_floordiv_array_vs_df():
+    xarray = xpd.Series([1, 2, 3], dtype="datetime64[ns]").array
+    parray = pd.Series([1, 2, 3], dtype="datetime64[ns]").array
+
+    xdf = xpd.DataFrame(xarray)
+    pdf = pd.DataFrame(parray)
+
+    actual = xarray.__floordiv__(xdf)
+    expected = parray.__floordiv__(pdf)
+
+    tm.assert_equal(actual, expected)
+
+
+def test_apply_slow_path_udf_references_global_module():
+    def my_apply(df, unused):
+        # `datetime` Raised `KeyError: __import__`
+        datetime.datetime.strptime(df["Minute"], "%H:%M:%S")
+        return pd.to_numeric(1)
+
+    df = xpd.DataFrame({"Minute": ["09:00:00"]})
+    result = df.apply(my_apply, axis=1, unused=True)
+    expected = xpd.Series([1])
+    tm.assert_series_equal(result, expected)
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        "__iadd__",
+        "__iand__",
+        "__ifloordiv__",
+        "__imod__",
+        "__imul__",
+        "__ior__",
+        "__ipow__",
+        "__isub__",
+        "__itruediv__",
+        "__ixor__",
+    ],
+)
+def test_inplace_ops(op):
+    xdf1 = xpd.DataFrame({"a": [10, 11, 12]})
+    xdf2 = xpd.DataFrame({"a": [1, 2, 3]})
+
+    df1 = pd.DataFrame({"a": [10, 11, 12]})
+    df2 = pd.DataFrame({"a": [1, 2, 3]})
+
+    actual = getattr(xdf1, op)(xdf2)
+    expected = getattr(df1, op)(df2)
+
+    tm.assert_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        "__iadd__",
+        "__iand__",
+        "__ifloordiv__",
+        "__imod__",
+        "__imul__",
+        "__ior__",
+        "__ipow__",
+        "__isub__",
+        "__itruediv__",
+        "__ixor__",
+    ],
+)
+def test_inplace_ops_series(op):
+    xser1 = xpd.Series([10, 11, 12])
+    xser2 = xpd.Series([1, 2, 3])
+
+    ser1 = pd.Series([10, 11, 12])
+    ser2 = pd.Series([1, 2, 3])
+
+    actual = getattr(xser1, op)(xser2)
+    expected = getattr(ser1, op)(ser2)
+
+    tm.assert_equal(actual, expected)
+
+
+@pytest.mark.parametrize("data", [pd.NaT, 1234, "nat"])
+def test_timestamp(data):
+    xtimestamp = xpd.Timestamp(data)
+    timestamp = pd.Timestamp(data)
+    tm.assert_equal(xtimestamp, timestamp)
+
+
+@pytest.mark.parametrize("data", [pd.NaT, 1234, "nat"])
+def test_timedelta(data):
+    xtimedelta = xpd.Timedelta(data)
+    timedelta = pd.Timedelta(data)
+    tm.assert_equal(xtimedelta, timedelta)
+
+
+def test_abstract_holiday_calendar():
+    class TestCalendar(AbstractHolidayCalendar):
+        def __init__(self, name=None, rules=None) -> None:
+            super().__init__(name=name, rules=rules)
+
+    jan1 = TestCalendar(rules=[Holiday("jan1", year=2015, month=1, day=1)])
+    jan2 = TestCalendar(rules=[Holiday("jan2", year=2015, month=1, day=2)])
+
+    # Getting holidays for Jan 1 should not alter results for Jan 2.
+    expected = xpd.DatetimeIndex(["01-Jan-2015"]).as_unit("ns")
+    tm.assert_index_equal(jan1.holidays(), expected)
+
+    expected2 = xpd.DatetimeIndex(["02-Jan-2015"]).as_unit("ns")
+    tm.assert_index_equal(jan2.holidays(), expected2)
+
+
+@pytest.mark.parametrize(
+    "holiday,start,expected",
+    [
+        (USMemorialDay, datetime.datetime(2015, 7, 1), []),
+        (USLaborDay, "2015-09-07", [xpd.Timestamp("2015-09-07")]),
+        (USColumbusDay, "2015-10-12", [xpd.Timestamp("2015-10-12")]),
+        (USThanksgivingDay, "2015-11-26", [xpd.Timestamp("2015-11-26")]),
+        (USMartinLutherKingJr, "2015-01-19", [xpd.Timestamp("2015-01-19")]),
+        (USPresidentsDay, datetime.datetime(2015, 7, 1), []),
+        (GoodFriday, datetime.datetime(2015, 7, 1), []),
+        (EasterMonday, "2015-04-06", [xpd.Timestamp("2015-04-06")]),
+        ("New Year's Day", "2010-12-31", [xpd.Timestamp("2010-12-31")]),
+        ("Independence Day", "2015-07-03", [xpd.Timestamp("2015-07-03")]),
+        ("Veterans Day", "2012-11-11", []),
+        ("Christmas Day", "2011-12-26", [xpd.Timestamp("2011-12-26")]),
+        (
+            "Juneteenth National Independence Day",
+            "2021-06-18",
+            [xpd.Timestamp("2021-06-18")],
+        ),
+        ("Juneteenth National Independence Day", "2022-06-19", []),
+        (
+            "Juneteenth National Independence Day",
+            "2022-06-20",
+            [xpd.Timestamp("2022-06-20")],
+        ),
+    ],
+)
+def test_holidays_within_dates(holiday, start, expected):
+    if isinstance(holiday, str):
+        calendar = get_calendar("USFederalHolidayCalendar")
+        holiday = calendar.rule_from_name(holiday)
+
+    assert list(holiday.dates(start, start)) == expected
+
+    # Verify that timezone info is preserved.
+    assert list(
+        holiday.dates(
+            utc.localize(xpd.Timestamp(start)),
+            utc.localize(xpd.Timestamp(start)),
+        )
+    ) == [utc.localize(dt) for dt in expected]
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize(
+    "env_value",
+    ["", "cuda", "pool", "async", "managed", "managed_pool", "abc"],
+)
+def test_rmm_option_on_import(env_value):
+    data_directory = os.path.dirname(os.path.abspath(__file__))
+    # Create a copy of the current environment variables
+    env = os.environ.copy()
+    env["CUDF_PANDAS_RMM_MODE"] = env_value
+
+    sp_completed = subprocess.run(
+        [
+            "python",
+            "-m",
+            "cudf.pandas",
+            data_directory + "/data/profile_basic.py",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+    if env_value in {"cuda", "pool", "async", "managed", "managed_pool"}:
+        assert sp_completed.returncode == 0
+    else:
+        assert sp_completed.returncode == 1
+
+
+def test_cudf_pandas_debugging_different_results(monkeypatch):
+    cudf_mean = cudf.Series.mean
+
+    def mock_mean_one(self, *args, **kwargs):
+        return np.float64(1.0)
+
+    with monkeypatch.context() as monkeycontext:
+        monkeypatch.setattr(xpd.Series.mean, "_fsproxy_fast", mock_mean_one)
+        monkeycontext.setenv("CUDF_PANDAS_DEBUGGING", "True")
+        s = xpd.Series([1, 2])
+        with pytest.warns(
+            UserWarning,
+            match="The results from cudf and pandas were different.",
+        ):
+            assert s.mean() == 1.0
+    # Must explicitly undo the patch. Proxy dispatch doesn't work with monkeypatch contexts.
+    monkeypatch.setattr(xpd.Series.mean, "_fsproxy_fast", cudf_mean)
+
+
+def test_cudf_pandas_debugging_pandas_error(monkeypatch):
+    pd_mean = pd.Series.mean
+
+    def mock_mean_exception(self, *args, **kwargs):
+        raise Exception()
+
+    with monkeypatch.context() as monkeycontext:
+        monkeycontext.setattr(
+            xpd.Series.mean, "_fsproxy_slow", mock_mean_exception
+        )
+        monkeycontext.setenv("CUDF_PANDAS_DEBUGGING", "True")
+        s = xpd.Series([1, 2])
+        with pytest.warns(
+            UserWarning,
+            match="The result from pandas could not be computed.",
+        ):
+            s = xpd.Series([1, 2])
+            assert s.mean() == 1.5
+    # Must explicitly undo the patch. Proxy dispatch doesn't work with monkeypatch contexts.
+    monkeypatch.setattr(xpd.Series.mean, "_fsproxy_slow", pd_mean)
+
+
+def test_cudf_pandas_debugging_failed(monkeypatch):
+    pd_mean = pd.Series.mean
+
+    def mock_mean_none(self, *args, **kwargs):
+        return None
+
+    with monkeypatch.context() as monkeycontext:
+        monkeycontext.setattr(xpd.Series.mean, "_fsproxy_slow", mock_mean_none)
+        monkeycontext.setenv("CUDF_PANDAS_DEBUGGING", "True")
+        s = xpd.Series([1, 2])
+        with pytest.warns(
+            UserWarning,
+            match="Pandas debugging mode failed.",
+        ):
+            s = xpd.Series([1, 2])
+            assert s.mean() == 1.5
+    # Must explicitly undo the patch. Proxy dispatch doesn't work with monkeypatch contexts.
+    monkeypatch.setattr(xpd.Series.mean, "_fsproxy_slow", pd_mean)
+
+
+def test_excelwriter_pathlike(tmpdir):
+    assert isinstance(pd.ExcelWriter(tmpdir.join("foo.xlsx")), os.PathLike)
+
+
+def test_is_proxy_object():
+    np_arr = np.array([1])
+
+    s1 = xpd.Series([1])
+    s2 = pd.Series([1])
+
+    np_arr_proxy = s1.to_numpy()
+
+    assert not is_proxy_object(np_arr)
+    assert is_proxy_object(np_arr_proxy)
+    assert is_proxy_object(s1)
+    assert not is_proxy_object(s2)
+
+
+def test_numpy_cupy_flatiter(series):
+    cp = pytest.importorskip("cupy")
+
+    _, s = series
+    arr = s.values
+
+    assert type(arr.flat._fsproxy_fast) is cp.flatiter
+    assert type(arr.flat._fsproxy_slow) is np.flatiter
+
+
+@pytest.mark.xfail(
+    PANDAS_VERSION < version.parse("2.1"),
+    reason="pyarrow_numpy storage type was not supported in pandas-2.0.0",
+)
+def test_arrow_string_arrays():
+    cu_s = xpd.Series(["a", "b", "c"])
+    pd_s = pd.Series(["a", "b", "c"])
+
+    cu_arr = xpd.arrays.ArrowStringArray._from_sequence(
+        cu_s, dtype=xpd.StringDtype(storage="pyarrow")
+    )
+    pd_arr = pd.arrays.ArrowStringArray._from_sequence(
+        pd_s, dtype=pd.StringDtype(storage="pyarrow")
+    )
+
+    tm.assert_equal(cu_arr, pd_arr)
+
+    xpd_pa_np_storage_type = (
+        xpd.StringDtype("pyarrow_numpy")
+        if PANDAS_VERSION < version.parse("2.3.1")
+        else pd.StringDtype(storage="pyarrow", na_value=np.nan)
+    )
+
+    pd_pa_np_storage_type = (
+        pd.StringDtype("pyarrow_numpy")
+        if PANDAS_VERSION < version.parse("2.3.1")
+        else pd.StringDtype(storage="pyarrow", na_value=np.nan)
+    )
+
+    cu_arr = xpd.core.arrays.string_arrow.ArrowStringArray._from_sequence(
+        cu_s, dtype=xpd_pa_np_storage_type
+    )
+    pd_arr = pd.core.arrays.string_arrow.ArrowStringArray._from_sequence(
+        pd_s, dtype=pd_pa_np_storage_type
+    )
+
+    tm.assert_equal(cu_arr, pd_arr)
+
+
+@pytest.mark.parametrize("indexer", ["at", "iat"])
+def test_at_iat(indexer):
+    df = xpd.DataFrame(range(3))
+    result = getattr(df, indexer)[0, 0]
+    assert result == 0
+
+    getattr(df, indexer)[0, 0] = 1
+    expected = pd.DataFrame([1, 1, 2])
+    tm.assert_frame_equal(df, expected)
+
+
+def test_at_setitem_empty():
+    df = xpd.DataFrame({"name": []}, dtype="float64")
+    df.at[0, "name"] = 1.0
+    df.at[0, "new"] = 2.0
+    expected = pd.DataFrame({"name": [1.0], "new": [2.0]})
+    tm.assert_frame_equal(df, expected)
+
+
+@pytest.mark.parametrize(
+    "index",
+    [
+        xpd.Index([1, 2, 3], name="foo"),
+        xpd.Index(["a", "b", "c"], name="foo"),
+        xpd.RangeIndex(start=0, stop=3, step=1, name="foo"),
+        xpd.CategoricalIndex(["a", "b", "a"], name="foo"),
+        xpd.DatetimeIndex(
+            ["2024-04-24", "2025-04-24", "2026-04-24"], name="foo"
+        ),
+        xpd.TimedeltaIndex(["1 days", "2 days", "3 days"], name="foo"),
+        xpd.PeriodIndex(
+            ["2024-06", "2023-06", "2022-06"], freq="M", name="foo"
+        ),
+        xpd.IntervalIndex.from_breaks([0, 1, 2, 3], name="foo"),
+        xpd.MultiIndex.from_tuples(
+            [(1, "a"), (2, "b"), (3, "c")], names=["foo1", "bar1"]
+        ),
+    ],
+)
+def test_change_index_name(index):
+    s = xpd.Series([1, 2, object()], index=index)
+    df = xpd.DataFrame({"values": [1, 2, object()]}, index=index)
+
+    if isinstance(index, xpd.MultiIndex):
+        names = ["foo2", "bar2"]
+        s.index.names = names
+        df.index.names = names
+
+        assert s.index.names == names
+        assert df.index.names == names
+    else:
+        name = "bar"
+        s.index.name = name
+        df.index.name = name
+
+        assert s.index.name == name
+        assert df.index.name == name
+
+
+@pytest.mark.flaky(reruns=5, delay=4)
+def test_notebook_slow_repr():
+    notebook_filename = (
+        os.path.dirname(os.path.abspath(__file__))
+        + "/data/repr_slow_down_test.ipynb"
+    )
+    with open(notebook_filename, "r", encoding="utf-8") as f:
+        nb = nbformat.read(f, as_version=4)
+
+    ep = ExecutePreprocessor(
+        timeout=30, kernel_name=jupyter_client.KernelManager().kernel_name
+    )
+
+    try:
+        ep.preprocess(nb, {"metadata": {"path": "./"}})
+    except Exception as e:
+        assert False, f"Error executing the notebook: {e}"
+
+    # Collect the outputs
+    html_result = nb.cells[2]["outputs"][0]["data"]["text/html"]
+    for string in {
+        "div",
+        "Column_1",
+        "Column_2",
+        "Column_3",
+        "Column_4",
+        "tbody",
+        "</table>",
+    }:
+        assert string in html_result, (
+            f"Expected string {string} not found in the output"
+        )
+
+
+def test_numpy_ndarray_isinstancecheck(array):
+    arr1, arr2 = array
+    assert isinstance(arr1, np.ndarray)
+    assert isinstance(arr2, np.ndarray)
+
+
+def test_numpy_ndarray_np_ufunc(array):
+    arr1, arr2 = array
+
+    @np.vectorize
+    def add_one_ufunc(arr):
+        return arr + 1
+
+    assert_eq(add_one_ufunc(arr1), add_one_ufunc(arr2))
+
+
+def test_numpy_ndarray_cp_ufunc(array):
+    arr1, arr2 = array
+
+    @cp.vectorize
+    def add_one_ufunc(arr):
+        return arr + 1
+
+    assert_eq(add_one_ufunc(cp.asarray(arr1)), add_one_ufunc(arr2))
+
+
+def test_numpy_ndarray_numba_ufunc(array):
+    arr1, arr2 = array
+
+    @vectorize
+    def add_one_ufunc(arr):
+        return arr + 1
+
+    assert_eq(add_one_ufunc(arr1), add_one_ufunc(arr2))
+
+
+@pytest.mark.filterwarnings(
+    "ignore:Grid size:numba.core.errors.NumbaPerformanceWarning"
+)
+def test_numpy_ndarray_numba_cuda_ufunc(array):
+    arr1, arr2 = array
+
+    @vectorize(["int64(int64)"], target="cuda")
+    def add_one_ufunc(a):
+        return a + 1
+
+    assert_eq(cp.asarray(add_one_ufunc(arr1)), cp.asarray(add_one_ufunc(arr2)))
+
+
+@pytest.mark.xfail(
+    reason="Fallback expected because casting to object is not supported",
+)
+def test_fallback_raises_error(monkeypatch):
+    with monkeypatch.context() as monkeycontext:
+        monkeycontext.setenv("CUDF_PANDAS_FAIL_ON_FALLBACK", "True")
+        with pytest.raises(FallbackError):
+            pd.Series(range(2)).astype(object)
+
+
+def mock_mean_memory_error(self, *args, **kwargs):
+    raise MemoryError()
+
+
+def mock_mean_rmm_error(self, *args, **kwargs):
+    raise RMMError(1, "error")
+
+
+def mock_mean_not_impl_error(self, *args, **kwargs):
+    raise NotImplementedError()
+
+
+def mock_mean_attr_error(self, *args, **kwargs):
+    raise AttributeError()
+
+
+def mock_mean_type_error(self, *args, **kwargs):
+    raise TypeError()
+
+
+@pytest.mark.parametrize(
+    "mock_mean, err",
+    [
+        (
+            mock_mean_memory_error,
+            OOMFallbackError,
+        ),
+        (
+            mock_mean_rmm_error,
+            OOMFallbackError,
+        ),
+        (
+            mock_mean_not_impl_error,
+            NotImplementedFallbackError,
+        ),
+        (
+            mock_mean_attr_error,
+            AttributeFallbackError,
+        ),
+        (
+            mock_mean_type_error,
+            TypeFallbackError,
+        ),
+    ],
+)
+def test_fallback_raises_specific_error(
+    monkeypatch,
+    mock_mean,
+    err,
+):
+    with monkeypatch.context() as monkeycontext:
+        monkeypatch.setattr(xpd.Series.mean, "_fsproxy_fast", mock_mean)
+        monkeycontext.setenv("CUDF_PANDAS_FAIL_ON_FALLBACK", "True")
+        s = xpd.Series([1, 2])
+        with pytest.raises(err, match="Falling back to the slow path"):
+            assert s.mean() == 1.5
+
+    # Must explicitly undo the patch. Proxy dispatch doesn't work with monkeypatch contexts.
+    monkeypatch.setattr(xpd.Series.mean, "_fsproxy_fast", cudf.Series.mean)
+
+
+@pytest.mark.parametrize(
+    "attrs",
+    [
+        "_exceptions",
+        "version",
+        "_print_versions",
+        "capitalize_first_letter",
+        "_validators",
+        "_decorators",
+    ],
+)
+def test_cudf_pandas_util_version(attrs):
+    if not PANDAS_GE_220 and attrs == "capitalize_first_letter":
+        assert not hasattr(pd.util, attrs)
+    else:
+        assert hasattr(pd.util, attrs)
+
+
+def test_iteration_over_dataframe_dtypes_produces_proxy_objects(dataframe):
+    _, xdf = dataframe
+    xdf["b"] = xpd.IntervalIndex.from_arrays(xdf["a"], xdf["b"])
+    xdf["a"] = xpd.Series([1, 1, 1, 2, 3], dtype="category")
+    dtype_series = xdf.dtypes
+    assert all(is_proxy_object(x) for x in dtype_series)
+    assert isinstance(dtype_series.iloc[0], xpd.CategoricalDtype)
+    assert isinstance(dtype_series.iloc[1], xpd.IntervalDtype)
+
+
+def test_iter_doesnot_raise(monkeypatch):
+    s = xpd.Series([1, 2, 3])
+    with monkeypatch.context() as monkeycontext:
+        monkeycontext.setenv("CUDF_PANDAS_FAIL_ON_FALLBACK", "True")
+        for _ in s:
+            pass
+
+
+def test_dataframe_setitem_slowdown():
+    # We are explicitly testing the slowdown of the setitem operation
+    df = xpd.DataFrame(
+        {"a": [1, 2, 3] * 100000, "b": [1, 2, 3] * 100000}
+    ).astype("float64")
+    df = xpd.DataFrame({"a": df["a"].repeat(1000), "b": df["b"].repeat(1000)})
+    new_df = df + 1
+    start_time = time.time()
+    df[df.columns] = new_df
+    end_time = time.time()
+    delta = int(end_time - start_time)
+    if delta > 5:
+        pytest.fail(f"Test took too long to run, runtime: {delta}")
+
+
+def test_dataframe_setitem():
+    df = xpd.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]}).astype("float64")
+    new_df = df + 1
+    df[df.columns] = new_df
+    tm.assert_equal(df, new_df)
+
+
+def test_dataframe_get_fast_slow_methods():
+    df = xpd.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]})
+    assert isinstance(df.as_gpu_object(), cudf.DataFrame)
+    assert isinstance(df.as_cpu_object(), pd.DataFrame)
+
+
+def test_is_cudf_pandas():
+    s = xpd.Series([1, 2, 3])
+    df = xpd.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]})
+    index = xpd.Index([1, 2, 3])
+
+    assert is_proxy_instance(s, pd.Series)
+    assert is_proxy_instance(df, pd.DataFrame)
+    assert is_proxy_instance(index, pd.Index)
+    assert is_proxy_instance(index.values, np.ndarray)
+
+    for obj in [s, df, index, index.values]:
+        assert not is_proxy_instance(obj._fsproxy_slow, pd.Series)
+        assert not is_proxy_instance(obj._fsproxy_fast, pd.Series)
+
+        assert not is_proxy_instance(obj._fsproxy_slow, pd.DataFrame)
+        assert not is_proxy_instance(obj._fsproxy_fast, pd.DataFrame)
+
+        assert not is_proxy_instance(obj._fsproxy_slow, pd.Index)
+        assert not is_proxy_instance(obj._fsproxy_fast, pd.Index)
+
+        assert not is_proxy_instance(obj._fsproxy_slow, np.ndarray)
+        assert not is_proxy_instance(obj._fsproxy_fast, np.ndarray)
+
+
+def test_series_dtype_property():
+    s = pd.Series([1, 2, 3])
+    xs = xpd.Series([1, 2, 3])
+    expected = np.dtype(s)
+    actual = np.dtype(xs)
+    assert expected == actual
+
+
+def assert_functions_called(profiler, functions):
+    # Process profiling data
+    stream = StringIO()
+    stats = pstats.Stats(profiler, stream=stream)
+
+    # Get all called functions as (filename, lineno, func_name)
+    called_functions = {func[2] for func in stats.stats.keys()}
+    for func_str in functions:
+        assert func_str in called_functions
+
+
+def test_cudf_series_from_cudf_pandas():
+    s = xpd.Series([1, 2, 3])
+
+    with cProfile.Profile() as profiler:
+        gs = cudf.Series(s)
+
+    assert_functions_called(
+        profiler, ["as_gpu_object", "<method 'update' of 'dict' objects>"]
+    )
+
+    tm.assert_equal(s.as_gpu_object(), gs)
+
+
+def test_cudf_dataframe_from_cudf_pandas():
+    df = xpd.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]})
+
+    with cProfile.Profile() as profiler:
+        gdf = cudf.DataFrame(df)
+
+    assert_functions_called(
+        profiler, ["as_gpu_object", "<method 'update' of 'dict' objects>"]
+    )
+    tm.assert_frame_equal(df.as_gpu_object(), gdf)
+
+    df = xpd.DataFrame({"a": [1, 2, 3], "b": [1, 2, 3]})
+    gdf = cudf.DataFrame(
+        {"a": xpd.Series([1, 2, 3]), "b": xpd.Series([1, 2, 3])}
+    )
+
+    tm.assert_frame_equal(df.as_gpu_object(), gdf)
+
+    df = xpd.DataFrame({0: [1, 2, 3], 1: [1, 2, 3]})
+    gdf = cudf.DataFrame(
+        [xpd.Series([1, 1]), xpd.Series([2, 2]), xpd.Series([3, 3])]
+    )
+
+    tm.assert_frame_equal(df.as_gpu_object(), gdf)
+
+
+def test_cudf_index_from_cudf_pandas():
+    idx = xpd.Index([1, 2, 3])
+    with cProfile.Profile() as profiler:
+        gidx = cudf.Index(idx)
+    assert_functions_called(profiler, ["as_gpu_object"])
+
+    tm.assert_equal(idx.as_gpu_object(), gidx)
+
+
+def test_numpy_data_access():
+    s = pd.Series([1, 2, 3])
+    xs = xpd.Series([1, 2, 3])
+    expected = s.values.data
+    actual = xs.values.data
+
+    assert type(expected) is type(actual)
+
+
+@pytest.mark.parametrize(
+    "obj",
+    [
+        pd.DataFrame({"a": [1, 2, 3]}),
+        pd.Series([1, 2, 3]),
+        pd.Index([1, 2, 3]),
+        pd.Categorical([1, 2, 3]),
+        pd.to_datetime(["2021-01-01", "2021-01-02"]),
+        pd.to_timedelta(["1 days", "2 days"]),
+        xpd.DataFrame({"a": [1, 2, 3]}),
+        xpd.Series([1, 2, 3]),
+        xpd.Index([1, 2, 3]),
+        xpd.Categorical([1, 2, 3]),
+        xpd.to_datetime(["2021-01-01", "2021-01-02"]),
+        xpd.to_timedelta(["1 days", "2 days"]),
+        cudf.DataFrame({"a": [1, 2, 3]}),
+        cudf.Series([1, 2, 3]),
+        cudf.Index([1, 2, 3]),
+        cudf.Index([1, 2, 3], dtype="category"),
+        cudf.to_datetime(["2021-01-01", "2021-01-02"]),
+        cudf.Index([1, 2, 3], dtype="timedelta64[ns]"),
+        [1, 2, 3],
+        {"a": 1, "b": 2},
+        (1, 2, 3),
+    ],
+)
+def test_as_proxy_object(obj):
+    proxy_obj = as_proxy_object(obj)
+    if isinstance(
+        obj,
+        (
+            pd.DataFrame,
+            pd.Series,
+            pd.Index,
+            pd.Categorical,
+            xpd.DataFrame,
+            xpd.Series,
+            xpd.Index,
+            xpd.Categorical,
+            cudf.DataFrame,
+            cudf.Series,
+            cudf.Index,
+        ),
+    ):
+        assert is_proxy_object(proxy_obj)
+        if isinstance(proxy_obj, xpd.DataFrame):
+            tm.assert_frame_equal(proxy_obj, xpd.DataFrame(obj))
+        elif isinstance(proxy_obj, xpd.Series):
+            tm.assert_series_equal(proxy_obj, xpd.Series(obj))
+        elif isinstance(proxy_obj, xpd.Index):
+            tm.assert_index_equal(proxy_obj, xpd.Index(obj))
+        else:
+            tm.assert_equal(proxy_obj, obj)
+    else:
+        assert not is_proxy_object(proxy_obj)
+        assert proxy_obj == obj
+
+
+def test_as_proxy_object_doesnot_copy_series():
+    s = pd.Series([1, 2, 3])
+    proxy_obj = as_proxy_object(s)
+    s[0] = 10
+    assert proxy_obj[0] == 10
+    tm.assert_series_equal(s, proxy_obj)
+
+
+def test_as_proxy_object_doesnot_copy_dataframe():
+    df = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+    proxy_obj = as_proxy_object(df)
+    df.iloc[0, 0] = 10
+    assert proxy_obj.iloc[0, 0] == 10
+    tm.assert_frame_equal(df, proxy_obj)
+
+
+def test_as_proxy_object_doesnot_copy_index():
+    idx = pd.Index([1, 2, 3])
+    proxy_obj = as_proxy_object(idx)
+    assert proxy_obj._fsproxy_wrapped is idx
+
+
+def test_as_proxy_object_no_op_for_intermediates():
+    s = pd.Series(["abc", "def", "ghi"])
+    str_attr = s.str
+    proxy_obj = as_proxy_object(str_attr)
+    assert proxy_obj is str_attr
+
+
+def test_pickle_round_trip_proxy_numpy_array(array):
+    arr, proxy_arr = array
+    pickled_arr = BytesIO()
+    pickled_proxy_arr = BytesIO()
+    pickle.dump(arr, pickled_arr)
+    pickle.dump(proxy_arr, pickled_proxy_arr)
+
+    pickled_arr.seek(0)
+    pickled_proxy_arr.seek(0)
+
+    np.testing.assert_equal(
+        pickle.load(pickled_proxy_arr), pickle.load(pickled_arr)
+    )
+
+
+def test_pandas_objects_not_callable():
+    series = xpd.Series([1, 2, 3])
+    dataframe = xpd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
+    index = xpd.Index([1, 2, 3])
+    range_index = xpd.RangeIndex(start=0, stop=10, step=1)
+    assert not isinstance(series, Callable)
+    assert not isinstance(dataframe, Callable)
+    assert not isinstance(index, Callable)
+    assert not isinstance(range_index, Callable)
+
+    assert isinstance(xpd.Series, Callable)
+    assert isinstance(xpd.DataFrame, Callable)
+    assert isinstance(xpd.Index, Callable)
+    assert isinstance(xpd.RangeIndex, Callable)

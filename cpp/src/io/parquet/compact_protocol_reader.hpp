@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2023, NVIDIA CORPORATION.
+ * Copyright (c) 2018-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,16 +16,19 @@
 
 #pragma once
 
-#include "parquet.hpp"
+#include "parquet_common.hpp"
+
+#include <cudf/io/parquet_schema.hpp>
+#include <cudf/utilities/export.hpp>
+
+#include <cuda/std/bit>
 
 #include <algorithm>
 #include <cstddef>
-#include <optional>
-#include <string>
 #include <utility>
-#include <vector>
 
-namespace cudf::io::parquet::detail {
+namespace CUDF_EXPORT cudf {
+namespace io::parquet::detail {
 
 /**
  * @brief Class for parsing Parquet's Thrift Compact Protocol encoded metadata
@@ -94,37 +97,43 @@ class CompactProtocolReader {
     return {t, sz};
   }
 
-  bool skip_struct_field(int t, int depth = 0);
+  void skip_struct_field(int t, int depth = 0);
 
  public:
   // Generate Thrift structure parsing routines
-  bool read(FileMetaData* f);
-  bool read(SchemaElement* s);
-  bool read(LogicalType* l);
-  bool read(DecimalType* d);
-  bool read(TimeType* t);
-  bool read(TimeUnit* u);
-  bool read(TimestampType* t);
-  bool read(IntType* t);
-  bool read(RowGroup* r);
-  bool read(ColumnChunk* c);
-  bool read(ColumnChunkMetaData* c);
-  bool read(PageHeader* p);
-  bool read(DataPageHeader* d);
-  bool read(DictionaryPageHeader* d);
-  bool read(DataPageHeaderV2* d);
-  bool read(KeyValue* k);
-  bool read(PageLocation* p);
-  bool read(OffsetIndex* o);
-  bool read(SizeStatistics* s);
-  bool read(ColumnIndex* c);
-  bool read(Statistics* s);
-  bool read(ColumnOrder* c);
+  void read(FileMetaData* f);
+  void read(SchemaElement* s);
+  void read(LogicalType* l);
+  void read(DecimalType* d);
+  void read(TimeType* t);
+  void read(TimeUnit* u);
+  void read(TimestampType* t);
+  void read(IntType* t);
+  void read(RowGroup* r);
+  void read(ColumnChunk* c);
+  void read(BloomFilterAlgorithm* bf);
+  void read(BloomFilterHash* bf);
+  void read(BloomFilterCompression* bf);
+  void read(BloomFilterHeader* bf);
+  void read(ColumnChunkMetaData* c);
+  void read(PageHeader* p);
+  void read(DataPageHeader* d);
+  void read(DictionaryPageHeader* d);
+  void read(DataPageHeaderV2* d);
+  void read(KeyValue* k);
+  void read(PageLocation* p);
+  void read(OffsetIndex* o);
+  void read(SizeStatistics* s);
+  void read(ColumnIndex* c);
+  void read(Statistics* s);
+  void read(ColumnOrder* c);
+  void read(PageEncodingStats* s);
+  void read(SortingColumn* s);
 
  public:
-  static int NumRequiredBits(uint32_t max_level) noexcept
+  static inline constexpr int NumRequiredBits(uint32_t max_level) noexcept
   {
-    return 32 - CountLeadingZeros32(max_level);
+    return 32 - cuda::std::countl_zero(max_level);
   }
   bool InitSchema(FileMetaData* md);
 
@@ -147,4 +156,5 @@ class CompactProtocolReader {
   friend class parquet_field_struct_blob;
 };
 
-}  // namespace cudf::io::parquet::detail
+}  // namespace io::parquet::detail
+}  // namespace CUDF_EXPORT cudf
