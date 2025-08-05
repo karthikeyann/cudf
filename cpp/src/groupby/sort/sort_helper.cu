@@ -15,20 +15,19 @@
  */
 
 #include "common_utils.cuh"
-
 #include "cudf/column/column_device_view.cuh"
 #include "cudf/detail/utilities/vector_factories.hpp"
 #include "cudf/null_mask.hpp"
 #include "cudf_test/column_utilities.hpp"
+#include "stream_compaction/stream_compaction_common.cuh"
 #include "thrust/detail/copy.h"
 #include "thrust/device_vector.h"
 #include "thrust/host_vector.h"
 
-#include "stream_compaction/stream_compaction_common.cuh"
-
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/copy.hpp>
+#include <cudf/detail/cuco_helpers.hpp>
 #include <cudf/detail/gather.cuh>
 #include <cudf/detail/gather.hpp>
 #include <cudf/detail/groupby/sort_helper.hpp>
@@ -37,6 +36,7 @@
 #include <cudf/detail/scatter.hpp>
 #include <cudf/detail/sequence.hpp>
 #include <cudf/detail/sorting.hpp>
+#include <cudf/hashing/detail/helper_functions.cuh>
 #include <cudf/strings/string_view.hpp>
 #include <cudf/table/experimental/row_operators.cuh>
 #include <cudf/table/table_device_view.cuh>
@@ -46,6 +46,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cuco/static_map.cuh>
 #include <cuda/functional>
 #include <cuda/std/iterator>
 #include <thrust/iterator/counting_iterator.h>
@@ -60,6 +61,10 @@ namespace cudf {
 namespace groupby {
 namespace detail {
 namespace sort {
+
+// Constants for hash map sentinel values
+constexpr size_type COMPACTION_EMPTY_KEY_SENTINEL   = -1;
+constexpr size_type COMPACTION_EMPTY_VALUE_SENTINEL = -1;
 
 sort_groupby_helper::sort_groupby_helper(table_view const& keys,
                                          null_policy include_null_keys,
@@ -112,60 +117,41 @@ void sort_groupby_helper::hash_sorter(rmm::cuda_stream_view stream)
                  ?  // SQL style
                  _keys
                  : table_view({table_view({keys_bitmask_column(stream)}), _keys});
-  constexpr auto nulls_equal = null_equality::EQUAL;
-  auto map                   = hash_map_type{compute_hash_table_size(input.num_rows()),
-                           cuco::empty_key{COMPACTION_EMPTY_KEY_SENTINEL},
-                           cuco::empty_value{COMPACTION_EMPTY_VALUE_SENTINEL},
-                           hash_table_allocator_type{default_allocator<char>{}, stream},
-                           stream.value()};
 
-  auto const preprocessed_input =
-    cudf::experimental::row::hash::preprocessed_table::create(input, stream);
-  auto const has_nulls          = nullate::DYNAMIC{cudf::has_nested_nulls(input)};
+  using hasher_type3 = cudf::hashing::detail::default_hash<size_type>;
+  auto map           = cuco::static_map{
+    cuco::extent{compute_hash_table_size(input.num_rows(), 100)},  // 100% occupancy
+    cuco::empty_key{COMPACTION_EMPTY_KEY_SENTINEL},
+    cuco::empty_value{COMPACTION_EMPTY_VALUE_SENTINEL},
+              {},
+    cuco::linear_probing<1, hasher_type3>{hasher_type3{}},
+              {},
+              {},
+    cudf::detail::cuco_allocator<char>{rmm::mr::polymorphic_allocator<char>{}, stream},
+    stream.value()};
+
   auto const has_nested_columns = cudf::detail::has_nested_columns(input);
-
-  auto const row_hasher = cudf::experimental::row::hash::row_hasher(preprocessed_input);
-  auto const key_hasher =
-    cudf::detail::experimental::compaction_hash(row_hasher.device_hasher(has_nulls));
-
-  auto const row_comp = cudf::experimental::row::equality::self_comparator(preprocessed_input);
-
   // TODO: return value as std::numerical_limits::max() for nulls so that it goes to last while
   // sorting labels.
   auto const pair_iter = cudf::detail::make_counting_transform_iterator(
     size_type{0}, [] __device__(size_type const i) { return cuco::make_pair(i, i); });
   auto const count_iter = thrust::make_counting_iterator(size_type{0});
 
-  using nan_equal_comparator =
-    cudf::experimental::row::equality::nan_equal_physical_equality_comparator;
-  nan_equal_comparator value_comp{};
-
   _unsorted_keys_labels = make_numeric_column(
     data_type(type_to_id<size_type>()), _keys.num_rows(), mask_state::UNALLOCATED, stream);
   auto unsorted_keys_labels_begin = _unsorted_keys_labels->mutable_view().data<size_type>();
 
   if (has_nested_columns) {
-    auto const key_equal = row_comp.equal_to<true>(has_nulls, nulls_equal, value_comp);
     // should I use insert_if?
     // if (_include_null_keys == null_policy::EXCLUDE and has_nulls(_keys));
-    map.insert(pair_iter, pair_iter + input.num_rows(), key_hasher, key_equal, stream.value());
-    map.find(count_iter,
-             count_iter + input.num_rows(),
-             unsorted_keys_labels_begin,
-             key_hasher,
-             key_equal,
-             stream.value());
+    map.insert_async(pair_iter, pair_iter + input.num_rows(), stream);
+    map.find_async(count_iter, count_iter + input.num_rows(), unsorted_keys_labels_begin, stream);
   } else {
-    auto const key_equal = row_comp.equal_to<false>(has_nulls, nulls_equal, value_comp);
-    map.insert(pair_iter, pair_iter + input.num_rows(), key_hasher, key_equal, stream.value());
-    map.find(count_iter,
-             count_iter + input.num_rows(),
-             unsorted_keys_labels_begin,
-             key_hasher,
-             key_equal,
-             stream.value());
+    map.insert_async(pair_iter, pair_iter + input.num_rows(), stream);
+    map.find_async(count_iter, count_iter + input.num_rows(), unsorted_keys_labels_begin, stream);
     // TODO check if insert_and_find device function is faster, if so, use it
   }
+  // stream.synchronize();
   // how to find null's label and exclude it?
   // copy bitmask to _unsorted_keys_labels, and use it to sort for _key_sorted_order, and also
   // group_labels.
