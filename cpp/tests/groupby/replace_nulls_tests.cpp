@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -14,6 +14,8 @@
  * limitations under the License.
  */
 
+#include "cudf_test/debug_utilities.hpp"
+
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_wrapper.hpp>
 #include <cudf_test/iterator_utilities.hpp>
@@ -22,6 +24,7 @@
 
 #include <cudf/groupby.hpp>
 #include <cudf/replace.hpp>
+#include <cudf/sorting.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
@@ -44,10 +47,15 @@ void TestReplaceNullsGroupbySingle(K const& key,
 {
   cudf::groupby::groupby gb_obj(cudf::table_view({key}));
   std::vector<cudf::replace_policy> policies{policy};
-  auto p = gb_obj.replace_nulls(cudf::table_view({input}), policies);
+  auto result = gb_obj.replace_nulls(cudf::table_view({input}), policies);
 
-  CUDF_TEST_EXPECT_TABLES_EQUAL(*p.first, cudf::table_view({expected_key}));
-  CUDF_TEST_EXPECT_TABLES_EQUAL(*p.second, cudf::table_view({expected_val}));
+  cudf::test::print(result.first->get_column(0));
+  cudf::test::print(expected_key);
+  auto const sort_order  = cudf::sorted_order(result.first->view());
+  auto const sorted_keys = cudf::gather(result.first->view(), *sort_order);
+  auto const sorted_vals = cudf::gather(result.second->view(), *sort_order);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*sorted_keys, cudf::table_view({expected_key}));
+  CUDF_TEST_EXPECT_TABLES_EQUAL(*sorted_vals, cudf::table_view({expected_val}));
 }
 
 TYPED_TEST(GroupbyReplaceNullsFixedWidthTest, PrecedingFill)

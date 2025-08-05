@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -15,6 +15,8 @@
  */
 
 #include "groupby_test_util.hpp"
+
+#include "cudf_test/debug_utilities.hpp"
 
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/cudf_gtest.hpp>
@@ -76,8 +78,11 @@ void test_single_agg(cudf::column_view const& keys,
     cudf::table_view({keys}), include_null_keys, keys_are_sorted, column_order, precedence);
 
   auto result = gb_obj.aggregate(requests, cudf::test::get_default_stream());
+  cudf::test::print(result.second[0].results[0]->view());
+  cudf::test::print(sorted_expect_vals->get_column(0));
 
-  if (use_sort == force_use_sort_impl::YES && keys_are_sorted == cudf::sorted::NO) {
+  if (use_sort == force_use_sort_impl::YES && keys_are_sorted == cudf::sorted::NO &&
+      std::getenv("USE_HASHING") == nullptr) {
     CUDF_TEST_EXPECT_TABLES_EQUAL(*sorted_expect_keys, result.first->view());
     CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(sorted_expect_vals->get_column(0),
                                         *result.second[0].results[0]);
@@ -89,6 +94,8 @@ void test_single_agg(cudf::column_view const& keys,
       cudf::gather(cudf::table_view({result.second[0].results[0]->view()}), *sort_order);
 
     CUDF_TEST_EXPECT_TABLES_EQUAL(*sorted_expect_keys, *sorted_keys);
+    cudf::test::print(*sort_order);
+    cudf::test::print(sorted_vals->get_column(0));
     CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(sorted_expect_vals->get_column(0),
                                         sorted_vals->get_column(0));
   }
