@@ -277,6 +277,11 @@ include(${rapids-cmake-dir}/cpm/rapids_logger.cmake)
 rapids_cpm_rapids_logger(BUILD_EXPORT_SET cudf-exports INSTALL_EXPORT_SET cudf-exports)
 create_logger_macros(CUDF "cudf::default_logger()" include/cudf)
 
+# wget
+# https://raw.githubusercontent.com/rapidsai/cudf/refs/heads/branch-25.02/cpp/cmake/thirdparty/get_fmt.cmake
+# to cpp/cmake/thirdparty/get_fmt.cmake find fmt
+include(cmake/thirdparty/get_fmt.cmake)
+
 # find jitify
 include(cmake/thirdparty/get_jitify.cmake)
 
@@ -924,6 +929,7 @@ target_include_directories(
   cudf
   PUBLIC "$<BUILD_INTERFACE:${DLPACK_INCLUDE_DIR}>"
          "$<BUILD_INTERFACE:${JITIFY_INCLUDE_DIR}>"
+         "$<BUILD_INTERFACE:${FMT_INCLUDE_DIR}>"
          "$<BUILD_INTERFACE:${CUDF_SOURCE_DIR}/include>"
          "$<BUILD_INTERFACE:${CUDF_GENERATED_INCLUDE_DIR}/include>"
   PRIVATE "$<BUILD_INTERFACE:${CUDF_SOURCE_DIR}/src>"

@@ -24,7 +24,11 @@
 #include <cudf/io/parquet.hpp>
 
 #include <array>
-#include <format>
+// #include <format>
+#include <fmt/core.h>
+namespace std {
+using namespace fmt;
+}
 #include <string>
 
 using cudf::test::iterators::no_nulls;

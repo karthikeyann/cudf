@@ -276,7 +276,7 @@ void metadata::sanitize_schema()
 
         // swap children
         struct_elem.children_idx = std::move(schema_elem.children_idx);
-        schema_elem.children_idx = {struct_node_idx};
+        schema_elem.children_idx = std::vector<size_type>{struct_node_idx};
         schema_elem.num_children = 1;
 
         struct_elem.max_definition_level = schema_elem.max_definition_level;

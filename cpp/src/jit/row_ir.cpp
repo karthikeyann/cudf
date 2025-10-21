@@ -20,9 +20,15 @@
 
 #include <cudf/column/column_factories.hpp>
 
+#include <fmt/core.h>
+
 #include <algorithm>
 #include <iostream>
 #include <numeric>
+
+namespace std {
+using namespace fmt;
+}
 
 namespace cudf {
 

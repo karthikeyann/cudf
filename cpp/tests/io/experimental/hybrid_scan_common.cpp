@@ -28,7 +28,12 @@
 
 #include <rmm/mr/device/aligned_resource_adaptor.hpp>
 
-#include <format>
+// #include <format>
+#include <fmt/core.h>
+namespace std {
+using namespace fmt;
+}
+
 #include <string>
 
 cudf::host_span<uint8_t const> fetch_footer_bytes(cudf::host_span<uint8_t const> buffer)

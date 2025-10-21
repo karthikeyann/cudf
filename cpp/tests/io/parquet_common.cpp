@@ -18,7 +18,11 @@
 
 #include <cudf/io/parquet.hpp>
 
-#include <format>
+// #include <format>
+#include <fmt/core.h>
+namespace std {
+using namespace fmt;
+}
 #include <string>
 
 // Global environment for temporary files

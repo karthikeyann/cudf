@@ -21,8 +21,10 @@
 #include <cudf/types.hpp>
 #include <cudf/utilities/export.hpp>
 
+#include <span>
 #include <string>
 #include <string_view>
+#include <variant>
 
 namespace CUDF_EXPORT cudf {
 namespace detail {
