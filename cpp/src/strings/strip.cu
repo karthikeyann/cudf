@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -50,7 +50,7 @@ std::unique_ptr<column> strip(strings_column_view const& input,
                               side_type side,
                               string_scalar const& to_strip,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr)
+                              cudf::memory_resources resources)
 {
   if (input.is_empty()) return make_empty_column(type_id::STRING);
 
@@ -60,13 +60,13 @@ std::unique_ptr<column> strip(strings_column_view const& input,
   auto const d_column = column_device_view::create(input.parent(), stream);
 
   auto result = rmm::device_uvector<string_index_pair>(input.size(), stream);
-  thrust::transform(rmm::exec_policy(stream),
+  thrust::transform(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                     thrust::counting_iterator<size_type>(0),
                     thrust::counting_iterator<size_type>(input.size()),
                     result.begin(),
                     strip_transform_fn{*d_column, side, d_to_strip});
 
-  return make_strings_column(result.begin(), result.end(), stream, mr);
+  return make_strings_column(result.begin(), result.end(), stream, resources);
 }
 
 }  // namespace detail
@@ -77,10 +77,10 @@ std::unique_ptr<column> strip(strings_column_view const& input,
                               side_type side,
                               string_scalar const& to_strip,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr)
+                              cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::strip(input, side, to_strip, stream, mr);
+  return detail::strip(input, side, to_strip, stream, resources);
 }
 
 }  // namespace strings

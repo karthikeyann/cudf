@@ -1,42 +1,92 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
 #include "join_common_utils.cuh"
 #include "join_common_utils.hpp"
+#include "mixed_join_common_utils.cuh"
 #include "mixed_join_kernel.hpp"
 #include "mixed_join_size_kernel.hpp"
 
 #include <cudf/ast/detail/expression_parser.hpp>
 #include <cudf/ast/expressions.hpp>
+#include <cudf/detail/iterator.cuh>
+#include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/nvtx/ranges.hpp>
-#include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/join/join.hpp>
 #include <cudf/join/mixed_join.hpp>
-#include <cudf/table/table.hpp>
 #include <cudf/table/table_device_view.cuh>
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/error.hpp>
-#include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/exec_policy.hpp>
+#include <rmm/mr/polymorphic_allocator.hpp>
 
 #include <cuda/std/tuple>
 #include <thrust/fill.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/scan.h>
 
+#include <memory>
 #include <optional>
-#include <utility>
 
 namespace cudf {
 namespace detail {
 
 namespace {
+/**
+ * @brief Builds the hash table based on the given `build_table`.
+ *
+ * @tparam HashTable The type of the hash table
+ *
+ * @param build Table of columns used to build join hash.
+ * @param preprocessed_build shared_ptr to cudf::detail::row::equality::preprocessed_table
+ * for build
+ * @param hash_table Build hash table.
+ * @param has_nested_nulls Flag to denote if build or probe tables have nested nulls
+ * @param nulls_equal Flag to denote nulls are equal or not.
+ * @param bitmask Bitmask to denote whether a row is valid.
+ * @param stream CUDA stream used for device memory operations and kernel launches.
+ */
+template <typename HashTable>
+void build_join_hash_table(
+  cudf::table_view const& build,
+  std::shared_ptr<detail::row::equality::preprocessed_table> const& preprocessed_build,
+  HashTable& hash_table,
+  bool has_nested_nulls,
+  null_equality nulls_equal,
+  [[maybe_unused]] bitmask_type const* bitmask,
+  rmm::cuda_stream_view stream)
+{
+  CUDF_EXPECTS(0 != build.num_columns(), "Selected build dataset is empty", std::invalid_argument);
+  CUDF_EXPECTS(0 != build.num_rows(), "Build side table has no rows", std::invalid_argument);
+
+  auto insert_rows = [&](auto const& build, auto const& d_hasher) {
+    auto const iter = cudf::detail::make_counting_transform_iterator(0, pair_fn{d_hasher});
+
+    if (nulls_equal == cudf::null_equality::EQUAL or not nullable(build)) {
+      hash_table.insert_async(iter, iter + build.num_rows(), stream.value());
+    } else {
+      auto const stencil = thrust::counting_iterator<size_type>{0};
+      auto const pred    = row_is_valid{bitmask};
+
+      hash_table.insert_if_async(iter, iter + build.num_rows(), stencil, pred, stream.value());
+    }
+  };
+
+  auto const nulls = nullate::DYNAMIC{has_nested_nulls};
+
+  auto const row_hash = detail::row::hash::row_hasher{preprocessed_build};
+  auto const d_hasher = row_hash.device_hasher(nulls);
+
+  insert_rows(build, d_hasher);
+}
+
 /**
  * @brief Precomputes double hashing indices and row hash values for mixed join operations.
  *
@@ -70,12 +120,12 @@ precompute_mixed_join_data(mixed_multiset_type const& hash_table,
                            HashProbe const& hash_probe,
                            size_type probe_table_num_rows,
                            rmm::cuda_stream_view stream,
-                           rmm::device_async_resource_ref mr)
+                           cudf::memory_resources resources)
 {
-  auto input_pairs =
-    rmm::device_uvector<cuco::pair<hash_value_type, size_type>>(probe_table_num_rows, stream, mr);
+  auto input_pairs = rmm::device_uvector<cuco::pair<hash_value_type, size_type>>(
+    probe_table_num_rows, stream, resources);
   auto hash_indices = rmm::device_uvector<cuda::std::pair<hash_value_type, hash_value_type>>(
-    probe_table_num_rows, stream, mr);
+    probe_table_num_rows, stream, resources);
 
   auto const capacity                      = hash_table.capacity();
   auto const probe_hash_fn                 = hash_table.hash_function();
@@ -102,7 +152,7 @@ precompute_mixed_join_data(mixed_multiset_type const& hash_table,
 
   // Single transform to fill both arrays using zip iterator
   thrust::transform(
-    rmm::exec_policy_nosync(stream),
+    rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
     thrust::counting_iterator<size_type>(0),
     thrust::counting_iterator<size_type>(probe_table_num_rows),
     thrust::make_zip_iterator(cuda::std::make_tuple(input_pairs.begin(), hash_indices.begin())),
@@ -138,7 +188,7 @@ mixed_join_setup_data setup_mixed_join_common(table_view const& left_equality,
                                               null_equality compare_nulls,
                                               join_kind join_type,
                                               rmm::cuda_stream_view stream,
-                                              rmm::device_async_resource_ref mr)
+                                              cudf::memory_resources resources)
 {
   CUDF_EXPECTS(left_conditional.num_rows() == left_equality.num_rows(),
                "The left conditional and equality tables must have the same number of rows.");
@@ -184,7 +234,7 @@ mixed_join_setup_data setup_mixed_join_common(table_view const& left_equality,
   // places. However, this probably isn't worth adding any time soon since we
   // won't be able to support AST conditions for those types anyway.
   auto const row_bitmask =
-    cudf::detail::bitmask_and(build, stream, cudf::get_current_device_resource_ref()).first;
+    cudf::detail::bitmask_and(build, stream, resources.get_temporary_mr()).first;
   auto preprocessed_build = detail::row::equality::preprocessed_table::create(build, stream);
   build_join_hash_table(build,
                         preprocessed_build,
@@ -217,7 +267,7 @@ mixed_join_setup_data setup_mixed_join_common(table_view const& left_equality,
                  0,
                "Hash table storage must be aligned to 2-element boundary");
   auto [input_pairs, hash_indices] =
-    precompute_mixed_join_data(hash_table, hash_probe, outer_num_rows, stream, mr);
+    precompute_mixed_join_data(hash_table, hash_probe, outer_num_rows, stream, resources);
 
   return {swap_tables,
           outer_num_rows,
@@ -258,10 +308,10 @@ compute_mixed_join_matches_per_row(
   detail::grid_1d config,
   thread_index_type shmem_size_per_block,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  cudf::memory_resources resources)
 {
   auto matches_per_row = std::make_unique<rmm::device_uvector<size_type>>(
-    static_cast<std::size_t>(outer_num_rows), stream, mr);
+    static_cast<std::size_t>(outer_num_rows), stream, resources);
   auto matches_per_row_span = cudf::device_span<size_type>{
     matches_per_row->begin(), static_cast<std::size_t>(outer_num_rows)};
 
@@ -295,10 +345,11 @@ compute_mixed_join_matches_per_row(
                                    stream);
   }
 
-  std::size_t const size = thrust::reduce(rmm::exec_policy_nosync(stream),
-                                          matches_per_row_span.begin(),
-                                          matches_per_row_span.end(),
-                                          std::size_t{0});
+  std::size_t const size =
+    thrust::reduce(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
+                   matches_per_row_span.begin(),
+                   matches_per_row_span.end(),
+                   std::size_t{0});
 
   return {size, std::move(matches_per_row)};
 }
@@ -316,7 +367,7 @@ mixed_join(
   join_kind join_type,
   std::optional<std::pair<std::size_t, device_span<size_type const>>> const& output_size_data,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  cudf::memory_resources resources)
 {
   CUDF_EXPECTS((join_type != join_kind::LEFT_SEMI_JOIN) && (join_type != join_kind::LEFT_ANTI_JOIN),
                "Left semi and anti joins should use mixed_join_semi.");
@@ -332,11 +383,12 @@ mixed_join(
       // Left and full joins all return all the row indices from
       // left with a corresponding NULL from the right.
       case join_kind::LEFT_JOIN:
-      case join_kind::FULL_JOIN: return get_trivial_left_join_indices(left_conditional, stream, mr);
+      case join_kind::FULL_JOIN:
+        return get_trivial_left_join_indices(left_conditional, stream, resources);
       // Inner joins return empty output because no matches can exist.
       case join_kind::INNER_JOIN:
-        return std::pair(std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr),
-                         std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr));
+        return std::pair(std::make_unique<rmm::device_uvector<size_type>>(0, stream, resources),
+                         std::make_unique<rmm::device_uvector<size_type>>(0, stream, resources));
       default: CUDF_FAIL("Invalid join kind."); break;
     }
   } else if (left_num_rows == 0) {
@@ -344,11 +396,11 @@ mixed_join(
       // Left and inner joins all return empty sets.
       case join_kind::LEFT_JOIN:
       case join_kind::INNER_JOIN:
-        return std::pair(std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr),
-                         std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr));
+        return std::pair(std::make_unique<rmm::device_uvector<size_type>>(0, stream, resources),
+                         std::make_unique<rmm::device_uvector<size_type>>(0, stream, resources));
       // Full joins need to return the trivial complement.
       case join_kind::FULL_JOIN: {
-        auto ret_flipped = get_trivial_left_join_indices(right_conditional, stream, mr);
+        auto ret_flipped = get_trivial_left_join_indices(right_conditional, stream, resources);
         return std::pair(std::move(ret_flipped.second), std::move(ret_flipped.first));
       }
       default: CUDF_FAIL("Invalid join kind."); break;
@@ -363,7 +415,7 @@ mixed_join(
                                        compare_nulls,
                                        join_type,
                                        stream,
-                                       mr);
+                                       resources);
 
   bool const is_outer_join =
     (join_type == join_kind::LEFT_JOIN || join_type == join_kind::FULL_JOIN);
@@ -393,7 +445,7 @@ mixed_join(
                                                               setup.config,
                                                               setup.shmem_size_per_block,
                                                               stream,
-                                                              mr);
+                                                              resources);
     join_size            = size;
     matches_per_row      = std::move(*matches);
     matches_per_row_span = cudf::device_span<size_type const>{
@@ -403,7 +455,7 @@ mixed_join(
   // Given the number of matches per row, we need to compute the offsets for insertion.
   auto join_result_offsets =
     rmm::device_uvector<size_type>{static_cast<std::size_t>(setup.outer_num_rows), stream, mr};
-  thrust::exclusive_scan(rmm::exec_policy_nosync(stream),
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                          matches_per_row_span.begin(),
                          matches_per_row_span.end(),
                          join_result_offsets.begin());
@@ -422,12 +474,14 @@ mixed_join(
   // all other cases (inner, left semi, and left anti joins) if we reach this
   // point we can safely return an empty result.
   if (join_size == 0) {
-    return std::pair(std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr),
-                     std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr));
+    return std::pair(std::make_unique<rmm::device_uvector<size_type>>(0, stream, resources),
+                     std::make_unique<rmm::device_uvector<size_type>>(0, stream, resources));
   }
 
-  auto left_indices  = std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, mr);
-  auto right_indices = std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, mr);
+  auto left_indices =
+    std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, resources);
+  auto right_indices =
+    std::make_unique<rmm::device_uvector<size_type>>(join_size, stream, resources);
 
   auto const& join_output_l = left_indices->data();
   auto const& join_output_r = right_indices->data();
@@ -472,7 +526,7 @@ mixed_join(
   // by any row in the left table.
   if (join_type == join_kind::FULL_JOIN) {
     auto complement_indices = detail::get_left_join_indices_complement(
-      join_indices.second, left_num_rows, right_num_rows, stream, mr);
+      join_indices.second, left_num_rows, right_num_rows, stream, resources);
     join_indices = detail::concatenate_vector_pairs(join_indices, complement_indices, stream);
   }
   return join_indices;
@@ -487,7 +541,7 @@ compute_mixed_join_output_size(table_view const& left_equality,
                                null_equality compare_nulls,
                                join_kind join_type,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr)
+                               cudf::memory_resources resources)
 {
   CUDF_EXPECTS(join_type != join_kind::FULL_JOIN,
                "Size estimation is not available for full joins.");
@@ -505,18 +559,18 @@ compute_mixed_join_output_size(table_view const& left_equality,
       ((join_type == join_kind::INNER_JOIN) && (right_num_rows > left_num_rows)) ? right_num_rows
                                                                                  : left_num_rows;
     auto matches_per_row = std::make_unique<rmm::device_uvector<size_type>>(
-      static_cast<std::size_t>(outer_num_rows), stream, mr);
+      static_cast<std::size_t>(outer_num_rows), stream, resources);
     auto matches_per_row_span = cudf::device_span<size_type>{
       matches_per_row->begin(), static_cast<std::size_t>(outer_num_rows)};
 
     if (right_num_rows == 0 && join_type == join_kind::LEFT_JOIN) {
-      thrust::fill(rmm::exec_policy_nosync(stream),
+      thrust::fill(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                    matches_per_row_span.begin(),
                    matches_per_row_span.end(),
                    1);
       return {left_num_rows, std::move(matches_per_row)};
     } else {
-      thrust::fill(rmm::exec_policy_nosync(stream),
+      thrust::fill(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                    matches_per_row_span.begin(),
                    matches_per_row_span.end(),
                    0);
@@ -532,7 +586,7 @@ compute_mixed_join_output_size(table_view const& left_equality,
                                        compare_nulls,
                                        join_type,
                                        stream,
-                                       mr);
+                                       resources);
 
   bool const is_outer_join = (join_type == join_kind::LEFT_JOIN);
 
@@ -551,7 +605,7 @@ compute_mixed_join_output_size(table_view const& left_equality,
                                             setup.config,
                                             setup.shmem_size_per_block,
                                             stream,
-                                            mr);
+                                            resources);
 }
 
 }  // namespace detail
@@ -567,7 +621,7 @@ mixed_inner_join(
   null_equality compare_nulls,
   std::optional<std::pair<std::size_t, device_span<size_type const>>> const output_size_data,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
   return detail::mixed_join(left_equality,
@@ -579,7 +633,7 @@ mixed_inner_join(
                             join_kind::INNER_JOIN,
                             output_size_data,
                             stream,
-                            mr);
+                            resources);
 }
 
 std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_inner_join_size(
@@ -590,7 +644,7 @@ std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_in
   ast::expression const& binary_predicate,
   null_equality compare_nulls,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
   return detail::compute_mixed_join_output_size(left_equality,
@@ -601,7 +655,7 @@ std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_in
                                                 compare_nulls,
                                                 join_kind::INNER_JOIN,
                                                 stream,
-                                                mr);
+                                                resources);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -614,7 +668,7 @@ mixed_left_join(table_view const& left_equality,
                 null_equality compare_nulls,
                 output_size_data_type const output_size_data,
                 rmm::cuda_stream_view stream,
-                rmm::device_async_resource_ref mr)
+                cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
   return detail::mixed_join(left_equality,
@@ -626,7 +680,7 @@ mixed_left_join(table_view const& left_equality,
                             join_kind::LEFT_JOIN,
                             output_size_data,
                             stream,
-                            mr);
+                            resources);
 }
 
 std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_left_join_size(
@@ -637,7 +691,7 @@ std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_le
   ast::expression const& binary_predicate,
   null_equality compare_nulls,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
   return detail::compute_mixed_join_output_size(left_equality,
@@ -648,7 +702,7 @@ std::pair<std::size_t, std::unique_ptr<rmm::device_uvector<size_type>>> mixed_le
                                                 compare_nulls,
                                                 join_kind::LEFT_JOIN,
                                                 stream,
-                                                mr);
+                                                resources);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -661,7 +715,7 @@ mixed_full_join(table_view const& left_equality,
                 null_equality compare_nulls,
                 output_size_data_type const output_size_data,
                 rmm::cuda_stream_view stream,
-                rmm::device_async_resource_ref mr)
+                cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
   return detail::mixed_join(left_equality,
@@ -673,7 +727,7 @@ mixed_full_join(table_view const& left_equality,
                             join_kind::FULL_JOIN,
                             output_size_data,
                             stream,
-                            mr);
+                            resources);
 }
 
 }  // namespace cudf

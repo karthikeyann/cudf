@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -68,8 +68,8 @@ std::unique_ptr<table> drop_nulls(
   table_view const& input,
   std::vector<size_type> const& keys,
   cudf::size_type keep_threshold,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Filters a table to remove null elements.
@@ -101,8 +101,8 @@ std::unique_ptr<table> drop_nulls(
 std::unique_ptr<table> drop_nulls(
   table_view const& input,
   std::vector<size_type> const& keys,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Filters a table to remove NANs with threshold count.
@@ -146,8 +146,8 @@ std::unique_ptr<table> drop_nans(
   table_view const& input,
   std::vector<size_type> const& keys,
   cudf::size_type keep_threshold,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Filters a table to remove NANs.
@@ -180,8 +180,8 @@ std::unique_ptr<table> drop_nans(
 std::unique_ptr<table> drop_nans(
   table_view const& input,
   std::vector<size_type> const& keys,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Filters `input` using `boolean_mask` of boolean values as a mask.
@@ -208,8 +208,8 @@ std::unique_ptr<table> drop_nans(
 std::unique_ptr<table> apply_boolean_mask(
   table_view const& input,
   column_view const& boolean_mask,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Choices for drop_duplicates API for retainment of duplicate rows
@@ -253,9 +253,9 @@ std::unique_ptr<table> unique(
   table_view const& input,
   std::vector<size_type> const& keys,
   duplicate_keep_option keep,
-  null_equality nulls_equal         = null_equality::EQUAL,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  null_equality nulls_equal        = null_equality::EQUAL,
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Create a new table without duplicate rows.
@@ -280,11 +280,11 @@ std::unique_ptr<table> unique(
 std::unique_ptr<table> distinct(
   table_view const& input,
   std::vector<size_type> const& keys,
-  duplicate_keep_option keep        = duplicate_keep_option::KEEP_ANY,
-  null_equality nulls_equal         = null_equality::EQUAL,
-  nan_equality nans_equal           = nan_equality::ALL_EQUAL,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  duplicate_keep_option keep       = duplicate_keep_option::KEEP_ANY,
+  null_equality nulls_equal        = null_equality::EQUAL,
+  nan_equality nans_equal          = nan_equality::ALL_EQUAL,
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Create a column of indices of all distinct rows in the input table.
@@ -302,11 +302,11 @@ std::unique_ptr<table> distinct(
  */
 std::unique_ptr<column> distinct_indices(
   table_view const& input,
-  duplicate_keep_option keep        = duplicate_keep_option::KEEP_ANY,
-  null_equality nulls_equal         = null_equality::EQUAL,
-  nan_equality nans_equal           = nan_equality::ALL_EQUAL,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  duplicate_keep_option keep       = duplicate_keep_option::KEEP_ANY,
+  null_equality nulls_equal        = null_equality::EQUAL,
+  nan_equality nans_equal          = nan_equality::ALL_EQUAL,
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Create a new table without duplicate rows, preserving input order.
@@ -334,11 +334,11 @@ std::unique_ptr<column> distinct_indices(
 std::unique_ptr<table> stable_distinct(
   table_view const& input,
   std::vector<size_type> const& keys,
-  duplicate_keep_option keep        = duplicate_keep_option::KEEP_ANY,
-  null_equality nulls_equal         = null_equality::EQUAL,
-  nan_equality nans_equal           = nan_equality::ALL_EQUAL,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  duplicate_keep_option keep       = duplicate_keep_option::KEEP_ANY,
+  null_equality nulls_equal        = null_equality::EQUAL,
+  nan_equality nans_equal          = nan_equality::ALL_EQUAL,
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Count the number of consecutive groups of equivalent rows in a column.
@@ -453,10 +453,10 @@ std::vector<std::unique_ptr<column>> filter(
   std::string const& predicate_udf,
   std::vector<column_view> const& filter_columns,
   bool is_ptx,
-  std::optional<void*> user_data    = std::nullopt,
-  null_aware is_null_aware          = null_aware::NO,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  std::optional<void*> user_data   = std::nullopt,
+  null_aware is_null_aware         = null_aware::NO,
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Creates new table by applying a filter function against every
@@ -482,8 +482,8 @@ std::unique_ptr<table> filter(
   table_view const& predicate_table,
   ast::expression const& predicate_expr,
   table_view const& filter_table,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /** @} */
 }  // namespace CUDF_EXPORT cudf

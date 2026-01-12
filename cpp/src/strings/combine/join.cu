@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -124,7 +124,7 @@ std::unique_ptr<column> join_strings(strings_column_view const& input,
                                      string_scalar const& separator,
                                      string_scalar const& narep,
                                      rmm::cuda_stream_view stream,
-                                     rmm::device_async_resource_ref mr)
+                                     cudf::memory_resources resources)
 {
   if (input.is_empty()) { return make_empty_column(type_id::STRING); }
 
@@ -140,14 +140,15 @@ std::unique_ptr<column> join_strings(strings_column_view const& input,
     if ((input.size() == input.null_count()) ||
         ((input.chars_size(stream) / (input.size() - input.null_count())) <=
          AVG_CHAR_BYTES_THRESHOLD)) {
-      return std::get<1>(make_strings_children(
-                           join_fn{*d_strings, d_separator, d_narep}, input.size(), stream, mr))
+      return std::get<1>(
+               make_strings_children(
+                 join_fn{*d_strings, d_separator, d_narep}, input.size(), stream, resources))
         .release();
     }
     // dynamically feeds index pairs to build the output
     auto indices = cudf::detail::make_counting_transform_iterator(
       0, join_gather_fn{*d_strings, d_separator, d_narep});
-    auto joined_col = make_strings_column(indices, indices + (input.size() * 2), stream, mr);
+    auto joined_col = make_strings_column(indices, indices + (input.size() * 2), stream, resources);
     auto chars_data = joined_col->release().data;
     return std::move(*chars_data);
   }();
@@ -162,16 +163,16 @@ std::unique_ptr<column> join_strings(strings_column_view const& input,
     auto h_offsets = cudf::detail::make_host_vector<size_type>(2, stream);
     h_offsets[0]   = 0;
     h_offsets[1]   = chars.size();
-    auto offsets   = cudf::detail::make_device_uvector_async(h_offsets, stream, mr);
+    auto offsets   = cudf::detail::make_device_uvector_async(h_offsets, stream, resources);
     return std::make_unique<column>(std::move(offsets), rmm::device_buffer{}, 0);
   }();
 
   // build the null mask: only one output row so it is either all-valid or all-null
   auto const null_count =
     static_cast<size_type>(input.null_count() == input.size() && !narep.is_valid(stream));
-  auto null_mask = null_count
-                     ? cudf::detail::create_null_mask(1, cudf::mask_state::ALL_NULL, stream, mr)
-                     : rmm::device_buffer{0, stream, mr};
+  auto null_mask =
+    null_count ? cudf::detail::create_null_mask(1, cudf::mask_state::ALL_NULL, stream, resources)
+               : rmm::device_buffer{0, stream, mr};
 
   // perhaps this return a string_scalar instead of a single-row column
   return make_strings_column(
@@ -186,10 +187,10 @@ std::unique_ptr<column> join_strings(strings_column_view const& strings,
                                      string_scalar const& separator,
                                      string_scalar const& narep,
                                      rmm::cuda_stream_view stream,
-                                     rmm::device_async_resource_ref mr)
+                                     cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::join_strings(strings, separator, narep, stream, mr);
+  return detail::join_strings(strings, separator, narep, stream, resources);
 }
 
 }  // namespace strings

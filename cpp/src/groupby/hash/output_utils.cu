@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -46,25 +46,27 @@ struct result_column_creator {
   {
   }
 
-  std::unique_ptr<column> operator()(column_view const& col, aggregation::Kind const& agg) const
+  std::unique_ptr<column> operator()(column_view const& col,
+                                     aggregation::Kind const& agg,
+                                     bool is_agg_intermediate) const
   {
     auto const col_type =
       is_dictionary(col.type()) ? dictionary_column_view(col).keys().type() : col.type();
-    auto const nullable =
-      agg != aggregation::COUNT_VALID && agg != aggregation::COUNT_ALL && col.has_nulls();
+    auto const nullable = !is_agg_intermediate && agg != aggregation::COUNT_VALID &&
+                          agg != aggregation::COUNT_ALL && col.has_nulls();
     // TODO: Remove adjusted buffer size workaround once https://github.com/NVIDIA/cccl/issues/6430
     // is fixed. Use adjusted buffer size for small data types to ensure atomic operation safety.
     auto const make_uninitialized_column = [&](data_type d_type, size_type size, mask_state state) {
       auto const type_size = cudf::size_of(d_type);
       if (type_size < 4) {
         auto adjusted_size    = cudf::util::round_up_safe(size, static_cast<size_type>(4));
-        auto buffer           = rmm::device_buffer(adjusted_size * type_size, stream, mr);
-        auto mask             = create_null_mask(size, state, stream, mr);
+        auto buffer           = rmm::device_buffer(adjusted_size * type_size, stream, resources);
+        auto mask             = create_null_mask(size, state, stream, resources);
         auto const null_count = state_null_count(state, size);
         return std::make_unique<column>(
           d_type, size, std::move(buffer), std::move(mask), null_count);
       }
-      return make_fixed_width_column(d_type, size, state, stream, mr);
+      return make_fixed_width_column(d_type, size, state, stream, resources);
     };
     if (agg != aggregation::SUM_WITH_OVERFLOW) {
       auto const target_type = cudf::detail::target_type(col_type, agg);
@@ -83,7 +85,8 @@ struct result_column_creator {
 
     auto [null_mask, null_count] = [&]() -> std::pair<rmm::device_buffer, size_type> {
       if (output_size > 0 && nullable) {
-        return {create_null_mask(output_size, mask_state::ALL_NULL, stream, mr), output_size};
+        return {create_null_mask(output_size, mask_state::ALL_NULL, stream, resources),
+                output_size};
       }
       return {rmm::device_buffer{}, 0};
     }();
@@ -97,15 +100,22 @@ struct result_column_creator {
 std::unique_ptr<table> create_results_table(size_type output_size,
                                             table_view const& values,
                                             host_span<aggregation::Kind const> agg_kinds,
+                                            std::span<int8_t const> is_agg_intermediate,
                                             rmm::cuda_stream_view stream,
-                                            rmm::device_async_resource_ref mr)
+                                            cudf::memory_resources resources)
 {
+  CUDF_EXPECTS(values.num_columns() == static_cast<size_type>(agg_kinds.size()),
+               "The number of values columns and size of agg_kinds vector must be the same.");
+  CUDF_EXPECTS(
+    values.num_columns() == static_cast<size_type>(is_agg_intermediate.size()),
+    "The number of values columns and size of is_agg_intermediate vector must be the same.");
+
+  auto const column_creator = result_column_creator{output_size, stream, mr};
   std::vector<std::unique_ptr<column>> output_cols;
-  std::transform(values.begin(),
-                 values.end(),
-                 agg_kinds.begin(),
-                 std::back_inserter(output_cols),
-                 result_column_creator{output_size, stream, mr});
+  for (size_t i = 0; i < agg_kinds.size(); i++) {
+    output_cols.emplace_back(
+      column_creator(values.column(i), agg_kinds[i], static_cast<bool>(is_agg_intermediate[i])));
+  }
   auto result_table = std::make_unique<table>(std::move(output_cols));
   cudf::detail::initialize_with_identity(result_table->mutable_view(), agg_kinds, stream);
   return result_table;
@@ -115,9 +125,9 @@ template <typename SetType>
 rmm::device_uvector<size_type> extract_populated_keys(SetType const& key_set,
                                                       size_type num_total_keys,
                                                       rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr)
+                                                      cudf::memory_resources resources)
 {
-  rmm::device_uvector<size_type> unique_key_indices(num_total_keys, stream, mr);
+  rmm::device_uvector<size_type> unique_key_indices(num_total_keys, stream, resources);
   auto const keys_end = key_set.retrieve_all(unique_key_indices.begin(), stream.value());
   unique_key_indices.resize(std::distance(unique_key_indices.begin(), keys_end), stream);
   return unique_key_indices;
@@ -127,25 +137,25 @@ template rmm::device_uvector<size_type> extract_populated_keys<global_set_t>(
   global_set_t const& key_set,
   size_type num_total_keys,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr);
+  cudf::memory_resources resources);
 
 template rmm::device_uvector<size_type> extract_populated_keys<nullable_global_set_t>(
   nullable_global_set_t const& key_set,
   size_type num_total_keys,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr);
+  cudf::memory_resources resources);
 
 rmm::device_uvector<size_type> compute_key_transform_map(
   size_type num_total_keys,
   device_span<size_type const> unique_key_indices,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr)
+  cudf::memory_resources resources)
 {
   // Map from old key indices (index of the keys in the original input keys table) to new key
   // indices (indices of the keys in the final output table, which contains only the extracted
   // unique keys). Only these extracted unique keys are mapped.
-  rmm::device_uvector<size_type> key_transform_map(num_total_keys, stream, mr);
-  thrust::scatter(rmm::exec_policy_nosync(stream),
+  rmm::device_uvector<size_type> key_transform_map(num_total_keys, stream, resources);
+  thrust::scatter(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                   thrust::make_counting_iterator(0),
                   thrust::make_counting_iterator(static_cast<size_type>(unique_key_indices.size())),
                   unique_key_indices.begin(),
@@ -157,10 +167,10 @@ rmm::device_uvector<size_type> compute_key_transform_map(
 rmm::device_uvector<size_type> compute_target_indices(device_span<size_type const> input,
                                                       device_span<size_type const> transform_map,
                                                       rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr)
+                                                      cudf::memory_resources resources)
 {
-  rmm::device_uvector<size_type> target_indices(input.size(), stream, mr);
-  thrust::transform(rmm::exec_policy_nosync(stream),
+  rmm::device_uvector<size_type> target_indices(input.size(), stream, resources);
+  thrust::transform(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                     input.begin(),
                     input.end(),
                     target_indices.begin(),

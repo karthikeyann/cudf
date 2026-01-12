@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -33,6 +33,6 @@ std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> groupby(
   host_span<aggregation_request const> requests,
   null_policy include_null_keys,
   rmm::cuda_stream_view stream,
-  rmm::device_async_resource_ref mr);
+  cudf::memory_resources resources);
 }  // namespace groupby::detail::hash
 }  // namespace CUDF_EXPORT cudf

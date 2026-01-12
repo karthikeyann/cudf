@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -12,6 +12,8 @@
 #include <cudf/detail/aggregation/result_cache.hpp>
 #include <cudf/detail/binaryop.hpp>
 #include <cudf/detail/gather.hpp>
+#include <cudf/detail/null_mask.hpp>
+#include <cudf/detail/valid_if.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/types.hpp>
 
@@ -23,13 +25,13 @@ hash_compound_agg_finalizer::hash_compound_agg_finalizer(column_view col,
                                                          cudf::detail::result_cache* cache,
                                                          bitmask_type const* d_row_bitmask,
                                                          rmm::cuda_stream_view stream,
-                                                         rmm::device_async_resource_ref mr)
+                                                         cudf::memory_resources resources)
   : col{col},
     input_type{is_dictionary(col.type()) ? dictionary_column_view(col).keys().type() : col.type()},
     cache{cache},
     d_row_bitmask{d_row_bitmask},
     stream{stream},
-    mr{mr}
+    resources{resources}
 {
 }
 
@@ -46,14 +48,13 @@ auto hash_compound_agg_finalizer::gather_argminmax(aggregation const& agg)
                                static_cast<void const*>(arg_result.data<size_type>()),
                                nullptr,
                                0);
-  auto gather_argminmax =
-    cudf::detail::gather(table_view({col}),
-                         null_removed_map,
-                         arg_result.nullable() ? cudf::out_of_bounds_policy::NULLIFY
-                                               : cudf::out_of_bounds_policy::DONT_CHECK,
-                         cudf::detail::negative_index_policy::NOT_ALLOWED,
-                         stream,
-                         mr);
+  auto gather_argminmax = cudf::detail::gather(
+    table_view{{col}},
+    null_removed_map,
+    col.nullable() ? cudf::out_of_bounds_policy::NULLIFY : cudf::out_of_bounds_policy::DONT_CHECK,
+    cudf::detail::negative_index_policy::NOT_ALLOWED,
+    stream,
+    resources);
   return std::move(gather_argminmax->release()[0]);
 }
 
@@ -81,18 +82,40 @@ void hash_compound_agg_finalizer::visit(cudf::detail::mean_aggregation const& ag
 {
   if (cache->has_result(col, agg)) { return; }
 
-  auto const sum_agg      = make_sum_aggregation();
-  auto const count_agg    = make_count_aggregation();
-  auto const sum_result   = cache->get_result(col, *sum_agg);
-  auto const count_result = cache->get_result(col, *count_agg);
+  auto const sum_agg           = make_sum_aggregation();
+  auto const count_agg         = make_count_aggregation();
+  auto const sum_result        = cache->get_result(col, *sum_agg);
+  auto const count_result      = cache->get_result(col, *count_agg);
+  auto const sum_without_nulls = [&] {
+    if (sum_result.null_count() == 0) { return sum_result; }
+    return column_view{
+      sum_result.type(), sum_result.size(), sum_result.head(), nullptr, 0, sum_result.offset()};
+  }();
 
+  // Perform division without any null masks, and generate the null mask for the result later.
+  // This is because the null mask (if exists) is just needed to be copied from the sum result,
+  // and copying is faster than running the `bitmask_and` kernel.
   auto result =
-    cudf::detail::binary_operation(sum_result,
+    cudf::detail::binary_operation(sum_without_nulls,
                                    count_result,
                                    binary_operator::DIV,
                                    cudf::detail::target_type(input_type, aggregation::MEAN),
                                    stream,
-                                   mr);
+                                   resources);
+  // SUM result only has nulls if it is an input aggregation, not intermediate-only aggregation.
+  if (sum_result.has_nulls()) {
+    result->set_null_mask(cudf::detail::copy_bitmask(sum_result, stream, resources),
+                          sum_result.null_count());
+  } else if (col.has_nulls()) {  // SUM aggregation is only intermediate result, thus it is forced
+                                 // to be non-nullable
+    auto [null_mask, null_count] = cudf::detail::valid_if(
+      count_result.begin<size_type>(),
+      count_result.end<size_type>(),
+      [] __device__(size_type const count) -> bool { return count > 0; },
+      stream,
+      resources);
+    if (null_count > 0) { result->set_null_mask(std::move(null_mask), null_count); }
+  }
   cache->add_result(col, agg, std::move(result));
 }
 
@@ -100,17 +123,14 @@ void hash_compound_agg_finalizer::visit(cudf::detail::m2_aggregation const& agg)
 {
   if (cache->has_result(col, agg)) { return; }
 
-  auto const sum_sqr_agg = make_sum_of_squares_aggregation();
-  auto const sum_agg     = make_sum_aggregation();
-  auto const count_agg   = make_count_aggregation();
-  this->visit(*sum_sqr_agg);
-  this->visit(*sum_agg);
-  this->visit(*count_agg);
+  auto const sum_sqr_agg    = make_sum_of_squares_aggregation();
+  auto const sum_agg        = make_sum_aggregation();
+  auto const count_agg      = make_count_aggregation();
   auto const sum_sqr_result = cache->get_result(col, *sum_sqr_agg);
   auto const sum_result     = cache->get_result(col, *sum_agg);
   auto const count_result   = cache->get_result(col, *count_agg);
 
-  auto output = compute_m2(input_type, sum_sqr_result, sum_result, count_result, stream, mr);
+  auto output = compute_m2(input_type, sum_sqr_result, sum_result, count_result, stream, resources);
   cache->add_result(col, agg, std::move(output));
 }
 
@@ -118,14 +138,15 @@ void hash_compound_agg_finalizer::visit(cudf::detail::var_aggregation const& agg
 {
   if (cache->has_result(col, agg)) { return; }
 
-  auto const m2_agg    = make_m2_aggregation();
-  auto const count_agg = make_count_aggregation();
+  auto const m2_agg = make_m2_aggregation();
+  // Since M2 is a compound aggregation, we need to "finalize" it using aggregation finalizer's
+  // "visit" method.
   this->visit(*dynamic_cast<cudf::detail::m2_aggregation*>(m2_agg.get()));
-  this->visit(*count_agg);
+  auto const count_agg    = make_count_aggregation();
   auto const m2_result    = cache->get_result(col, *m2_agg);
   auto const count_result = cache->get_result(col, *count_agg);
 
-  auto output = compute_variance(m2_result, count_result, agg._ddof, stream, mr);
+  auto output = compute_variance(m2_result, count_result, agg._ddof, stream, resources);
   cache->add_result(col, agg, std::move(output));
 }
 
@@ -133,14 +154,15 @@ void hash_compound_agg_finalizer::visit(cudf::detail::std_aggregation const& agg
 {
   if (cache->has_result(col, agg)) { return; }
 
-  auto const m2_agg    = make_m2_aggregation();
-  auto const count_agg = make_count_aggregation();
+  auto const m2_agg = make_m2_aggregation();
+  // Since M2 is a compound aggregation, we need to "finalize" it using aggregation finalizer's
+  // "visit" method.
   this->visit(*dynamic_cast<cudf::detail::m2_aggregation*>(m2_agg.get()));
-  this->visit(*count_agg);
+  auto const count_agg    = make_count_aggregation();
   auto const m2_result    = cache->get_result(col, *m2_agg);
   auto const count_result = cache->get_result(col, *count_agg);
 
-  auto output = compute_std(m2_result, count_result, agg._ddof, stream, mr);
+  auto output = compute_std(m2_result, count_result, agg._ddof, stream, resources);
   cache->add_result(col, agg, std::move(output));
 }
 

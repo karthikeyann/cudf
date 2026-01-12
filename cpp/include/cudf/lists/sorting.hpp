@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -44,8 +44,8 @@ std::unique_ptr<column> sort_lists(
   lists_column_view const& source_column,
   order column_order,
   null_order null_precedence,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Segmented sort of the elements within a list in each row of a list column using stable
@@ -57,8 +57,8 @@ std::unique_ptr<column> stable_sort_lists(
   lists_column_view const& source_column,
   order column_order,
   null_order null_precedence,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 }  // namespace lists

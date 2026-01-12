@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2021-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2021-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -24,10 +24,10 @@ std::unique_ptr<column> sorted_order<sort_method::UNSTABLE>(column_view const& i
                                                             order column_order,
                                                             null_order null_precedence,
                                                             rmm::cuda_stream_view stream,
-                                                            rmm::device_async_resource_ref mr)
+                                                            cudf::memory_resources resources)
 {
   auto sorted_indices = cudf::make_numeric_column(
-    data_type(type_to_id<size_type>()), input.size(), mask_state::UNALLOCATED, stream, mr);
+    data_type(type_to_id<size_type>()), input.size(), mask_state::UNALLOCATED, stream, resources);
   mutable_column_view indices_view = sorted_indices->mutable_view();
   if (is_radix_sortable(input)) {
     sorted_order_radix(input, indices_view, column_order == order::ASCENDING, stream);

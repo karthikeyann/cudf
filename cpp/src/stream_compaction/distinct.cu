@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -20,6 +20,7 @@
 
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/polymorphic_allocator.hpp>
 
 #include <utility>
 #include <vector>
@@ -68,12 +69,12 @@ rmm::device_uvector<size_type> distinct_indices(table_view const& input,
                                                 null_equality nulls_equal,
                                                 nan_equality nans_equal,
                                                 rmm::cuda_stream_view stream,
-                                                rmm::device_async_resource_ref mr)
+                                                cudf::memory_resources resources)
 {
   auto const num_rows = input.num_rows();
 
   if (num_rows == 0 or input.num_columns() == 0) {
-    return rmm::device_uvector<size_type>(0, stream, mr);
+    return rmm::device_uvector<size_type>(0, stream, resources);
   }
 
   auto const preprocessed_input =
@@ -95,7 +96,7 @@ rmm::device_uvector<size_type> distinct_indices(table_view const& input,
                                               {},
                                               rmm::mr::polymorphic_allocator<char>{},
                                               stream.value()};
-    return detail::reduce_by_row(set, num_rows, keep, stream, mr);
+    return detail::reduce_by_row(set, num_rows, keep, stream, resources);
   };
 
   if (cudf::detail::has_nested_columns(input)) {
@@ -111,24 +112,20 @@ std::unique_ptr<table> distinct(table_view const& input,
                                 null_equality nulls_equal,
                                 nan_equality nans_equal,
                                 rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr)
+                                cudf::memory_resources resources)
 {
   if (input.num_rows() == 0 or input.num_columns() == 0 or keys.empty()) {
     return empty_like(input);
   }
 
-  auto const gather_map = detail::distinct_indices(input.select(keys),
-                                                   keep,
-                                                   nulls_equal,
-                                                   nans_equal,
-                                                   stream,
-                                                   cudf::get_current_device_resource_ref());
+  auto const gather_map = detail::distinct_indices(
+    input.select(keys), keep, nulls_equal, nans_equal, stream, resources.get_temporary_mr());
   return detail::gather(input,
                         gather_map,
                         out_of_bounds_policy::DONT_CHECK,
                         negative_index_policy::NOT_ALLOWED,
                         stream,
-                        mr);
+                        resources);
 }
 
 }  // namespace detail
@@ -139,10 +136,10 @@ std::unique_ptr<table> distinct(table_view const& input,
                                 null_equality nulls_equal,
                                 nan_equality nans_equal,
                                 rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr)
+                                cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::distinct(input, keys, keep, nulls_equal, nans_equal, stream, mr);
+  return detail::distinct(input, keys, keep, nulls_equal, nans_equal, stream, resources);
 }
 
 std::unique_ptr<column> distinct_indices(table_view const& input,
@@ -150,10 +147,10 @@ std::unique_ptr<column> distinct_indices(table_view const& input,
                                          null_equality nulls_equal,
                                          nan_equality nans_equal,
                                          rmm::cuda_stream_view stream,
-                                         rmm::device_async_resource_ref mr)
+                                         cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  auto indices = detail::distinct_indices(input, keep, nulls_equal, nans_equal, stream, mr);
+  auto indices = detail::distinct_indices(input, keep, nulls_equal, nans_equal, stream, resources);
   return std::make_unique<column>(std::move(indices), rmm::device_buffer{}, 0);
 }
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -122,9 +122,9 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
           std::unique_ptr<rmm::device_uvector<size_type>>>
 inner_join(cudf::table_view const& left_keys,
            cudf::table_view const& right_keys,
-           null_equality compare_nulls       = null_equality::EQUAL,
-           rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-           rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+           null_equality compare_nulls      = null_equality::EQUAL,
+           rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+           cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a pair of row index vectors corresponding to a
@@ -163,9 +163,9 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
           std::unique_ptr<rmm::device_uvector<size_type>>>
 left_join(cudf::table_view const& left_keys,
           cudf::table_view const& right_keys,
-          null_equality compare_nulls       = null_equality::EQUAL,
-          rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-          rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+          null_equality compare_nulls      = null_equality::EQUAL,
+          rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+          cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a pair of row index vectors corresponding to a
@@ -204,9 +204,9 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
           std::unique_ptr<rmm::device_uvector<size_type>>>
 full_join(cudf::table_view const& left_keys,
           cudf::table_view const& right_keys,
-          null_equality compare_nulls       = null_equality::EQUAL,
-          rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-          rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+          null_equality compare_nulls      = null_equality::EQUAL,
+          rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+          cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Performs a cross join on two tables (`left`, `right`)
@@ -234,8 +234,8 @@ full_join(cudf::table_view const& left_keys,
 std::unique_ptr<cudf::table> cross_join(
   cudf::table_view const& left,
   cudf::table_view const& right,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Filters join result indices based on a conditional predicate and join type.
@@ -313,8 +313,8 @@ filter_join_indices(cudf::table_view const& left,
                     cudf::device_span<size_type const> right_indices,
                     cudf::ast::expression const& predicate,
                     cudf::join_kind join_kind,
-                    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-                    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+                    rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+                    cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -212,8 +212,8 @@ class avro_reader_options_builder {
  */
 table_with_metadata read_avro(
   avro_reader_options const& options,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 }  // namespace io

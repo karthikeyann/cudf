@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -76,8 +76,8 @@ class sort_merge_join {
             std::unique_ptr<rmm::device_uvector<size_type>>>
   inner_join(table_view const& left,
              sorted is_left_sorted,
-             rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-             rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+             rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+             cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Returns context information about matches between the left and right tables.
@@ -104,8 +104,8 @@ class sort_merge_join {
   cudf::join_match_context inner_join_match_context(
     table_view const& left,
     sorted is_left_sorted,
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+    rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+    cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Performs an inner join between a partition of the left table and the right table.
@@ -157,8 +157,8 @@ class sort_merge_join {
             std::unique_ptr<rmm::device_uvector<size_type>>>
   partitioned_inner_join(
     cudf::join_partition_context const& context,
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+    rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+    cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
  private:
   /**
@@ -307,9 +307,9 @@ class sort_merge_join {
                          std::unique_ptr<rmm::device_uvector<size_type>>>
 sort_merge_inner_join(cudf::table_view const& left_keys,
                       cudf::table_view const& right_keys,
-                      null_equality compare_nulls       = null_equality::EQUAL,
-                      rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-                      rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+                      null_equality compare_nulls      = null_equality::EQUAL,
+                      rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+                      cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a pair of row index vectors corresponding to an inner join between the specified
@@ -352,9 +352,9 @@ sort_merge_inner_join(cudf::table_view const& left_keys,
                          std::unique_ptr<rmm::device_uvector<size_type>>>
 merge_inner_join(cudf::table_view const& left_keys,
                  cudf::table_view const& right_keys,
-                 null_equality compare_nulls       = null_equality::EQUAL,
-                 rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-                 rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+                 null_equality compare_nulls      = null_equality::EQUAL,
+                 rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+                 cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 }  // namespace CUDF_EXPORT cudf

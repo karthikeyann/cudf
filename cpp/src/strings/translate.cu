@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -80,7 +80,7 @@ struct translate_fn {
 std::unique_ptr<column> translate(strings_column_view const& strings,
                                   std::vector<std::pair<char_utf8, char_utf8>> const& chars_table,
                                   rmm::cuda_stream_view stream,
-                                  rmm::device_async_resource_ref mr)
+                                  cudf::memory_resources resources)
 {
   if (strings.is_empty()) return make_empty_column(type_id::STRING);
 
@@ -96,19 +96,19 @@ std::unique_ptr<column> translate(strings_column_view const& strings,
     return lhs.first < rhs.first;
   });
   // copy translate table to device memory
-  rmm::device_uvector<translate_table> table = cudf::detail::make_device_uvector_async(
-    htable, stream, cudf::get_current_device_resource_ref());
+  rmm::device_uvector<translate_table> table =
+    cudf::detail::make_device_uvector_async(htable, stream, resources.get_temporary_mr());
 
   auto d_strings = column_device_view::create(strings.parent(), stream);
 
   auto [offsets_column, chars] = make_strings_children(
-    translate_fn{*d_strings, table.begin(), table.end()}, strings.size(), stream, mr);
+    translate_fn{*d_strings, table.begin(), table.end()}, strings.size(), stream, resources);
 
   return make_strings_column(strings.size(),
                              std::move(offsets_column),
                              chars.release(),
                              strings.null_count(),
-                             cudf::detail::copy_bitmask(strings.parent(), stream, mr));
+                             cudf::detail::copy_bitmask(strings.parent(), stream, resources));
 }
 
 }  // namespace detail
@@ -118,10 +118,10 @@ std::unique_ptr<column> translate(strings_column_view const& strings,
 std::unique_ptr<column> translate(strings_column_view const& input,
                                   std::vector<std::pair<uint32_t, uint32_t>> const& chars_table,
                                   rmm::cuda_stream_view stream,
-                                  rmm::device_async_resource_ref mr)
+                                  cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::translate(input, chars_table, stream, mr);
+  return detail::translate(input, chars_table, stream, resources);
 }
 
 }  // namespace strings

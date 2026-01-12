@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -28,7 +28,7 @@ namespace io::detail::avro {
 table_with_metadata read_avro(std::unique_ptr<cudf::io::datasource>&& source,
                               avro_reader_options const& options,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 }  // namespace io::detail::avro
 }  // namespace CUDF_EXPORT cudf

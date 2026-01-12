@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -57,7 +57,7 @@ std::unique_ptr<table> gather(table_view const& source_table,
                               out_of_bounds_policy bounds_policy,
                               negative_index_policy neg_indices,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 /**
  * @copydoc cudf::detail::gather(table_view const&,column_view const&,table_view
@@ -71,7 +71,7 @@ std::unique_ptr<table> gather(table_view const& source_table,
                               out_of_bounds_policy bounds_policy,
                               negative_index_policy neg_indices,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 }  // namespace detail
 }  // namespace CUDF_EXPORT cudf

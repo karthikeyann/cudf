@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2024-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2024-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -29,7 +29,7 @@ namespace {
 
 std::unique_ptr<column> make_empty_column_from_schema(ArrowSchema const* schema,
                                                       rmm::cuda_stream_view stream,
-                                                      rmm::device_async_resource_ref mr)
+                                                      cudf::memory_resources resources)
 {
   ArrowSchemaView schema_view;
   NANOARROW_THROW_NOT_OK(ArrowSchemaViewInit(&schema_view, schema, nullptr));
@@ -41,13 +41,14 @@ std::unique_ptr<column> make_empty_column_from_schema(ArrowSchema const* schema,
         data_type(type_id::EMPTY), 0, rmm::device_buffer{}, rmm::device_buffer{}, 0);
     }
     case type_id::LIST: {
-      return cudf::make_lists_column(0,
-                                     cudf::make_empty_column(data_type{type_id::INT32}),
-                                     make_empty_column_from_schema(schema->children[0], stream, mr),
-                                     0,
-                                     {},
-                                     stream,
-                                     mr);
+      return cudf::make_lists_column(
+        0,
+        cudf::make_empty_column(data_type{type_id::INT32}),
+        make_empty_column_from_schema(schema->children[0], stream, resources),
+        0,
+        {},
+        stream,
+        resources);
     }
     case type_id::STRUCT: {
       std::vector<std::unique_ptr<column>> child_columns;
@@ -56,8 +57,8 @@ std::unique_ptr<column> make_empty_column_from_schema(ArrowSchema const* schema,
         schema->children,
         schema->children + schema->n_children,
         std::back_inserter(child_columns),
-        [&](auto const& child) { return make_empty_column_from_schema(child, stream, mr); });
-      return cudf::make_structs_column(0, std::move(child_columns), 0, {}, stream, mr);
+        [&](auto const& child) { return make_empty_column_from_schema(child, stream, resources); });
+      return cudf::make_structs_column(0, std::move(child_columns), 0, {}, stream, resources);
     }
     default: {
       return cudf::make_empty_column(type);
@@ -69,7 +70,7 @@ std::unique_ptr<column> make_empty_column_from_schema(ArrowSchema const* schema,
 
 std::unique_ptr<table> from_arrow_stream(ArrowArrayStream* input,
                                          rmm::cuda_stream_view stream,
-                                         rmm::device_async_resource_ref mr)
+                                         cudf::memory_resources resources)
 {
   CUDF_EXPECTS(input != nullptr, "input ArrowArrayStream must not be NULL", std::invalid_argument);
 
@@ -84,7 +85,7 @@ std::unique_ptr<table> from_arrow_stream(ArrowArrayStream* input,
   while (true) {
     NANOARROW_THROW_NOT_OK(ArrowArrayStreamGetNext(input, &chunk, nullptr));
     if (chunk.release == nullptr) { break; }
-    chunks.push_back(from_arrow(&schema, &chunk, stream, mr));
+    chunks.push_back(from_arrow(&schema, &chunk, stream, resources));
     chunk.release(&chunk);
   }
   input->release(input);
@@ -103,7 +104,7 @@ std::unique_ptr<table> from_arrow_stream(ArrowArrayStream* input,
       schema.children,
       schema.children + schema.n_children,
       std::back_inserter(columns),
-      [&](auto const& child) { return make_empty_column_from_schema(child, stream, mr); });
+      [&](auto const& child) { return make_empty_column_from_schema(child, stream, resources); });
     schema.release(&schema);
     return std::make_unique<cudf::table>(std::move(columns));
   }
@@ -117,12 +118,12 @@ std::unique_ptr<table> from_arrow_stream(ArrowArrayStream* input,
     chunks.begin(), chunks.end(), std::back_inserter(chunk_views), [](auto const& chunk) {
       return chunk->view();
     });
-  return cudf::detail::concatenate(chunk_views, stream, mr);
+  return cudf::detail::concatenate(chunk_views, stream, resources);
 }
 
 std::unique_ptr<column> from_arrow_stream_column(ArrowArrayStream* input,
                                                  rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr)
+                                                 cudf::memory_resources resources)
 {
   CUDF_EXPECTS(input != nullptr, "input ArrowArrayStream must not be NULL", std::invalid_argument);
 
@@ -137,13 +138,13 @@ std::unique_ptr<column> from_arrow_stream_column(ArrowArrayStream* input,
   while (true) {
     NANOARROW_THROW_NOT_OK(ArrowArrayStreamGetNext(input, &chunk, nullptr));
     if (chunk.release == nullptr) { break; }
-    chunks.push_back(from_arrow_column(&schema, &chunk, stream, mr));
+    chunks.push_back(from_arrow_column(&schema, &chunk, stream, resources));
     chunk.release(&chunk);
   }
   input->release(input);
 
   if (chunks.empty()) {
-    auto empty_column = make_empty_column_from_schema(&schema, stream, mr);
+    auto empty_column = make_empty_column_from_schema(&schema, stream, resources);
     schema.release(&schema);
     return empty_column;
   }
@@ -157,25 +158,25 @@ std::unique_ptr<column> from_arrow_stream_column(ArrowArrayStream* input,
     chunks.begin(), chunks.end(), std::back_inserter(chunk_views), [](auto const& chunk) {
       return chunk->view();
     });
-  return cudf::detail::concatenate(chunk_views, stream, mr);
+  return cudf::detail::concatenate(chunk_views, stream, resources);
 }
 
 }  // namespace detail
 
 std::unique_ptr<table> from_arrow_stream(ArrowArrayStream* input,
                                          rmm::cuda_stream_view stream,
-                                         rmm::device_async_resource_ref mr)
+                                         cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::from_arrow_stream(input, stream, mr);
+  return detail::from_arrow_stream(input, stream, resources);
 }
 
 std::unique_ptr<column> from_arrow_stream_column(ArrowArrayStream* input,
                                                  rmm::cuda_stream_view stream,
-                                                 rmm::device_async_resource_ref mr)
+                                                 cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::from_arrow_stream_column(input, stream, mr);
+  return detail::from_arrow_stream_column(input, stream, resources);
 }
 
 }  // namespace cudf

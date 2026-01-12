@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -106,18 +106,19 @@ std::unique_ptr<column> allocate_like(column_view const& input,
                                       size_type size,
                                       mask_allocation_policy mask_alloc,
                                       rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
+                                      cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(
     is_fixed_width(input.type()), "Expects only fixed-width type column", cudf::data_type_error);
   mask_state const allocate_mask = should_allocate_mask(mask_alloc, input.nullable());
 
-  return std::make_unique<column>(input.type(),
-                                  size,
-                                  rmm::device_buffer(size * size_of(input.type()), stream, mr),
-                                  detail::create_null_mask(size, allocate_mask, stream, mr),
-                                  0);
+  return std::make_unique<column>(
+    input.type(),
+    size,
+    rmm::device_buffer(size * size_of(input.type()), stream, resources),
+    detail::create_null_mask(size, allocate_mask, stream, resources),
+    0);
 }
 
 }  // namespace detail
@@ -170,20 +171,20 @@ std::unique_ptr<table> empty_like(table_view const& input_table)
 std::unique_ptr<column> allocate_like(column_view const& input,
                                       mask_allocation_policy mask_alloc,
                                       rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
+                                      cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::allocate_like(input, input.size(), mask_alloc, stream, mr);
+  return detail::allocate_like(input, input.size(), mask_alloc, stream, resources);
 }
 
 std::unique_ptr<column> allocate_like(column_view const& input,
                                       size_type size,
                                       mask_allocation_policy mask_alloc,
                                       rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
+                                      cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::allocate_like(input, size, mask_alloc, stream, mr);
+  return detail::allocate_like(input, size, mask_alloc, stream, resources);
 }
 
 }  // namespace cudf

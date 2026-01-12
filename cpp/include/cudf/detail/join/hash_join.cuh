@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -16,6 +16,7 @@
 #include <rmm/cuda_stream_view.hpp>
 #include <rmm/device_buffer.hpp>
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/polymorphic_allocator.hpp>
 
 #include <cuco/static_multiset.cuh>
 #include <cuda/std/functional>
@@ -137,7 +138,7 @@ struct hash_join {
   inner_join(cudf::table_view const& probe,
              std::optional<std::size_t> output_size,
              rmm::cuda_stream_view stream,
-             rmm::device_async_resource_ref mr) const;
+             cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::hash_join::left_join
@@ -147,7 +148,7 @@ struct hash_join {
   left_join(cudf::table_view const& probe,
             std::optional<std::size_t> output_size,
             rmm::cuda_stream_view stream,
-            rmm::device_async_resource_ref mr) const;
+            cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::hash_join::full_join
@@ -157,7 +158,7 @@ struct hash_join {
   full_join(cudf::table_view const& probe,
             std::optional<std::size_t> output_size,
             rmm::cuda_stream_view stream,
-            rmm::device_async_resource_ref mr) const;
+            cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::hash_join::inner_join_size
@@ -176,7 +177,7 @@ struct hash_join {
    */
   std::size_t full_join_size(cudf::table_view const& probe,
                              rmm::cuda_stream_view stream,
-                             rmm::device_async_resource_ref mr) const;
+                             cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::hash_join::inner_join_match_context
@@ -184,7 +185,7 @@ struct hash_join {
   [[nodiscard]] cudf::join_match_context inner_join_match_context(
     cudf::table_view const& probe,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) const;
+    cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::hash_join::left_join_match_context
@@ -192,7 +193,7 @@ struct hash_join {
   [[nodiscard]] cudf::join_match_context left_join_match_context(
     cudf::table_view const& probe,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) const;
+    cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::hash_join::full_join_match_context
@@ -200,7 +201,7 @@ struct hash_join {
   [[nodiscard]] cudf::join_match_context full_join_match_context(
     cudf::table_view const& probe,
     rmm::cuda_stream_view stream,
-    rmm::device_async_resource_ref mr) const;
+    cudf::memory_resources resources) const;
 
  private:
   template <typename OutputIterator>
@@ -230,7 +231,7 @@ struct hash_join {
                      join_kind join,
                      std::optional<std::size_t> output_size,
                      rmm::cuda_stream_view stream,
-                     rmm::device_async_resource_ref mr) const;
+                     cudf::memory_resources resources) const;
 
   /**
    * @copydoc cudf::detail::hash_join::probe_join_indices
@@ -245,7 +246,7 @@ struct hash_join {
                     join_kind join,
                     std::optional<std::size_t> output_size,
                     rmm::cuda_stream_view stream,
-                    rmm::device_async_resource_ref mr) const;
+                    cudf::memory_resources resources) const;
 };
 }  // namespace detail
 }  // namespace CUDF_EXPORT cudf

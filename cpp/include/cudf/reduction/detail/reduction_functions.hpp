@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -38,7 +38,7 @@ std::unique_ptr<scalar> sum(column_view const& col,
                             data_type const output_dtype,
                             std::optional<std::reference_wrapper<scalar const>> init,
                             rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr);
+                            cudf::memory_resources resources);
 
 /**
  * @brief Computes sum with overflow detection of int64_t elements in input column
@@ -59,7 +59,7 @@ std::unique_ptr<scalar> sum_with_overflow(column_view const& col,
                                           data_type const output_type,
                                           std::optional<std::reference_wrapper<scalar const>> init,
                                           rmm::cuda_stream_view stream,
-                                          rmm::device_async_resource_ref mr);
+                                          cudf::memory_resources resources);
 
 /**
  * @brief Computes minimum of elements in input column
@@ -79,7 +79,7 @@ std::unique_ptr<scalar> min(column_view const& col,
                             data_type const output_dtype,
                             std::optional<std::reference_wrapper<scalar const>> init,
                             rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr);
+                            cudf::memory_resources resources);
 
 /**
  * @brief Computes maximum of elements in input column
@@ -99,7 +99,7 @@ std::unique_ptr<scalar> max(column_view const& col,
                             data_type const output_dtype,
                             std::optional<std::reference_wrapper<scalar const>> init,
                             rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr);
+                            cudf::memory_resources resources);
 
 /**
  * @brief Computes index of the minimum element in the input column.
@@ -113,7 +113,7 @@ std::unique_ptr<scalar> max(column_view const& col,
  */
 std::unique_ptr<scalar> argmin(column_view const& col,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr);
+                               cudf::memory_resources resources);
 
 /**
  * @brief Computes index of the maximum element in the input column.
@@ -127,7 +127,18 @@ std::unique_ptr<scalar> argmin(column_view const& col,
  */
 std::unique_ptr<scalar> argmax(column_view const& col,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr);
+                               cudf::memory_resources resources);
+
+/**
+ * @brief Computes the minimum and maximum values of the input column
+ *
+ * @param col input column to compute minmax
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Device memory resource used to allocate the returned column's device memory
+ * @return A pair consisting of the minimum value and the maximum value
+ */
+std::pair<std::unique_ptr<scalar>, std::unique_ptr<scalar>> minmax(
+  cudf::column_view const& col, rmm::cuda_stream_view stream, rmm::device_async_resource_ref mr);
 
 /**
  * @brief Computes any of elements in input column is true when typecasted to bool
@@ -148,7 +159,7 @@ std::unique_ptr<scalar> any(column_view const& col,
                             data_type const output_dtype,
                             std::optional<std::reference_wrapper<scalar const>> init,
                             rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr);
+                            cudf::memory_resources resources);
 
 /**
  * @brief Computes all of elements in input column is true when typecasted to bool
@@ -169,7 +180,7 @@ std::unique_ptr<scalar> all(column_view const& col,
                             data_type const output_dtype,
                             std::optional<std::reference_wrapper<scalar const>> init,
                             rmm::cuda_stream_view stream,
-                            rmm::device_async_resource_ref mr);
+                            cudf::memory_resources resources);
 
 /**
  * @brief Compute frequency for each unique element in the input column.
@@ -184,7 +195,7 @@ std::unique_ptr<scalar> all(column_view const& col,
  */
 std::unique_ptr<scalar> histogram(column_view const& input,
                                   rmm::cuda_stream_view stream,
-                                  rmm::device_async_resource_ref mr);
+                                  cudf::memory_resources resources);
 
 /**
  * @brief Merge multiple histograms together.
@@ -196,7 +207,7 @@ std::unique_ptr<scalar> histogram(column_view const& input,
  */
 std::unique_ptr<scalar> merge_histogram(column_view const& input,
                                         rmm::cuda_stream_view stream,
-                                        rmm::device_async_resource_ref mr);
+                                        cudf::memory_resources resources);
 
 /**
  * @brief Computes product of elements in input column
@@ -217,7 +228,7 @@ std::unique_ptr<scalar> product(column_view const& col,
                                 data_type const output_dtype,
                                 std::optional<std::reference_wrapper<scalar const>> init,
                                 rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr);
+                                cudf::memory_resources resources);
 
 /**
  * @brief Computes sum of squares of elements in input column
@@ -236,7 +247,7 @@ std::unique_ptr<scalar> product(column_view const& col,
 std::unique_ptr<scalar> sum_of_squares(column_view const& col,
                                        data_type const output_dtype,
                                        rmm::cuda_stream_view stream,
-                                       rmm::device_async_resource_ref mr);
+                                       cudf::memory_resources resources);
 
 /**
  * @brief Computes mean of elements in input column
@@ -255,7 +266,7 @@ std::unique_ptr<scalar> sum_of_squares(column_view const& col,
 std::unique_ptr<scalar> mean(column_view const& col,
                              data_type const output_dtype,
                              rmm::cuda_stream_view stream,
-                             rmm::device_async_resource_ref mr);
+                             cudf::memory_resources resources);
 
 /**
  * @brief Computes variance of elements in input column
@@ -277,7 +288,7 @@ std::unique_ptr<scalar> variance(column_view const& col,
                                  data_type const output_dtype,
                                  size_type ddof,
                                  rmm::cuda_stream_view stream,
-                                 rmm::device_async_resource_ref mr);
+                                 cudf::memory_resources resources);
 
 /**
  * @brief Computes standard deviation of elements in input column
@@ -299,7 +310,7 @@ std::unique_ptr<scalar> standard_deviation(column_view const& col,
                                            data_type const output_dtype,
                                            size_type ddof,
                                            rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr);
+                                           cudf::memory_resources resources);
 
 /**
  * @brief Returns nth element in input column
@@ -329,7 +340,7 @@ std::unique_ptr<scalar> nth_element(column_view const& col,
                                     size_type n,
                                     null_policy null_handling,
                                     rmm::cuda_stream_view stream,
-                                    rmm::device_async_resource_ref mr);
+                                    cudf::memory_resources resources);
 
 /**
  * @brief Collect input column into a (list) scalar
@@ -343,7 +354,7 @@ std::unique_ptr<scalar> nth_element(column_view const& col,
 std::unique_ptr<scalar> collect_list(column_view const& col,
                                      null_policy null_handling,
                                      rmm::cuda_stream_view stream,
-                                     rmm::device_async_resource_ref mr);
+                                     cudf::memory_resources resources);
 
 /**
  * @brief Merge a bunch of list scalars into single list scalar
@@ -355,7 +366,7 @@ std::unique_ptr<scalar> collect_list(column_view const& col,
  */
 std::unique_ptr<scalar> merge_lists(lists_column_view const& col,
                                     rmm::cuda_stream_view stream,
-                                    rmm::device_async_resource_ref mr);
+                                    cudf::memory_resources resources);
 
 /**
  * @brief Collect input column into a (list) scalar without duplicated elements
@@ -373,7 +384,7 @@ std::unique_ptr<scalar> collect_set(column_view const& col,
                                     null_equality nulls_equal,
                                     nan_equality nans_equal,
                                     rmm::cuda_stream_view stream,
-                                    rmm::device_async_resource_ref mr);
+                                    cudf::memory_resources resources);
 
 /**
  * @brief Merge a bunch of list scalars into single list scalar then drop duplicated elements
@@ -389,7 +400,7 @@ std::unique_ptr<scalar> merge_sets(lists_column_view const& col,
                                    null_equality nulls_equal,
                                    nan_equality nans_equal,
                                    rmm::cuda_stream_view stream,
-                                   rmm::device_async_resource_ref mr);
+                                   cudf::memory_resources resources);
 
 /**
  * @brief Performs bitwise reduction on the input column, ignoring nulls.
@@ -403,7 +414,7 @@ std::unique_ptr<scalar> merge_sets(lists_column_view const& col,
 std::unique_ptr<scalar> bitwise_reduction(bitwise_op bit_op,
                                           column_view const& col,
                                           rmm::cuda_stream_view stream,
-                                          rmm::device_async_resource_ref mr);
+                                          cudf::memory_resources resources);
 
 /**
  * @brief Computes quantile value of the elements in the input column
@@ -425,7 +436,7 @@ std::unique_ptr<cudf::scalar> quantile(column_view const& col,
                                        cudf::interpolation interpolation,
                                        cudf::data_type const output_type,
                                        rmm::cuda_stream_view stream,
-                                       rmm::device_async_resource_ref mr);
+                                       cudf::memory_resources resources);
 
 /**
  * @brief Computes the number of unique elements in the input column
@@ -442,7 +453,7 @@ std::unique_ptr<scalar> nunique(column_view const& col,
                                 null_policy null_handling,
                                 data_type const output_dtype,
                                 rmm::cuda_stream_view stream,
-                                rmm::device_async_resource_ref mr);
+                                cudf::memory_resources resources);
 
 /**
  * @brief Returns the number of elements in the input column
@@ -460,7 +471,7 @@ std::unique_ptr<scalar> count(column_view const& col,
                               null_policy null_handling,
                               data_type const output_type,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 }  // namespace reduction::detail
 }  // namespace CUDF_EXPORT cudf

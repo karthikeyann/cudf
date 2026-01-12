@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "reader_impl_helpers.hpp"
@@ -50,7 +50,7 @@ struct row_group_stats_caster : public stats_caster_base {
     operator()(int schema_idx,
                cudf::data_type dtype,
                rmm::cuda_stream_view stream,
-               rmm::device_async_resource_ref mr) const
+               cudf::memory_resources resources) const
   {
     // List, Struct, Dictionary types are not supported
     if constexpr (cudf::is_compound<T>() && !std::is_same_v<T, string_view>) {
@@ -105,10 +105,10 @@ struct row_group_stats_caster : public stats_caster_base {
           stats_idx++;
         }
       };
-      return {min.to_device(dtype, stream, mr),
-              max.to_device(dtype, stream, mr),
+      return {min.to_device(dtype, stream, resources),
+              max.to_device(dtype, stream, resources),
               has_is_null_operator ? std::make_optional(is_null->to_device(
-                                       data_type{cudf::type_id::BOOL8}, stream, mr))
+                                       data_type{cudf::type_id::BOOL8}, stream, resources))
                                    : std::nullopt};
     }
   }
@@ -124,7 +124,7 @@ std::optional<std::vector<std::vector<size_type>>> aggregate_reader_metadata::ap
   std::reference_wrapper<ast::expression const> filter,
   rmm::cuda_stream_view stream) const
 {
-  auto mr = cudf::get_current_device_resource_ref();
+  auto mr = resources.get_temporary_mr();
 
   // Get a boolean mask indicating which columns can participate in stats based filtering
   auto const [stats_columns_mask, has_is_null_operator] =
@@ -151,18 +151,30 @@ std::optional<std::vector<std::vector<size_type>>> aggregate_reader_metadata::ap
     if (not stats_columns_mask[col_idx] or
         (cudf::is_compound(dtype) && dtype.id() != cudf::type_id::STRING)) {
       // Placeholder for unsupported types and non-participating columns
-      columns.push_back(cudf::make_numeric_column(
-        data_type{cudf::type_id::BOOL8}, total_row_groups, rmm::device_buffer{}, 0, stream, mr));
-      columns.push_back(cudf::make_numeric_column(
-        data_type{cudf::type_id::BOOL8}, total_row_groups, rmm::device_buffer{}, 0, stream, mr));
+      columns.push_back(cudf::make_numeric_column(data_type{cudf::type_id::BOOL8},
+                                                  total_row_groups,
+                                                  rmm::device_buffer{},
+                                                  0,
+                                                  stream,
+                                                  resources));
+      columns.push_back(cudf::make_numeric_column(data_type{cudf::type_id::BOOL8},
+                                                  total_row_groups,
+                                                  rmm::device_buffer{},
+                                                  0,
+                                                  stream,
+                                                  resources));
       if (has_is_null_operator) {
-        columns.push_back(cudf::make_numeric_column(
-          data_type{cudf::type_id::BOOL8}, total_row_groups, rmm::device_buffer{}, 0, stream, mr));
+        columns.push_back(cudf::make_numeric_column(data_type{cudf::type_id::BOOL8},
+                                                    total_row_groups,
+                                                    rmm::device_buffer{},
+                                                    0,
+                                                    stream,
+                                                    resources));
       }
       continue;
     }
-    auto [min_col, max_col, is_null_col] =
-      cudf::type_dispatcher<dispatch_storage_type>(dtype, stats_col, schema_idx, dtype, stream, mr);
+    auto [min_col, max_col, is_null_col] = cudf::type_dispatcher<dispatch_storage_type>(
+      dtype, stats_col, schema_idx, dtype, stream, resources);
     columns.push_back(std::move(min_col));
     columns.push_back(std::move(max_col));
     if (has_is_null_operator) {
@@ -238,7 +250,7 @@ aggregate_reader_metadata::filter_row_groups(
 
   // Aligned resource adaptor to allocate bloom filter buffers with
   auto aligned_mr = rmm::mr::aligned_resource_adaptor<rmm::device_async_resource_ref>(
-    cudf::get_current_device_resource_ref(), get_bloom_filter_alignment());
+    resources.get_temporary_mr(), get_bloom_filter_alignment());
 
   // Read a vector of bloom filter bitset device buffers for all columns with equality
   // predicate(s) across all row groups
@@ -420,8 +432,8 @@ std::optional<std::vector<std::vector<size_type>>> collect_filtered_row_group_in
   rmm::cuda_stream_view stream)
 {
   // Filter the input table using AST expression
-  auto predicate_col = cudf::detail::compute_column(
-    table, ast_expr.get(), stream, cudf::get_current_device_resource_ref());
+  auto predicate_col =
+    cudf::detail::compute_column(table, ast_expr.get(), stream, resources.get_temporary_mr());
   auto predicate = predicate_col->view();
   CUDF_EXPECTS(predicate.type().id() == cudf::type_id::BOOL8,
                "Filter expression must return a boolean column");

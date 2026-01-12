@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -70,7 +70,7 @@ conditional_inner_join(table_view const& left,
                        ast::expression const& binary_predicate,
                        std::optional<std::size_t> output_size = {},
                        rmm::cuda_stream_view stream           = cudf::get_default_stream(),
-                       rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+                       cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a pair of row index vectors corresponding to all pairs
@@ -117,7 +117,7 @@ conditional_left_join(table_view const& left,
                       ast::expression const& binary_predicate,
                       std::optional<std::size_t> output_size = {},
                       rmm::cuda_stream_view stream           = cudf::get_default_stream(),
-                      rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+                      cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns a pair of row index vectors corresponding to all pairs
@@ -160,8 +160,8 @@ std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
 conditional_full_join(table_view const& left,
                       table_view const& right,
                       ast::expression const& binary_predicate,
-                      rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-                      rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+                      rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+                      cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns an index vector corresponding to all rows in the left table
@@ -202,7 +202,7 @@ std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_semi_join(
   ast::expression const& binary_predicate,
   std::optional<std::size_t> output_size = {},
   rmm::cuda_stream_view stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr      = cudf::get_current_device_resource_ref());
+  cudf::memory_resources resources       = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns an index vector corresponding to all rows in the left table
@@ -243,7 +243,7 @@ std::unique_ptr<rmm::device_uvector<size_type>> conditional_left_anti_join(
   ast::expression const& binary_predicate,
   std::optional<std::size_t> output_size = {},
   rmm::cuda_stream_view stream           = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr      = cudf::get_current_device_resource_ref());
+  cudf::memory_resources resources       = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns the exact number of matches (rows) when performing a
@@ -267,8 +267,8 @@ std::size_t conditional_inner_join_size(
   table_view const& left,
   table_view const& right,
   ast::expression const& binary_predicate,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns the exact number of matches (rows) when performing a
@@ -292,8 +292,8 @@ std::size_t conditional_left_join_size(
   table_view const& left,
   table_view const& right,
   ast::expression const& binary_predicate,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns the exact number of matches (rows) when performing a
@@ -317,8 +317,8 @@ std::size_t conditional_left_semi_join_size(
   table_view const& left,
   table_view const& right,
   ast::expression const& binary_predicate,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /**
  * @brief Returns the exact number of matches (rows) when performing a
@@ -342,8 +342,8 @@ std::size_t conditional_left_anti_join_size(
   table_view const& left,
   table_view const& right,
   ast::expression const& binary_predicate,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
 /** @} */  // end of group
 

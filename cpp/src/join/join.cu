@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "join_common_utils.hpp"
@@ -12,9 +12,14 @@
 #include <cudf/join/join.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/table/table_view.hpp>
+#include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
+#include <rmm/device_uvector.hpp>
+#include <rmm/resource_ref.hpp>
+
+#include <memory>
 
 namespace cudf {
 namespace detail {
@@ -25,14 +30,14 @@ inner_join(table_view const& left_input,
            table_view const& right_input,
            null_equality compare_nulls,
            rmm::cuda_stream_view stream,
-           rmm::device_async_resource_ref mr)
+           cudf::memory_resources resources)
 {
   // Make sure any dictionary columns have matched key sets.
   // This will return any new dictionary columns created as well as updated table_views.
   auto matched = cudf::dictionary::detail::match_dictionaries(
     {left_input, right_input},
     stream,
-    cudf::get_current_device_resource_ref());  // temporary objects returned
+    resources.get_temporary_mr());  // temporary objects returned
 
   // now rebuild the table views with the updated ones
   auto const left      = matched.second.front();
@@ -46,11 +51,11 @@ inner_join(table_view const& left_input,
   // build the hash map from the smaller table.
   if (right.num_rows() > left.num_rows()) {
     cudf::hash_join hj_obj(left, has_nulls, compare_nulls, CUCO_DESIRED_LOAD_FACTOR, stream);
-    auto [right_result, left_result] = hj_obj.inner_join(right, std::nullopt, stream, mr);
+    auto [right_result, left_result] = hj_obj.inner_join(right, std::nullopt, stream, resources);
     return std::pair(std::move(left_result), std::move(right_result));
   } else {
     cudf::hash_join hj_obj(right, has_nulls, compare_nulls, CUCO_DESIRED_LOAD_FACTOR, stream);
-    return hj_obj.inner_join(left, std::nullopt, stream, mr);
+    return hj_obj.inner_join(left, std::nullopt, stream, resources);
   }
 }
 
@@ -60,14 +65,14 @@ left_join(table_view const& left_input,
           table_view const& right_input,
           null_equality compare_nulls,
           rmm::cuda_stream_view stream,
-          rmm::device_async_resource_ref mr)
+          cudf::memory_resources resources)
 {
   // Make sure any dictionary columns have matched key sets.
   // This will return any new dictionary columns created as well as updated table_views.
   auto matched = cudf::dictionary::detail::match_dictionaries(
     {left_input, right_input},  // these should match
     stream,
-    cudf::get_current_device_resource_ref());  // temporary objects returned
+    resources.get_temporary_mr());  // temporary objects returned
   // now rebuild the table views with the updated ones
   table_view const left  = matched.second.front();
   table_view const right = matched.second.back();
@@ -76,7 +81,7 @@ left_join(table_view const& left_input,
                              : cudf::nullable_join::NO;
 
   cudf::hash_join hj_obj(right, has_nulls, compare_nulls, CUCO_DESIRED_LOAD_FACTOR, stream);
-  return hj_obj.left_join(left, std::nullopt, stream, mr);
+  return hj_obj.left_join(left, std::nullopt, stream, resources);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -85,14 +90,14 @@ full_join(table_view const& left_input,
           table_view const& right_input,
           null_equality compare_nulls,
           rmm::cuda_stream_view stream,
-          rmm::device_async_resource_ref mr)
+          cudf::memory_resources resources)
 {
   // Make sure any dictionary columns have matched key sets.
   // This will return any new dictionary columns created as well as updated table_views.
   auto matched = cudf::dictionary::detail::match_dictionaries(
     {left_input, right_input},  // these should match
     stream,
-    cudf::get_current_device_resource_ref());  // temporary objects returned
+    resources.get_temporary_mr());  // temporary objects returned
   // now rebuild the table views with the updated ones
   table_view const left  = matched.second.front();
   table_view const right = matched.second.back();
@@ -101,7 +106,7 @@ full_join(table_view const& left_input,
                              : cudf::nullable_join::NO;
 
   cudf::hash_join hj_obj(right, has_nulls, compare_nulls, CUCO_DESIRED_LOAD_FACTOR, stream);
-  return hj_obj.full_join(left, std::nullopt, stream, mr);
+  return hj_obj.full_join(left, std::nullopt, stream, resources);
 }
 
 }  // namespace detail
@@ -112,10 +117,10 @@ inner_join(table_view const& left,
            table_view const& right,
            null_equality compare_nulls,
            rmm::cuda_stream_view stream,
-           rmm::device_async_resource_ref mr)
+           cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::inner_join(left, right, compare_nulls, stream, mr);
+  return detail::inner_join(left, right, compare_nulls, stream, resources);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -124,10 +129,10 @@ left_join(table_view const& left,
           table_view const& right,
           null_equality compare_nulls,
           rmm::cuda_stream_view stream,
-          rmm::device_async_resource_ref mr)
+          cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::left_join(left, right, compare_nulls, stream, mr);
+  return detail::left_join(left, right, compare_nulls, stream, resources);
 }
 
 std::pair<std::unique_ptr<rmm::device_uvector<size_type>>,
@@ -136,10 +141,10 @@ full_join(table_view const& left,
           table_view const& right,
           null_equality compare_nulls,
           rmm::cuda_stream_view stream,
-          rmm::device_async_resource_ref mr)
+          cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::full_join(left, right, compare_nulls, stream, mr);
+  return detail::full_join(left, right, compare_nulls, stream, resources);
 }
 
 }  // namespace cudf

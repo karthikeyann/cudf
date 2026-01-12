@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <cudf/copying.hpp>
@@ -45,7 +45,10 @@ bool has_nonempty_null_rows(cudf::column_view const& input, rmm::cuda_stream_vie
 
   auto const row_begin = thrust::counting_iterator<cudf::size_type>(0);
   auto const row_end   = row_begin + input.size();
-  return thrust::count_if(rmm::exec_policy(stream), row_begin, row_end, is_dirty_row) > 0;
+  return thrust::count_if(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
+                          row_begin,
+                          row_end,
+                          is_dirty_row) > 0;
 }
 
 }  // namespace
@@ -78,10 +81,12 @@ bool has_nonempty_nulls(cudf::column_view const& input, rmm::cuda_stream_view st
 
 std::unique_ptr<column> purge_nonempty_nulls(column_view const& input,
                                              rmm::cuda_stream_view stream,
-                                             rmm::device_async_resource_ref mr)
+                                             cudf::memory_resources resources)
 {
   // If not compound types (LIST/STRING/STRUCT/DICTIONARY) then just copy the input into output.
-  if (!cudf::is_compound(input.type())) { return std::make_unique<column>(input, stream, mr); }
+  if (!cudf::is_compound(input.type())) {
+    return std::make_unique<column>(input, stream, resources);
+  }
 
   // Implement via identity gather.
   auto gathered_table = cudf::detail::gather(table_view{{input}},
@@ -89,7 +94,7 @@ std::unique_ptr<column> purge_nonempty_nulls(column_view const& input,
                                              thrust::make_counting_iterator(input.size()),
                                              out_of_bounds_policy::DONT_CHECK,
                                              stream,
-                                             mr);
+                                             resources);
   return std::move(gathered_table->release().front());
 }
 
@@ -127,9 +132,9 @@ bool has_nonempty_nulls(column_view const& input, rmm::cuda_stream_view stream)
  */
 std::unique_ptr<cudf::column> purge_nonempty_nulls(column_view const& input,
                                                    rmm::cuda_stream_view stream,
-                                                   rmm::device_async_resource_ref mr)
+                                                   cudf::memory_resources resources)
 {
-  return detail::purge_nonempty_nulls(input, stream, mr);
+  return detail::purge_nonempty_nulls(input, stream, resources);
 }
 
 }  // namespace cudf

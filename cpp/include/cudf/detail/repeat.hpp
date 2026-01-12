@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -26,7 +26,7 @@ std::unique_ptr<table> repeat(table_view const& input_table,
                               column_view const& count,
                               bool check_count,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 /**
  * @copydoc cudf::repeat(table_view const&, size_type,
@@ -37,7 +37,7 @@ std::unique_ptr<table> repeat(table_view const& input_table,
 std::unique_ptr<table> repeat(table_view const& input_table,
                               size_type count,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 }  // namespace detail
 }  // namespace CUDF_EXPORT cudf

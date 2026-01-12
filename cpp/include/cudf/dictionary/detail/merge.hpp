@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -33,7 +33,7 @@ std::unique_ptr<column> merge(dictionary_column_view const& lcol,
                               dictionary_column_view const& rcol,
                               cudf::detail::index_vector const& row_order,
                               rmm::cuda_stream_view stream,
-                              rmm::device_async_resource_ref mr);
+                              cudf::memory_resources resources);
 
 }  // namespace dictionary::detail
 }  // namespace CUDF_EXPORT cudf

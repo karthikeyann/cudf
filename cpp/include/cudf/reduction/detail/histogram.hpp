@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -34,7 +34,7 @@ namespace reduction::detail {
 compute_row_frequencies(table_view const& input,
                         std::optional<column_view> const& partial_counts,
                         rmm::cuda_stream_view stream,
-                        rmm::device_async_resource_ref mr);
+                        cudf::memory_resources resources);
 
 /**
  * @brief Create an empty histogram column.

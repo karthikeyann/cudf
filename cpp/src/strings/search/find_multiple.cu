@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -27,7 +27,7 @@ namespace detail {
 std::unique_ptr<column> find_multiple(strings_column_view const& input,
                                       strings_column_view const& targets,
                                       rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
+                                      cudf::memory_resources resources)
 {
   auto const strings_count = input.size();
   auto const targets_count = targets.size();
@@ -50,11 +50,15 @@ std::unique_ptr<column> find_multiple(strings_column_view const& input,
   auto const total_count = static_cast<size_type>(total_elements);
 
   // create output column
-  auto results = make_numeric_column(
-    data_type{type_id::INT32}, total_count, rmm::device_buffer{0, stream, mr}, 0, stream, mr);
+  auto results = make_numeric_column(data_type{type_id::INT32},
+                                     total_count,
+                                     rmm::device_buffer{0, stream, mr},
+                                     0,
+                                     stream,
+                                     resources);
 
   // fill output column with position values
-  thrust::transform(rmm::exec_policy(stream),
+  thrust::transform(rmm::exec_policy_nosync(stream, resources.get_temporary_mr()),
                     thrust::make_counting_iterator<size_type>(0),
                     thrust::make_counting_iterator<size_type>(total_count),
                     results->mutable_view().begin<int32_t>(),
@@ -71,14 +75,14 @@ std::unique_ptr<column> find_multiple(strings_column_view const& input,
                                         numeric_scalar<size_type>(0, true, stream),
                                         numeric_scalar<size_type>(targets_count, true, stream),
                                         stream,
-                                        mr);
+                                        resources);
   return make_lists_column(strings_count,
                            std::move(offsets),
                            std::move(results),
                            0,
                            rmm::device_buffer{0, stream, mr},
                            stream,
-                           mr);
+                           resources);
 }
 
 }  // namespace detail
@@ -87,10 +91,10 @@ std::unique_ptr<column> find_multiple(strings_column_view const& input,
 std::unique_ptr<column> find_multiple(strings_column_view const& input,
                                       strings_column_view const& targets,
                                       rmm::cuda_stream_view stream,
-                                      rmm::device_async_resource_ref mr)
+                                      cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::find_multiple(input, targets, stream, mr);
+  return detail::find_multiple(input, targets, stream, resources);
 }
 
 }  // namespace strings

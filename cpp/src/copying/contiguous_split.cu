@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -1262,7 +1262,7 @@ std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> compute_splits(
 
   // compute sizes of each column in each partition, including alignment.
   thrust::transform(
-    rmm::exec_policy(stream, temp_mr),
+    rmm::exec_policy_nosync(stream, temp_mr),
     thrust::make_counting_iterator<std::size_t>(0),
     thrust::make_counting_iterator<std::size_t>(num_bufs),
     d_dst_buf_info,
@@ -1347,7 +1347,7 @@ std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> compute_splits(
     auto values =
       cudf::detail::make_counting_transform_iterator(0, buf_size_functor{d_dst_buf_info});
 
-    thrust::reduce_by_key(rmm::exec_policy(stream, temp_mr),
+    thrust::reduce_by_key(rmm::exec_policy_nosync(stream, temp_mr),
                           keys,
                           keys + num_bufs,
                           values,
@@ -1362,7 +1362,7 @@ std::unique_ptr<packed_partition_buf_size_and_dst_buf_info> compute_splits(
     auto values =
       cudf::detail::make_counting_transform_iterator(0, buf_size_functor{d_dst_buf_info});
 
-    thrust::exclusive_scan_by_key(rmm::exec_policy(stream, temp_mr),
+    thrust::exclusive_scan_by_key(rmm::exec_policy_nosync(stream, temp_mr),
                                   keys,
                                   keys + num_bufs,
                                   values,
@@ -1484,7 +1484,7 @@ std::unique_ptr<chunk_iteration_state> chunk_iteration_state::create(
         return i == num_bufs ? 0 : num_batches(i);
       }));
 
-  thrust::exclusive_scan(rmm::exec_policy(stream, temp_mr),
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, temp_mr),
                          buf_count_iter,
                          buf_count_iter + num_bufs + 1,
                          d_batch_offsets.begin(),
@@ -1493,7 +1493,7 @@ std::unique_ptr<chunk_iteration_state> chunk_iteration_state::create(
   auto const num_batches_iter =
     cudf::detail::make_counting_transform_iterator(0, num_batches_func{batches.begin()});
   size_type const num_batches = thrust::reduce(
-    rmm::exec_policy(stream, temp_mr), num_batches_iter, num_batches_iter + batches.size());
+    rmm::exec_policy_nosync(stream, temp_mr), num_batches_iter, num_batches_iter + batches.size());
 
   auto out_to_in_index = out_to_in_index_function{d_batch_offsets.begin(), num_bufs};
 
@@ -1503,7 +1503,7 @@ std::unique_ptr<chunk_iteration_state> chunk_iteration_state::create(
   rmm::device_uvector<dst_buf_info> d_batched_dst_buf_info(num_batches, stream, temp_mr);
 
   thrust::for_each(
-    rmm::exec_policy(stream, temp_mr),
+    rmm::exec_policy_nosync(stream, temp_mr),
     iter,
     iter + num_batches,
     [d_orig_dst_buf_info,
@@ -1620,7 +1620,7 @@ std::unique_ptr<chunk_iteration_state> chunk_iteration_state::create(
       auto const iter     = thrust::make_counting_iterator(num_batches_in_first_iteration);
       auto num_iterations = accum_size_per_iteration.size();
       thrust::for_each(
-        rmm::exec_policy(stream, temp_mr),
+        rmm::exec_policy_nosync(stream, temp_mr),
         iter,
         iter + num_batches - num_batches_in_first_iteration,
         [num_iterations,
@@ -1689,7 +1689,7 @@ std::unique_ptr<chunk_iteration_state> compute_batches(int num_bufs,
   // occupancy.
   rmm::device_uvector<cuda::std::pair<std::size_t, std::size_t>> batches(num_bufs, stream, temp_mr);
   thrust::transform(
-    rmm::exec_policy(stream, temp_mr),
+    rmm::exec_policy_nosync(stream, temp_mr),
     d_dst_buf_info,
     d_dst_buf_info + num_bufs,
     batches.begin(),
@@ -1804,7 +1804,7 @@ struct contiguous_split_state {
                          rmm::cuda_stream_view stream,
                          std::optional<rmm::device_async_resource_ref> mr,
                          rmm::device_async_resource_ref temp_mr)
-    : contiguous_split_state(input, {}, user_buffer_size, stream, mr, temp_mr)
+    : contiguous_split_state(input, {}, user_buffer_size, stream, resources, temp_mr)
   {
   }
 
@@ -1813,7 +1813,7 @@ struct contiguous_split_state {
                          rmm::cuda_stream_view stream,
                          std::optional<rmm::device_async_resource_ref> mr,
                          rmm::device_async_resource_ref temp_mr)
-    : contiguous_split_state(input, splits, 0, stream, mr, temp_mr)
+    : contiguous_split_state(input, splits, 0, stream, resources, temp_mr)
   {
   }
 
@@ -1856,7 +1856,7 @@ struct contiguous_split_state {
       cuda::proclaim_return_type<size_type>(
         [] __device__(dst_buf_info const& info) { return info.valid_count; }));
 
-    thrust::reduce_by_key(rmm::exec_policy(stream, temp_mr),
+    thrust::reduce_by_key(rmm::exec_policy_nosync(stream, temp_mr),
                           keys,
                           keys + num_batches_total,
                           values,
@@ -1963,7 +1963,7 @@ struct contiguous_split_state {
       std::transform(h_buf_sizes,
                      h_buf_sizes + num_partitions,
                      std::back_inserter(out_buffers),
-                     [stream = stream, mr = mr.value_or(cudf::get_current_device_resource_ref())](
+                     [stream = stream, mr = mr.value_or(resources.get_temporary_mr())](
                        std::size_t bytes) { return rmm::device_buffer{bytes, stream, mr}; });
     }
 
@@ -2088,12 +2088,12 @@ struct contiguous_split_state {
 std::vector<packed_table> contiguous_split(cudf::table_view const& input,
                                            std::vector<size_type> const& splits,
                                            rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr)
+                                           cudf::memory_resources resources)
 {
   // `temp_mr` is the same as `mr` for contiguous_split as it allocates all
   // of its memory from the default memory resource in cuDF
   auto temp_mr = mr;
-  auto state   = contiguous_split_state(input, splits, stream, mr, temp_mr);
+  auto state   = contiguous_split_state(input, splits, stream, resources, temp_mr);
   return state.contiguous_split();
 }
 
@@ -2102,10 +2102,10 @@ std::vector<packed_table> contiguous_split(cudf::table_view const& input,
 std::vector<packed_table> contiguous_split(cudf::table_view const& input,
                                            std::vector<size_type> const& splits,
                                            rmm::cuda_stream_view stream,
-                                           rmm::device_async_resource_ref mr)
+                                           cudf::memory_resources resources)
 {
   CUDF_FUNC_RANGE();
-  return detail::contiguous_split(input, splits, stream, mr);
+  return detail::contiguous_split(input, splits, stream, resources);
 }
 
 chunked_pack::chunked_pack(cudf::table_view const& input,

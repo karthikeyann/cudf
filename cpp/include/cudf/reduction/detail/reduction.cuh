@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2019-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -49,7 +49,7 @@ std::unique_ptr<scalar> reduce(InputIterator d_in,
                                op::simple_op<Op> op,
                                std::optional<OutputType> init,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr)
+                               cudf::memory_resources resources)
   requires(is_fixed_width<OutputType>() && not cudf::is_fixed_point<OutputType>())
 {
   auto const binary_op     = cudf::detail::cast_functor<OutputType>(op.get_binary_op());
@@ -90,7 +90,7 @@ std::unique_ptr<scalar> reduce(InputIterator d_in,
                                op::simple_op<Op> op,
                                std::optional<OutputType> init,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr)
+                               cudf::memory_resources resources)
   requires(is_fixed_point<OutputType>())
 {
   CUDF_FAIL(
@@ -107,7 +107,7 @@ std::unique_ptr<scalar> reduce(InputIterator d_in,
                                op::simple_op<Op> op,
                                std::optional<OutputType> init,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr)
+                               cudf::memory_resources resources)
   requires(std::is_same_v<OutputType, string_view>)
 {
   auto const binary_op     = cudf::detail::cast_functor<OutputType>(op.get_binary_op());
@@ -170,7 +170,7 @@ std::unique_ptr<scalar> reduce(InputIterator d_in,
                                cudf::size_type valid_count,
                                cudf::size_type ddof,
                                rmm::cuda_stream_view stream,
-                               rmm::device_async_resource_ref mr)
+                               cudf::memory_resources resources)
 {
   auto const binary_op     = cudf::detail::cast_functor<IntermediateType>(op.get_binary_op());
   auto const initial_value = op.template get_identity<IntermediateType>();
@@ -203,7 +203,7 @@ std::unique_ptr<scalar> reduce(InputIterator d_in,
   // compute the result value from intermediate value in device
   using ScalarType = cudf::scalar_type_t<OutputType>;
   auto result      = std::make_unique<ScalarType>(OutputType{0}, true, stream, mr);
-  thrust::for_each_n(rmm::exec_policy(stream),
+  thrust::for_each_n(rmm::exec_policy_nosync(stream),
                      intermediate_result.data(),
                      1,
                      [dres = result->data(), op, valid_count, ddof] __device__(auto i) {

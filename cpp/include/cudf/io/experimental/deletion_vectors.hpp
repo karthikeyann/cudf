@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -59,8 +59,8 @@ class chunked_parquet_reader {
     cudf::host_span<cuda::std::byte const> serialized_roaring64,
     cudf::host_span<size_t const> row_group_offsets,
     cudf::host_span<size_type const> row_group_num_rows,
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+    rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+    cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Constructor for the chunked reader
@@ -91,8 +91,8 @@ class chunked_parquet_reader {
     cudf::host_span<cuda::std::byte const> serialized_roaring64,
     cudf::host_span<size_t const> row_group_offsets,
     cudf::host_span<size_type const> row_group_num_rows,
-    rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+    rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+    cudf::memory_resources resources = cudf::get_current_device_resource_ref());
 
   /**
    * @brief Destructor, destroying the internal reader instance and the roaring bitmap deletion
@@ -161,8 +161,8 @@ table_with_metadata read_parquet(
   cudf::host_span<cuda::std::byte const> serialized_roaring64,
   cudf::host_span<size_t const> row_group_offsets,
   cudf::host_span<size_type const> row_group_num_rows,
-  rmm::cuda_stream_view stream      = cudf::get_default_stream(),
-  rmm::device_async_resource_ref mr = rmm::mr::get_current_device_resource_ref());
+  rmm::cuda_stream_view stream     = cudf::get_default_stream(),
+  cudf::memory_resources resources = rmm::mr::get_current_device_resource_ref());
 
 /** @} */  // end of group
 
