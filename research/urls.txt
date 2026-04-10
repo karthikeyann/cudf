@@ -1,0 +1,166 @@
+# ParPaRaw - Related Papers on CSV/Delimiter Parsing, GPU Parsing, and Raw Data Processing
+# Organized by: Main Paper | Cited By ParPaRaw | Citing ParPaRaw | Related
+
+# ============================================================================
+# MAIN PAPER
+# ============================================================================
+
+# [1] ParPaRaw: Massively Parallel Parsing of Delimiter-Separated Raw Data
+#     Stehle & Jacobsen, PVLDB 2020
+https://arxiv.org/pdf/1905.13415
+
+# ============================================================================
+# CITED BY ParPaRaw (CSV/parsing-relevant references from the paper)
+# ============================================================================
+
+# [2] NoDB: Efficient Query Execution on Raw Data Files
+#     Alagiannis, Borovica, Branco, Idreos, Ailamaki — SIGMOD 2012
+https://15799.courses.cs.cmu.edu/fall2013/static/papers/NoDBsigmod2012.pdf
+
+# [3] Speculative Distributed CSV Data Parsing for Big Data Analytics
+#     Ge, Li, Eilebrecht, Chandramouli, Kossmann — SIGMOD 2019
+https://badrish.net/papers/dp-sigmod19.pdf
+
+# [4] Instant Loading for Main Memory Databases
+#     Muhlbauer, Rodiger, Seilbeck, Reiser, Kemper, Neumann — PVLDB 2013
+https://www.vldb.org/pvldb/vol6/p1702-muehlbauer.pdf
+
+# [5] Filter Before You Parse: Faster Analytics on Raw Data with Sparser
+#     Palkar, Abuzaid, Bailis, Zaharia — PVLDB 2018
+https://www.vldb.org/pvldb/vol11/p1576-palkar.pdf
+
+# [6] Mison: A Fast JSON Parser for Data Analytics
+#     Li, Katsipoulakis, Chandramouli, Goldstein, Kossmann — PVLDB 2017
+http://www.vldb.org/pvldb/vol10/p1118-li.pdf
+
+# [7] FAD.js: Fast JSON Data Access Using JIT-based Speculative Optimizations
+#     Bonetta & Brantner — PVLDB 2017
+https://vldb.org/pvldb/vol10/p1778-bonetta.pdf
+
+# [8] Parsing Gigabytes of JSON per Second (simdjson)
+#     Langdale & Lemire — VLDB Journal 2019
+https://arxiv.org/pdf/1902.08318
+
+# [9] FishStore: Fast Ingestion and Indexing of Raw Data
+#     Chandramouli, Xie, Li, Kossmann — PVLDB 2019
+http://www.vldb.org/pvldb/vol12/p1922-chandramouli.pdf
+
+# [10] Data-Parallel Finite-State Machines
+#      Mytkowicz, Musuvathi, Schulte — ASPLOS 2014
+https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/asplos302-mytkowicz.pdf
+
+# [11] Single-pass Parallel Prefix Scan with Decoupled Look-back
+#      Merrill & Garland — NVIDIA Technical Report 2016
+https://research.nvidia.com/sites/default/files/pubs/2016-03_Single-pass-Parallel-Prefix/nvr-2016-002.pdf
+
+# [12] Parallel In-Situ Data Processing with Speculative Loading (SCANRAW)
+#      Cheng & Rusu — SIGMOD 2014
+https://faculty.ucmerced.edu/frusu/Papers/Conference/2014-sigmod-scanraw.pdf
+
+# [13] DBMS Data Loading: An Analysis on Modern Hardware
+#      Dziedzic, Karpathiotakis, Alagiannis, Appuswamy, Ailamaki — DaMoN/ADMS 2016
+https://adam-dziedzic.com/static/assets/papers/dziedzic_adms16_data_loading.pdf
+
+# [14] ReCache: Reactive Caching for Fast Analytics over Heterogeneous Data
+#      Azim, Karpathiotakis, Ailamaki — PVLDB 2017
+https://www.vldb.org/pvldb/vol11/p324-azim.pdf
+
+# [15] Scans as Primitive Parallel Operations
+#      Blelloch — IEEE Trans. Computers 1989
+#      (no free PDF found — IEEE paywall)
+
+# [16] Data Parallel Algorithms
+#      Hillis & Steele — CACM 1986
+#      (no free PDF found — ACM paywall)
+
+# [17] Here Are My Data Files. Here Are My Queries. Where Are My Results?
+#      Idreos, Alagiannis, Johnson, Ailamaki — CIDR 2011
+#      (no free PDF found)
+
+# [18] Fast Queries Over Heterogeneous Data Through Engine Customization
+#      Karpathiotakis, Alagiannis, Ailamaki — PVLDB 2016
+#      (available via VLDB but no direct PDF URL confirmed)
+
+# [19] Adaptive Query Processing on Raw Data
+#      Karpathiotakis, Branco, Alagiannis, Ailamaki — PVLDB 2014
+#      (available via VLDB but no direct PDF URL confirmed)
+
+# [20] On Parsing Context Free Languages in Parallel Environments
+#      Fischer — Cornell TR 1975
+https://ecommons.cornell.edu/handle/1813/7121
+
+# [21] Vertical Partitioning for Query Processing over Raw Data
+#      Zhao, Cheng, Rusu — SSDBM 2015
+#      (no free PDF found)
+
+# [22] Parallel Data Analysis Directly on Scientific File Formats
+#      Blanas, Wu, Byna, Dong, Shoshani — SIGMOD 2014
+#      (no free PDF found)
+
+# ============================================================================
+# PAPERS CITING ParPaRaw (later work building on it)
+# ============================================================================
+
+# [23] Fast CSV Loading Using GPUs and RDMA for In-Memory Data Processing
+#      Kumaigorodski, Lutz, Markl — BTW 2021 (Best Paper)
+https://dl.gi.de/bitstreams/d90ece98-9fbe-49af-8778-57595f108478/download
+
+# [24] GpJSON: High-Performance JSON Data Processing on GPUs
+#      Talluri, Di Donato, Danelutti, Vlaswinkel, Arnaboldi, Delamare, Santambrogio, Bonetta — PVLDB 2025
+https://www.vldb.org/pvldb/vol18/p3216-bonetta.pdf
+
+# [25] SheetReader: Efficient Specialized Spreadsheet Parsing
+#      Gavriilidis, Henze, Zacharatou, Markl — Information Systems 2023
+https://arxiv.org/pdf/2202.13189
+
+# [26] PipeJSON: Parsing JSON at Line Speed on FPGAs
+#      DaMoN 2022
+#      (ACM paywall — https://dl.acm.org/doi/10.1145/3533737.3535094)
+
+# ============================================================================
+# RELATED (found through citation graph, relevant to CSV/GPU parsing)
+# ============================================================================
+
+# [27] Scalable Structural Index Construction for JSON Analytics (Pison)
+#      Jiang, Qiu, Zhao — PVLDB 2021
+https://vldb.org/pvldb/vol14/p694-zhao.pdf
+
+# [28] FishStore: Faster Ingestion with Subset Hashing
+#      Chandramouli et al. — SIGMOD 2019
+https://badrish.net/papers/fishstore-sigmod19.pdf
+
+# [29] On-demand JSON: A better way to parse documents?
+#      Keiser et al. — Software: Practice and Experience 2024
+#      (Wiley paywall)
+
+# [30] Raw Filtering of JSON Data on FPGAs
+#      2022
+https://arxiv.org/pdf/2205.05464
+
+# [31] Blog on GPU parsing
+#      2018
+https://raphlinus.github.io/personal/2018/05/10/toward-gpu-json-parsing.html
+
+# [32] cuJSON: A Highly Parallel JSON Parser for GPUs
+#      Vedadi Gargary, Safari Loaliyan, Zhao — UC Riverside
+#      (from ~/Downloads)
+
+# [33] Massively Parallel Algorithms for Data Ingestion on New Hardware (PhD Thesis)
+#      Elias Stehle — TU Munich 2020 (ParPaRaw author's full dissertation)
+#      (from ~/Downloads)
+
+# [34] JSONSki: Streaming Semi-structured Data with Bit-Parallel Fast-Forwarding
+#      Jiang & Zhao — UC Riverside
+#      (from ~/Downloads)
+
+# [35] Scalable Data-Parallel Processing of Semi-Structured Data (PhD Dissertation)
+#      Lin Jiang — UC Riverside 2021 (Pison/JSONSki author)
+#      (from ~/Downloads)
+
+# [36] Parsing Millions of DNS Records Per Second (simdzone)
+#      Koekkoek & Lemire — Software: Practice and Experience 2024
+#      (from ~/Downloads)
+
+# [37] GPU-based JSON Data Processing Using Structural Indexes (MSc Thesis)
+#      Vlaswinkel — TU Eindhoven 2021 (GpJSON precursor)
+#      (from ~/Downloads)
