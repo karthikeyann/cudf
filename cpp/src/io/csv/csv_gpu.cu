@@ -1197,8 +1197,9 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   int actual_col  = 0;
   // Unstaged rows: reuse loaded words across fields and pass them on to integer parsing
   cuda::std::conditional_t<WindowedIntegers, caching_word_reader, direct_word_reader> words{};
-  // Staged rows only: in the unstaged instance the extra code costs more registers than it saves
-  bool const plain_ints = not WindowedIntegers and plain_digits_parse(options);
+  // Staged rows only: the word loads need the staging slack, and in the unstaged instance the
+  // extra code costs more registers than it saves
+  bool const plain_ints = not WindowedIntegers and is_staged and plain_digits_parse(options);
 
   while (col < column_flags.size() && field_start < row_end) {
     // In delim_whitespace mode, collapse leading delimiter runs so leading whitespace does

@@ -675,8 +675,9 @@ struct field_window {
  * @brief `parse_numeric<T, base>(begin, end, opts)`, reading a field of up to 32 bytes (counted
  * from the aligned word that contains `begin`) from registers.
  *
- * The words come from `window` if it covers the field; otherwise at most four aligned words that
- * contain a character of `[begin, end)` are loaded.
+ * The words come from `window` if it covers the field (words the caller already loaded from
+ * within the buffer); otherwise the field is parsed in place. Loading the aligned words that
+ * contain the field here could read outside the buffer at its ends.
  */
 template <typename T, int base = 10>
 __device__ __forceinline__ cuda::std::optional<T> parse_numeric_windowed(
@@ -694,18 +695,7 @@ __device__ __forceinline__ cuda::std::optional<T> parse_numeric_windowed(
     last.pos  = first.pos + static_cast<int>(length);
     return parse_numeric<T, base>(first, last, opts);
   }
-  auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(begin) & 7);
-  if (length <= 0 || offset + length > 32) { return parse_numeric<T, base>(begin, end, opts); }
-  auto const words     = reinterpret_cast<uint64_t const*>(begin - offset);
-  auto const num_words = (offset + static_cast<int>(length) + 7) / 8;
-  field_window_iterator first{words[0],
-                              num_words > 1 ? words[1] : 0,
-                              num_words > 2 ? words[2] : 0,
-                              num_words > 3 ? words[3] : 0,
-                              offset};
-  auto last = first;
-  last.pos  = offset + static_cast<int>(length);
-  return parse_numeric<T, base>(first, last, opts);
+  return parse_numeric<T, base>(begin, end, opts);
 }
 
 struct ConvertFunctor {
