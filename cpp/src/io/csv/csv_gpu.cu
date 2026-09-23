@@ -228,6 +228,7 @@ struct direct_word_reader {
   {
     return *begin;
   }
+  __device__ __forceinline__ char at(char const* pos) const { return *pos; }
   __device__ __forceinline__ uint64_t load(char const* word_begin)
   {
     return *reinterpret_cast<uint64_t const*>(word_begin);
@@ -249,6 +250,19 @@ struct caching_word_reader {
     window.base =
       reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(begin) & ~uintptr_t{7});
     window.count = 0;
+  }
+  /// `*pos`, from the current field's words when they hold it
+  __device__ __forceinline__ char at(char const* pos) const
+  {
+    auto const offset = pos - window.base;
+    if (window.base != nullptr && offset >= 0 && offset < 8 * window.count) {
+      auto const word = offset < 8    ? window.w0
+                        : offset < 16 ? window.w1
+                        : offset < 24 ? window.w2
+                                      : window.w3;
+      return static_cast<char>(word >> (8 * (offset & 7)));
+    }
+    return *pos;
   }
   /// `*begin`, read through the word cache when the word lies within `[data_begin, end)`
   __device__ __forceinline__ char first_char(char const* begin,
@@ -745,6 +759,61 @@ __device__ __forceinline__ cuda::std::pair<char const*, char const*> unescape_do
   return {out, out_it};
 }
 
+/**
+ * @brief `serialized_trie_contains(trie, {key, key_len})`, reading the key through `words.at`
+ */
+template <typename WordReader>
+__device__ __forceinline__ bool trie_contains(device_span<cudf::detail::serial_trie_node const> trie,
+                                             char const* key,
+                                             size_t key_len,
+                                             WordReader const& words)
+{
+  if (trie.empty()) { return false; }
+  if (key_len == 0) { return trie.front().is_leaf; }
+  // The root node holds the longest key length (negative if unknown)
+  auto const max_key_length = trie.front().children_offset;
+  if (max_key_length >= 0 && key_len > static_cast<size_t>(max_key_length)) { return false; }
+  auto curr_node = trie.begin() + 1;
+  for (auto curr_key = key; curr_key < key + key_len; ++curr_key) {
+    // Don't jump away from root node
+    if (curr_key != key) {
+      // A node without children cannot match a longer key
+      if (curr_node->children_offset < 0) { return false; }
+      curr_node += curr_node->children_offset;
+    }
+    auto const c = words.at(curr_key);
+    // Nodes are sorted - terminate search if the node is larger or equal
+    while (curr_node->character != cudf::detail::trie_terminating_character &&
+           curr_node->character < c) {
+      ++curr_node;
+    }
+    if (curr_node->character != c) { return false; }
+  }
+  return curr_node->is_leaf;
+}
+
+/**
+ * @brief `trim_whitespaces_quotes(begin, end, quotechar)`, reading characters through `words.at`
+ * (including the characters just outside the range that the original also reads)
+ */
+template <typename WordReader>
+__device__ __forceinline__ cuda::std::pair<char const*, char const*> trim_whitespaces_quotes_at(
+  char const* begin, char const* end, char quotechar, WordReader const& words)
+{
+  auto trim_begin = begin;
+  while (trim_begin != end && is_whitespace(words.at(trim_begin))) {
+    ++trim_begin;
+  }
+  auto trim_end = end;
+  while (trim_end != trim_begin && is_whitespace(words.at(trim_end - 1))) {
+    --trim_end;
+  }
+  auto const trimmed_begin = trim_begin + (words.at(trim_begin) == quotechar);
+  auto const trimmed_end   = trim_end - (words.at(trim_end - 1) == quotechar);
+  // A lone quote character would otherwise be skipped from both ends, leaving end < begin
+  return {trimmed_begin, cuda::std::max(trimmed_begin, trimmed_end)};
+}
+
 template <bool WindowedIntegers, typename WordReader>
 __device__ __forceinline__ ConvertFunctor make_convert_functor(WordReader const& words)
 {
@@ -869,14 +938,25 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
       ++actual_col;
     } else if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
-      auto const is_valid = !serialized_trie_contains(
-        options.trie_na, {field_start, static_cast<size_t>(next_delimiter - field_start)});
+      // Unstaged rows read the field's characters from the words the seek already loaded
+      auto const field_len = static_cast<size_t>(next_delimiter - field_start);
+      bool is_valid        = false;
+      if constexpr (WindowedIntegers) {
+        is_valid = !trie_contains(options.trie_na, field_start, field_len, words);
+      } else {
+        is_valid = !serialized_trie_contains(options.trie_na, {field_start, field_len});
+      }
 
       // Modify field_start & end to ignore whitespace and quotechars
       auto field_end = next_delimiter;
       if (is_valid && dtypes[actual_col].id() != cudf::type_id::STRING) {
-        auto const trimmed_field =
-          trim_whitespaces_quotes(field_start, field_end, options.quotechar);
+        auto const trimmed_field = [&] {
+          if constexpr (WindowedIntegers) {
+            return trim_whitespaces_quotes_at(field_start, field_end, options.quotechar, words);
+          } else {
+            return trim_whitespaces_quotes(field_start, field_end, options.quotechar);
+          }
+        }();
         field_start = trimmed_field.first;
         field_end   = trimmed_field.second;
       }
@@ -889,8 +969,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
             if (not options.detect_whitespace_around_quotes) {
               // A lone quote character is not a quoted (empty) string: stripping it would leave
               // a negative length
-              if (end - field_start >= 2 && (*field_start == options.quotechar) &&
-                  (*(end - 1) == options.quotechar)) {
+              if (end - field_start >= 2 && (words.at(field_start) == options.quotechar) &&
+                  (words.at(end - 1) == options.quotechar)) {
                 ++field_start;
                 --end;
                 was_quoted = true;
