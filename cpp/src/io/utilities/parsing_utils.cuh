@@ -662,17 +662,39 @@ struct field_window_iterator {
 };
 
 /**
+ * @brief Up to four consecutive aligned 8-byte words of the input, starting at `base`, that a
+ * caller has already loaded (e.g. while searching for the end of the field)
+ */
+struct field_window {
+  char const* base = nullptr;
+  uint64_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+  int count = 0;  ///< Number of valid words
+};
+
+/**
  * @brief `parse_numeric<T, base>(begin, end, opts)`, reading a field of up to 32 bytes (counted
- * from the aligned word that contains `begin`) with at most four word loads.
+ * from the aligned word that contains `begin`) from registers.
  *
- * Only aligned words that contain a character of `[begin, end)` are loaded.
+ * The words come from `window` if it covers the field; otherwise at most four aligned words that
+ * contain a character of `[begin, end)` are loaded.
  */
 template <typename T, int base = 10>
 __device__ __forceinline__ cuda::std::optional<T> parse_numeric_windowed(
-  char const* begin, char const* end, parse_options_view const& opts)
+  char const* begin,
+  char const* end,
+  parse_options_view const& opts,
+  field_window const& window = field_window{})
 {
-  auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(begin) & 7);
   auto const length = end - begin;
+  if (length > 0 && window.base != nullptr && begin >= window.base &&
+      end <= window.base + 8 * window.count) {
+    field_window_iterator first{
+      window.w0, window.w1, window.w2, window.w3, static_cast<int>(begin - window.base)};
+    auto last = first;
+    last.pos  = first.pos + static_cast<int>(length);
+    return parse_numeric<T, base>(first, last, opts);
+  }
+  auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(begin) & 7);
   if (length <= 0 || offset + length > 32) { return parse_numeric<T, base>(begin, end, opts); }
   auto const words     = reinterpret_cast<uint64_t const*>(begin - offset);
   auto const num_words = (offset + static_cast<int>(length) + 7) / 8;
@@ -690,6 +712,8 @@ struct ConvertFunctor {
   /// Parse integers from registers (`parse_numeric_windowed`); pays off when the field is in
   /// global memory, not when it is already in shared memory
   bool windowed_integers = false;
+  /// Already loaded words of the field, used by `windowed_integers` parsing when they cover it
+  field_window window{};
 
   /**
    * @brief Dispatch for numeric types whose values can be convertible to
@@ -715,8 +739,8 @@ struct ConvertFunctor {
       if (serialized_trie_contains(opts.trie_true, {begin, field_len})) { return 1; }
       if (serialized_trie_contains(opts.trie_false, {begin, field_len})) { return 0; }
       if (windowed_integers) {
-        return as_hex ? cudf::io::parse_numeric_windowed<T, 16>(begin, end, opts)
-                      : cudf::io::parse_numeric_windowed<T>(begin, end, opts);
+        return as_hex ? cudf::io::parse_numeric_windowed<T, 16>(begin, end, opts, window)
+                      : cudf::io::parse_numeric_windowed<T>(begin, end, opts, window);
       }
       return as_hex ? cudf::io::parse_numeric<T, 16>(begin, end, opts)
                     : cudf::io::parse_numeric<T>(begin, end, opts);

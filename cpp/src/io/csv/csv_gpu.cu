@@ -216,25 +216,109 @@ __device__ __forceinline__ void set_valid_warp_aggregated(cudf::bitmask_type* va
  *
  * In thread-per-row kernels each thread streams through its own row, so byte-wise loads issue
  * one memory transaction per character per thread; word loads cut that by up to 8x.
+ *
+ * If `may_have_quote_pair` is given, it is set to false only when the field starts with a quote
+ * and no two adjacent characters of `[begin, field end)` are both quote characters (so the
+ * field has no escaped quotes to unescape); otherwise it is set to true.
  */
-__device__ __forceinline__ char const* seek_field_end_by_words(char const* begin,
-                                                               char const* end,
-                                                               char const* data_begin,
-                                                               parse_options_view const& opts)
+/// Word source of `seek_field_end_by_words` that loads every word
+struct direct_word_reader {
+  __device__ __forceinline__ void start_field(char const*) {}
+  __device__ __forceinline__ char first_char(char const* begin, char const*, char const*)
+  {
+    return *begin;
+  }
+  __device__ __forceinline__ uint64_t load(char const* word_begin)
+  {
+    return *reinterpret_cast<uint64_t const*>(word_begin);
+  }
+};
+
+/**
+ * @brief Word source of `seek_field_end_by_words` for one thread's row that reuses the last
+ * loaded word (the word holding a field's end usually also holds the next field's start) and
+ * keeps the first words of the current field for parsing (`window`).
+ */
+struct caching_word_reader {
+  char const* cached_begin = nullptr;
+  uint64_t cached          = 0;
+  cudf::io::field_window window{};
+
+  __device__ __forceinline__ void start_field(char const* begin)
+  {
+    window.base =
+      reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(begin) & ~uintptr_t{7});
+    window.count = 0;
+  }
+  /// `*begin`, read through the word cache when the word lies within `[data_begin, end)`
+  __device__ __forceinline__ char first_char(char const* begin,
+                                             char const* data_begin,
+                                             char const* end)
+  {
+    auto const word_begin =
+      reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(begin) & ~uintptr_t{7});
+    if (word_begin >= data_begin && word_begin + 8 <= end) {
+      return static_cast<char>(load(word_begin) >> (8 * (begin - word_begin)));
+    }
+    return *begin;
+  }
+  __device__ __forceinline__ uint64_t load(char const* word_begin)
+  {
+    if (word_begin != cached_begin) {
+      cached       = *reinterpret_cast<uint64_t const*>(word_begin);
+      cached_begin = word_begin;
+    }
+    // Only words that continue the window without a gap are kept
+    if (window.count < 4 && word_begin == window.base + 8 * window.count) {
+      if (window.count == 0) { window.w0 = cached; }
+      if (window.count == 1) { window.w1 = cached; }
+      if (window.count == 2) { window.w2 = cached; }
+      if (window.count == 3) { window.w3 = cached; }
+      ++window.count;
+    }
+    return cached;
+  }
+};
+
+template <typename WordReader = direct_word_reader>
+__device__ __forceinline__ char const* seek_field_end_by_words(
+  char const* begin,
+  char const* end,
+  char const* data_begin,
+  parse_options_view const& opts,
+  bool* may_have_quote_pair = nullptr,
+  WordReader&& words        = WordReader{})
 {
+  words.start_field(begin);
+  if (may_have_quote_pair != nullptr) { *may_have_quote_pair = true; }
   if (opts.multi_delimiter) { return cudf::io::gpu::seek_field_end(begin, end, opts); }
 
-  bool const field_starts_with_quote = (begin < end && *begin == opts.quotechar);
-  bool quotation                     = false;
+  bool const field_starts_with_quote =
+    (begin < end && words.first_char(begin, data_begin, end) == opts.quotechar);
+  bool quotation         = false;
+  bool previous_is_quote = false;
+  bool quote_pair        = false;
   // Returns true if the field ends at character `c`, located at `pos`
   auto const ends_field = [&](char c, char const* pos) {
-    if (field_starts_with_quote && c == opts.quotechar) {
-      quotation = !quotation;
-      return false;
+    if (field_starts_with_quote) {
+      if (c == opts.quotechar) {
+        quote_pair        = quote_pair || previous_is_quote;
+        previous_is_quote = true;
+        quotation         = !quotation;
+        return false;
+      }
+      previous_is_quote = false;
     }
     if (quotation) { return false; }
     return c == opts.delimiter || c == opts.terminator ||
            (c == '\r' && pos + 1 < end && pos[1] == '\n');
+  };
+
+  auto const field_end = [&](char const* pos) {
+    if (may_have_quote_pair != nullptr) {
+      *may_have_quote_pair = !field_starts_with_quote || quote_pair;
+    }
+    return pos;
   };
 
   auto current = begin;
@@ -243,12 +327,12 @@ __device__ __forceinline__ char const* seek_field_end_by_words(char const* begin
       reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(current) & ~uintptr_t{7});
     // Words must lie within [data_begin, end); the data buffer itself need not be aligned
     if (word_begin >= data_begin && word_begin + 8 <= end) {
-      auto const word  = *reinterpret_cast<uint64_t const*>(word_begin);
+      auto const word  = words.load(word_begin);
       auto const first = static_cast<int>(current - word_begin);
       if (field_starts_with_quote) {
         for (auto i = first; i < 8; ++i) {
           if (ends_field(static_cast<char>(word >> (8 * i)), word_begin + i)) {
-            return word_begin + i;
+            return field_end(word_begin + i);
           }
         }
       } else {
@@ -265,18 +349,18 @@ __device__ __forceinline__ char const* seek_field_end_by_words(char const* begin
         while (candidates != 0) {
           auto const i = (__ffsll(static_cast<long long>(candidates)) - 1) / 8;
           if (ends_field(static_cast<char>(word >> (8 * i)), word_begin + i)) {
-            return word_begin + i;
+            return field_end(word_begin + i);
           }
           candidates &= candidates - 1;
         }
       }
       current = word_begin + 8;
     } else {
-      if (ends_field(*current, current)) { return current; }
+      if (ends_field(*current, current)) { return field_end(current); }
       ++current;
     }
   }
-  return current;
+  return field_end(current);
 }
 }  // namespace
 
@@ -661,6 +745,16 @@ __device__ __forceinline__ cuda::std::pair<char const*, char const*> unescape_do
   return {out, out_it};
 }
 
+template <bool WindowedIntegers, typename WordReader>
+__device__ __forceinline__ ConvertFunctor make_convert_functor(WordReader const& words)
+{
+  if constexpr (WindowedIntegers) {
+    return ConvertFunctor{true, words.window};
+  } else {
+    return ConvertFunctor{false};
+  }
+}
+
 /**
  * @brief Cooperatively copies the contiguous character span covering this block's rows into
  * shared memory, so per-row parsing reads shared memory instead of scattered global loads.
@@ -757,6 +851,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   auto next_field = field_start;
   int col         = 0;
   int actual_col  = 0;
+  // Unstaged rows: reuse loaded words across fields and pass them on to integer parsing
+  cuda::std::conditional_t<WindowedIntegers, caching_word_reader, direct_word_reader> words{};
 
   while (col < column_flags.size() && field_start < row_end) {
     // In delim_whitespace mode, collapse leading delimiter runs so leading whitespace does
@@ -764,7 +860,9 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, options);
     if (field_start >= row_end) break;
     next_field          = field_start;
-    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, options);
+    bool may_have_quote_pair = true;
+    auto next_delimiter      = seek_field_end_by_words(
+      field_start, row_end, raw_csv, options, &may_have_quote_pair, words);
 
     if (column_flags[col] & column_parse::predecoded) {
       // Already decoded during type inference
@@ -814,7 +912,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           // Strings reference the global data buffer, not the staged copy
           auto global_start = to_global(field_start);
           auto global_end   = to_global(end);
-          if (was_quoted && unescape_buffer != nullptr) {
+          // The seek already rules out escaped quotes in most quoted fields
+          if (was_quoted && may_have_quote_pair && unescape_buffer != nullptr) {
             auto const unescaped =
               unescape_doublequotes(global_start,
                                     global_end,
@@ -828,7 +927,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           str_list[rec_id].second = global_end - global_start;
         } else {
           if (cudf::type_dispatcher(dtypes[actual_col],
-                                    ConvertFunctor{WindowedIntegers},
+                                    make_convert_functor<WindowedIntegers>(words),
                                     field_start,
                                     field_end,
                                     columns[actual_col],
