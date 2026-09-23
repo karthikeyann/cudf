@@ -222,6 +222,33 @@ void erase_except_last(C& container, cuda::stream_ref stream)
   container.resize(1, stream);
 }
 
+/**
+ * @brief Reads a small range of the source into host memory.
+ *
+ * Sources that prefer device reads (e.g. device buffers) serve `host_read` with a pageable
+ * device-to-host copy, which costs hundreds of microseconds even for a few bytes. Such sources are
+ * read to device memory instead and copied back through a pinned buffer.
+ *
+ * @return Number of bytes read
+ */
+size_t read_to_host(cudf::io::datasource* source,
+                    size_t offset,
+                    size_t size,
+                    uint8_t* dst,
+                    cuda::stream_ref stream)
+{
+  if (size == 0) { return 0; }
+  if (not source->is_device_read_preferred(size)) { return source->host_read(offset, size, dst); }
+  rmm::device_uvector<uint8_t> d_buffer(size, stream);
+  auto const bytes_read = source->device_read(offset, size, d_buffer.data(), stream);
+  auto h_buffer         = cudf::detail::make_pinned_vector_async<uint8_t>(bytes_read, stream);
+  cudf::detail::cuda_memcpy(host_span<uint8_t>{h_buffer.data(), bytes_read},
+                            device_span<uint8_t const>{d_buffer.data(), bytes_read},
+                            stream);
+  std::copy(h_buffer.begin(), h_buffer.end(), dst);
+  return bytes_read;
+}
+
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 [[nodiscard]] bool has_utf8_bom(host_span<char const> data)
 {
@@ -460,9 +487,11 @@ data_and_row_offsets load_data_and_gather_row_offsets(
                 data->begin() + byte_range_offset + header_end,
                 header.begin());
     } else {
-      source->host_read(header_start + byte_range_offset,
-                        header_end - header_start,
-                        reinterpret_cast<uint8_t*>(header.data()));
+      read_to_host(source,
+                   header_start + byte_range_offset,
+                   header_end - header_start,
+                   reinterpret_cast<uint8_t*>(header.data()),
+                   stream);
     }
     if (header_rows > 0) { row_offsets.erase_first_n(header_rows); }
   }
@@ -516,9 +545,11 @@ data_and_row_offsets select_data_and_row_offsets(
     if (has_utf8_bom(*h_data)) { data_start_offset += sizeof(UTF8_BOM); }
   } else {
     if (range_offset == 0) {
-      auto bom_buffer = source->host_read(0, std::min<size_t>(source->size(), sizeof(UTF8_BOM)));
-      auto bom_chars  = host_span<char const>{reinterpret_cast<char const*>(bom_buffer->data()),
-                                              bom_buffer->size()};
+      std::array<uint8_t, sizeof(UTF8_BOM)> bom_buffer{};
+      auto const bom_size = read_to_host(
+        source, 0, std::min<size_t>(source->size(), sizeof(UTF8_BOM)), bom_buffer.data(), stream);
+      auto bom_chars =
+        host_span<char const>{reinterpret_cast<char const*>(bom_buffer.data()), bom_size};
       if (has_utf8_bom(bom_chars)) { data_start_offset += sizeof(UTF8_BOM); }
     } else {
       auto find_data_start_chunk_size = 1024ul;
