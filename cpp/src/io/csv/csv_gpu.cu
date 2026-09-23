@@ -181,6 +181,27 @@ __device__ __forceinline__ void warp_aggregated_increment(T* counters, int idx)
 }
 
 /**
+ * @brief Marks row `rec_id` of a column as valid and counts it, aggregated across the warp.
+ *
+ * A warp covers 32 consecutive, word-aligned rows (the grid is 1D with a multiple-of-32 block
+ * size), so all lanes that mark the same column target the same bitmask word, with bit == lane.
+ * One lane per column sets all of their bits and adds their count with a single atomic each.
+ */
+__device__ __forceinline__ void set_valid_warp_aggregated(cudf::bitmask_type* valid_mask,
+                                                          size_type* valid_count,
+                                                          int column,
+                                                          size_type rec_id)
+{
+  static_assert(csvparse_block_dim % cudf::detail::warp_size == 0);
+  auto const peers  = __match_any_sync(__activemask(), column);
+  auto const leader = __ffs(peers) - 1;
+  if (static_cast<int>(threadIdx.x % cudf::detail::warp_size) == leader) {
+    atomicOr(&valid_mask[cudf::word_index(rec_id)], peers);
+    atomicAdd(valid_count, static_cast<size_type>(__popc(peers)));
+  }
+}
+
+/**
  * @brief Equivalent of `cudf::io::gpu::seek_field_end` (without escape characters) that reads the
  * row in aligned 8-byte words instead of one character at a time.
  *
@@ -621,8 +642,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                     options,
                                     column_flags[col] & column_parse::as_hexadecimal)) {
             // set the valid bitmap - all bits were set to 0 to start
-            set_bit(valids[actual_col], rec_id);
-            warp_aggregated_increment(valid_counts.data(), actual_col);
+            set_valid_warp_aggregated(
+              valids[actual_col], &valid_counts[actual_col], actual_col, rec_id);
           }
         }
       } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
