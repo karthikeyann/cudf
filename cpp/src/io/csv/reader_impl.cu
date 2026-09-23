@@ -1339,6 +1339,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
                  "Specify names of all columns in the file, or names of all selected columns");
 
     for (auto const index : unique_use_cols_indexes) {
+      CUDF_EXPECTS(index >= 0 && index < num_actual_columns,
+                   "Selected column index is out of range",
+                   std::out_of_range);
       column_flags[index] = column_parse::enabled | column_parse::inferred;
       if (are_opts_col_names_used) {
         column_names[index] = reader_opts.get_names()[num_active_columns];
@@ -1363,8 +1366,11 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   // User can specify which columns should be read as datetime
   if (!reader_opts.get_parse_dates_indexes().empty() ||
       !reader_opts.get_parse_dates_names().empty()) {
+    // Like names that match no column, indexes that match no column are ignored
     for (auto const index : reader_opts.get_parse_dates_indexes()) {
-      column_flags[index] |= column_parse::as_datetime;
+      if (index >= 0 && index < num_actual_columns) {
+        column_flags[index] |= column_parse::as_datetime;
+      }
     }
 
     for (auto const& name : reader_opts.get_parse_dates_names()) {
@@ -1378,7 +1384,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   // User can specify which columns should be parsed as hexadecimal
   if (!reader_opts.get_parse_hex_indexes().empty() || !reader_opts.get_parse_hex_names().empty()) {
     for (auto const index : reader_opts.get_parse_hex_indexes()) {
-      column_flags[index] |= column_parse::as_hexadecimal;
+      if (index >= 0 && index < num_actual_columns) {
+        column_flags[index] |= column_parse::as_hexadecimal;
+      }
     }
 
     for (auto const& name : reader_opts.get_parse_hex_names()) {
