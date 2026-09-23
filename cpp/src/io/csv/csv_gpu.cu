@@ -1324,23 +1324,31 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          int delimiter,
                          int quotechar,
                          int commentchar,
+                         uint32_t num_tiles,
                          tile_transition* tile_transitions,
                          uint8_t const* start_states,
+                         uint32_t const* redo_tiles,
+                         uint32_t const* redo_count,
                          blank_row_chars blank_chars,
                          uint64_t* tile_kept_rows,
                          uint32_t* row_bitmaps)
 {
-  __shared__ uint64_t bk_ctxtree[bk_ctxtree_size];
-  uint32_t const t    = threadIdx.x;
-  auto const tile     = blockIdx.x;
-  auto const is_redo  = start_states != nullptr;
+  uint32_t const t   = threadIdx.x;
+  auto const is_redo = start_states != nullptr;
+  using block_scan   = cub::BlockScan<tile_transition, rowofs_block_dim>;
+  using block_reduce = cub::BlockReduce<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+  __shared__ typename block_reduce::TempStorage reduce_storage;
+  // The first launch processes every tile; the redo launch strides over the listed tiles
+  auto const num_items = is_redo ? *redo_count : num_tiles;
+  for (uint32_t item = blockIdx.x; item < num_items; item += gridDim.x) {
+  auto const tile     = is_redo ? redo_tiles[item] : item;
   auto const start_st = is_redo ? start_states[tile] : uint8_t{ROW_CTX_NONE};
-  if (is_redo && start_st == ROW_CTX_NONE) { return; }  // the first launch was correct
 
   // Each thread handles slices_per_thread consecutive 32-character slices
   uint4 ctx_maps[slices_per_thread];
   size_t slice_pos[slices_per_thread];
-  packed_rowctx_t thread_ctx = 0;
+  tile_transition thread_transition = identity_transition;
 #pragma unroll
   for (int j = 0; j < slices_per_thread; ++j) {
     auto& block_pos = slice_pos[j];
@@ -1357,28 +1365,17 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
       quotechar,
       commentchar,
       block_pos);
-    thread_ctx = j == 0 ? pack_rowmaps(ctx_maps[j])
-                        : merge_row_contexts(thread_ctx, pack_rowmaps(ctx_maps[j]));
+    // Output states of the slice (bits 0..5 of .w, EOF stays EOF)
+    thread_transition = compose_transitions{}(
+      thread_transition, static_cast<tile_transition>((ctx_maps[j].w & 0x3f) | (ROW_CTX_EOF << 6)));
   }
-  rowctx_merge_transform(bk_ctxtree, thread_ctx, t);
-  __syncthreads();
-
-  if (t == 0) {
-    if (!is_redo) {
-      auto const aggregate = bk_ctxtree[1];
-      tile_transition transition =
-        static_cast<tile_transition>(ROW_CTX_EOF << 6);  // EOF input stays EOF
-      for (uint32_t s = 0; s < 3; ++s) {
-        transition |= (get_row_context(aggregate, s) & 3) << (2 * s);
-      }
-      tile_transitions[tile] = transition;
-    }
-    bk_ctxtree[0] = start_st;  // no rows before the tile are needed, only its start state
-  }
-  __syncthreads();
-
-  // Walk back the transform tree with the tile's initial parser state
-  auto state          = rowctx_inverse_merge_transform(bk_ctxtree, t) & 3;
+  // Each thread's input state: the tile's start state through the transitions of earlier threads
+  tile_transition prefix;
+  tile_transition tile_total;
+  block_scan(scan_storage)
+    .ExclusiveScan(thread_transition, prefix, identity_transition, compose_transitions{}, tile_total);
+  if (t == 0 && !is_redo) { tile_transitions[tile] = tile_total; }
+  auto state = static_cast<uint32_t>((prefix >> (2 * start_st)) & 3);
   uint32_t kept_rows = 0;
 #pragma unroll
   for (int j = 0; j < slices_per_thread; ++j) {
@@ -1393,22 +1390,25 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     // Output state of the slice for this input state (EOF stays EOF)
     state = state < 3 ? (ctx_maps[j].w >> (2 * state)) & 3 : state;
   }
-  using block_reduce = cub::BlockReduce<uint32_t, rowofs_block_dim>;
-  __shared__ typename block_reduce::TempStorage reduce_storage;
   kept_rows = block_reduce(reduce_storage).Sum(kept_rows);
+  __syncthreads();  // temp storage is reused by the next tile
   if (t == 0) { tile_kept_rows[tile] = kept_rows; }
+  }
 }
 
 /// Block size of the tile start state scan
 constexpr int start_state_block_dim = 1024;
 
 /**
- * @brief Computes each tile's starting parser state from the tile transitions (one block).
+ * @brief Computes each tile's starting parser state from the tile transitions (one block), and
+ * lists the tiles that do not start in the NONE state.
  */
 CUDF_KERNEL void __launch_bounds__(start_state_block_dim)
   tile_start_states_gpu(tile_transition const* tile_transitions,
                         uint32_t num_tiles,
-                        uint8_t* start_states)
+                        uint8_t* start_states,
+                        uint32_t* redo_tiles,
+                        uint32_t* redo_count)
 {
   using block_scan = cub::BlockScan<tile_transition, start_state_block_dim>;
   __shared__ typename block_scan::TempStorage temp_storage;
@@ -1420,7 +1420,12 @@ CUDF_KERNEL void __launch_bounds__(start_state_block_dim)
     tile_transition chunk;
     block_scan(temp_storage).ExclusiveScan(in, prefix, carry, compose_transitions{}, chunk);
     // The data starts in the NONE state
-    if (tile < num_tiles) { start_states[tile] = prefix & 3; }
+    if (tile < num_tiles) {
+      auto const start_state = prefix & 3;
+      start_states[tile]     = start_state;
+      // Tiles that do not start in the NONE state assumed by the first launch must be redone
+      if (start_state != ROW_CTX_NONE) { redo_tiles[atomicAdd(redo_count, 1u)] = tile; }
+    }
     carry = compose_transitions{}(carry, chunk);
     __syncthreads();
   }
@@ -1622,11 +1627,15 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
   auto const tile_kept_rows = tile_kept_rows_buffer.data();
   rmm::device_uvector<tile_transition> tile_transitions(num_tiles, stream);
   rmm::device_uvector<uint8_t> start_states(num_tiles, stream);
+  rmm::device_uvector<uint32_t> redo_tiles(num_tiles, stream);
+  auto redo_count = cudf::detail::make_zeroed_device_uvector_async<uint32_t>(1, stream, mr);
   rmm::device_uvector<uint32_t> row_bitmaps(
     static_cast<size_t>(num_tiles) * rowofs_block_dim * slices_per_thread, stream);
 
   auto const launch = [&](uint8_t const* tile_start_states) {
-    gather_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    // The redo launch strides over the (usually empty) list of tiles to redo
+    auto const num_blocks = tile_start_states ? std::min<uint32_t>(num_tiles, 256) : num_tiles;
+    gather_row_bitmaps_gpu<<<num_blocks, rowofs_block_dim, 0, stream.get()>>>(
       data,
       chunk_size,
       parse_pos,
@@ -1637,8 +1646,11 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
       options.delimiter,
       (options.quotechar) ? options.quotechar : 0x100,
       (options.comment) ? options.comment : 0x100,
+      num_tiles,
       tile_transitions.data(),
       tile_start_states,
+      redo_tiles.data(),
+      redo_count.data(),
       blank_row_chars::from(options),
       tile_kept_rows,
       row_bitmaps.data());
@@ -1647,7 +1659,7 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
   // Assume every tile starts outside of quotes, then redo the tiles where that was wrong
   launch(nullptr);
   tile_start_states_gpu<<<1, start_state_block_dim, 0, stream.get()>>>(
-    tile_transitions.data(), num_tiles, start_states.data());
+    tile_transitions.data(), num_tiles, start_states.data(), redo_tiles.data(), redo_count.data());
   CUDF_CUDA_TRY(cudaGetLastError());
   launch(start_states.data());
 
