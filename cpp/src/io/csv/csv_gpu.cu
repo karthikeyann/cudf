@@ -724,34 +724,38 @@ __device__ __forceinline__ bool plain_digits_parse(parse_options_view const& opt
 }
 
 /**
- * @brief Classifies and decodes a field that consists of 1 to 20 decimal digits with an optional
- * leading '-', with word operations instead of per-character loops.
+ * @brief Decodes a field that consists of 1 to 20 decimal digits with an optional leading '-' and
+ * is not an N/A, true or false value, with word operations instead of per-character loops.
  *
- * For such a field (and `plain_digits_parse(opts)`), when it is not an N/A, true or false value,
- * `classify_field` returns `integral_field_slot` of its digits (a small-integer slot for up to 18
- * digits) and `predecode_integer_field` stores `parse_numeric<uint64_t>`'s value, which is the
- * digits' value modulo 2^64, negated for '-'. Returns false (and nothing else is valid) for any
- * other field.
+ * Returns false (and leaves the outputs unspecified) for any other field. For such a field, with
+ * `plain_digits_parse(opts)`, trimming leaves it unchanged, and `parse_numeric<T>` (whose
+ * `value * base + digit` steps and final `* sign` wrap modulo 2^bits) returns the low bits of
+ * `value`: the digits' value modulo 2^64, negated for '-'.
  *
- * `field_start` must lie in a buffer from which the aligned 8-byte words that contain the field's
- * characters can be read.
+ * @param load_word Returns the aligned 8-byte word at the given address; only the words that
+ * contain the field's characters are requested
+ * @param num_digits Set to the number of digits
+ * @param negative Set to whether the field starts with '-'
  */
-__device__ __forceinline__ bool classify_plain_integer(parse_options_view const& opts,
-                                                       char const* field_start,
-                                                       char const* field_end,
-                                                       int& slot,
-                                                       uint64_t& value)
+template <typename LoadWord>
+__device__ __forceinline__ bool plain_integer_value(parse_options_view const& opts,
+                                                    char const* field_start,
+                                                    char const* field_end,
+                                                    LoadWord&& load_word,
+                                                    uint64_t& value,
+                                                    int& num_digits_out,
+                                                    bool& negative_out)
 {
   auto const len    = static_cast<int>(field_end - field_start);
   auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(field_start) & 7);
   if (len < 1 || len > 21 || offset + len > 32) { return false; }
   // Only the aligned words that hold the field's characters are read
-  auto const words = reinterpret_cast<uint64_t const*>(field_start - offset);
+  auto const words = field_start - offset;
   auto const used  = offset + len;
-  auto const w0    = words[0];
-  auto const w1    = used > 8 ? words[1] : 0;
-  auto const w2    = used > 16 ? words[2] : 0;
-  auto const w3    = used > 24 ? words[3] : 0;
+  auto const w0    = load_word(words);
+  auto const w1    = used > 8 ? load_word(words + 8) : 0;
+  auto const w2    = used > 16 ? load_word(words + 16) : 0;
+  auto const w3    = used > 24 ? load_word(words + 24) : 0;
   // The field's first 24 bytes, 8 per word, first character in the lowest byte
   auto const funnel = [](uint64_t low, uint64_t high, int shift) {
     return shift == 0 ? low : (low >> shift) | (high << (64 - shift));
@@ -802,10 +806,80 @@ __device__ __forceinline__ bool classify_plain_integer(parse_options_view const&
                 swar_digits_value(digits_at(head), 8) * 100'000'000ULL +
                 swar_digits_value(digits_at(head + 8), 8);
   }
-  auto const digits_begin = field_start + negative;
-  slot  = num_digits < 19 ? (negative ? slot_negative_small_int : slot_positive_small_int)
-                          : integral_field_slot(digits_begin, field_end, negative, direct_word_reader{});
-  value = negative ? uint64_t{0} - magnitude : magnitude;
+  value          = negative ? uint64_t{0} - magnitude : magnitude;
+  num_digits_out = num_digits;
+  negative_out   = negative;
+  return true;
+}
+
+/// Aligned word load from the given address
+__device__ __forceinline__ uint64_t load_aligned_word(char const* word_begin)
+{
+  return *reinterpret_cast<uint64_t const*>(word_begin);
+}
+
+/**
+ * @brief `classify_field` and `predecode_integer_field` for a field accepted by
+ * `plain_integer_value`: `integral_field_slot` of its digits (a small-integer slot for up to 18
+ * digits) and `parse_numeric<uint64_t>`'s value. Returns false for any other field.
+ *
+ * `field_start` must lie in a buffer from which the aligned 8-byte words that contain the field's
+ * characters can be read.
+ */
+__device__ __forceinline__ bool classify_plain_integer(parse_options_view const& opts,
+                                                       char const* field_start,
+                                                       char const* field_end,
+                                                       int& slot,
+                                                       uint64_t& value)
+{
+  int num_digits = 0;
+  bool negative  = false;
+  if (not plain_integer_value(
+        opts, field_start, field_end, load_aligned_word, value, num_digits, negative)) {
+    return false;
+  }
+  slot = num_digits < 19 ? (negative ? slot_negative_small_int : slot_positive_small_int)
+                         : integral_field_slot(
+                             field_start + negative, field_end, negative, direct_word_reader{});
+  return true;
+}
+
+/**
+ * @brief `convert_csv_to_cudf`'s decoding of a valid field into an integer column (any integral
+ * type but BOOL8) for a field accepted by `plain_integer_value`. Returns false, and stores
+ * nothing, for any other field or column type.
+ */
+template <typename LoadWord>
+__device__ __forceinline__ bool store_plain_integer(parse_options_view const& opts,
+                                                    char const* field_start,
+                                                    char const* field_end,
+                                                    type_id type,
+                                                    void* column,
+                                                    size_type row,
+                                                    LoadWord&& load_word)
+{
+  auto const is_plain_integral = type == type_id::INT8 or type == type_id::INT16 or
+                                 type == type_id::INT32 or type == type_id::INT64 or
+                                 type == type_id::UINT8 or type == type_id::UINT16 or
+                                 type == type_id::UINT32 or type == type_id::UINT64;
+  uint64_t value = 0;
+  int num_digits = 0;
+  bool negative  = false;
+  if (not is_plain_integral or
+      not plain_integer_value(opts, field_start, field_end, load_word, value, num_digits, negative)) {
+    return false;
+  }
+  // The low bits of the value modulo 2^64, as parse_numeric<T> produces them
+  switch (type) {
+    case type_id::INT8: static_cast<int8_t*>(column)[row] = static_cast<int8_t>(value); break;
+    case type_id::INT16: static_cast<int16_t*>(column)[row] = static_cast<int16_t>(value); break;
+    case type_id::INT32: static_cast<int32_t*>(column)[row] = static_cast<int32_t>(value); break;
+    case type_id::INT64: static_cast<int64_t*>(column)[row] = static_cast<int64_t>(value); break;
+    case type_id::UINT8: static_cast<uint8_t*>(column)[row] = static_cast<uint8_t>(value); break;
+    case type_id::UINT16: static_cast<uint16_t*>(column)[row] = static_cast<uint16_t>(value); break;
+    case type_id::UINT32: static_cast<uint32_t*>(column)[row] = static_cast<uint32_t>(value); break;
+    default: static_cast<uint64_t*>(column)[row] = value; break;
+  }
   return true;
 }
 
@@ -1131,6 +1205,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   int actual_col  = 0;
   // Unstaged rows: reuse loaded words across fields and pass them on to integer parsing
   cuda::std::conditional_t<WindowedIntegers, caching_word_reader, direct_word_reader> words{};
+  // Staged rows only: in the unstaged instance the extra code costs more registers than it saves
+  bool const plain_ints = not WindowedIntegers and plain_digits_parse(options);
 
   while (col < column_flags.size() && field_start < row_end) {
     // In delim_whitespace mode, collapse leading delimiter runs so leading whitespace does
@@ -1144,6 +1220,18 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 
     if (column_flags[col] & column_parse::predecoded) {
       // Already decoded during type inference
+      ++actual_col;
+    } else if (plain_ints and (column_flags[col] & column_parse::enabled) and
+               not(column_flags[col] & column_parse::as_hexadecimal) and
+               store_plain_integer(options,
+                                   field_start,
+                                   next_delimiter,
+                                   dtypes[actual_col].id(),
+                                   columns[actual_col],
+                                   rec_id,
+                                   load_aligned_word)) {
+      // Plain integers (the common case) are decoded with word operations
+      set_valid_warp_aggregated(valids[actual_col], &valid_counts[actual_col], actual_col, rec_id);
       ++actual_col;
     } else if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
