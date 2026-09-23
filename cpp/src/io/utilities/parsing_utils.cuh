@@ -558,7 +558,10 @@ __inline__ __device__ cuda::std::pair<char const*, char const*> trim_whitespaces
                                         cuda::std::make_reverse_iterator(trim_begin),
                                         not_whitespace);
 
-  return {skip_character(trim_begin, quotechar), skip_character(trim_end, quotechar).base()};
+  auto const trimmed_begin = skip_character(trim_begin, quotechar);
+  auto const trimmed_end   = skip_character(trim_end, quotechar).base();
+  // A lone quote character would otherwise be skipped from both ends, leaving end < begin
+  return {trimmed_begin, cuda::std::max(trimmed_begin, trimmed_end)};
 }
 
 /**
