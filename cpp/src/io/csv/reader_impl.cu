@@ -987,8 +987,25 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       stream,
       mr);
 
-    for (auto& buffer : out_buffers) {
-      out_columns.emplace_back(make_column(buffer, nullptr, std::nullopt, stream));
+    // Build all string columns in one batch (one stream sync instead of several per column)
+    std::vector<size_t> string_col_indices;
+    std::vector<device_span<string_index_pair const>> string_col_pairs;
+    for (size_t i = 0; i < out_buffers.size(); ++i) {
+      if (out_buffers[i].type.id() == type_id::STRING) {
+        string_col_indices.push_back(i);
+        string_col_pairs.emplace_back(*out_buffers[i]._strings);
+      }
+    }
+    auto string_columns = cudf::make_strings_column_batch(string_col_pairs, stream, mr);
+
+    out_columns.resize(out_buffers.size());
+    for (size_t i = 0; i < string_col_indices.size(); ++i) {
+      out_columns[string_col_indices[i]] = std::move(string_columns[i]);
+    }
+    for (size_t i = 0; i < out_buffers.size(); ++i) {
+      if (!out_columns[i]) {
+        out_columns[i] = make_column(out_buffers[i], nullptr, std::nullopt, stream);
+      }
     }
 
     for (size_t i = 0; i < column_types.size(); ++i) {
