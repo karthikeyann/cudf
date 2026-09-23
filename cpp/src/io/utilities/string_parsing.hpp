@@ -51,6 +51,9 @@ struct parse_options_view {
   /// Whether a true/false/NA key could equal a plain integer field (an optional '-' then digits);
   /// when false, such fields need no trie lookups
   bool tries_may_hold_plain_integers = true;
+  /// Whether a true/false/NA key could equal a plain decimal number field (only digits, signs,
+  /// 'e'/'E' and the decimal point); when false, such fields need no trie lookups
+  bool tries_may_hold_plain_decimals = true;
   /// Optional device table of exp10(k) for k in [-exp10_table_bias, exp10_table_bias], computed
   /// with the device exp10; lets numeric parsing look up powers of ten instead of calling exp10
   double const* exp10_table = nullptr;
@@ -78,6 +81,7 @@ struct parse_options {
   cudf::detail::optional_trie trie_na;
   bool multi_delimiter;
   bool tries_may_hold_plain_integers = true;  ///< See parse_options_view
+  bool tries_may_hold_plain_decimals = true;  ///< See parse_options_view
 
   [[nodiscard]] json_inference_options_view json_view() const
   {
@@ -106,7 +110,8 @@ struct parse_options {
             cudf::detail::make_trie_view(trie_false),
             cudf::detail::make_trie_view(trie_na),
             multi_delimiter,
-            tries_may_hold_plain_integers};
+            tries_may_hold_plain_integers,
+            tries_may_hold_plain_decimals};
   }
 };
 

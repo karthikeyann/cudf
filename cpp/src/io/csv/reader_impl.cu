@@ -1726,6 +1726,20 @@ parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::st
   parse_opts.tries_may_hold_plain_integers = any_plain_integer_key(reader_opts.get_true_values()) or
                                              any_plain_integer_key(reader_opts.get_false_values()) or
                                              any_plain_integer_key(na_values);
+  // Plain decimal number fields consist of digits, signs, 'e'/'E' and the decimal point only; a
+  // key made of other characters too (or empty) can never equal one
+  auto const decimal = parse_opts.decimal;
+  auto const is_plain_decimal_key = [decimal](std::string const& key) {
+    return !key.empty() && std::all_of(key.begin(), key.end(), [decimal](char c) {
+      return (c >= '0' && c <= '9') || c == '-' || c == '+' || c == 'e' || c == 'E' || c == decimal;
+    });
+  };
+  auto const any_plain_decimal_key = [&](std::vector<std::string> const& keys) {
+    return std::any_of(keys.begin(), keys.end(), is_plain_decimal_key);
+  };
+  parse_opts.tries_may_hold_plain_decimals = any_plain_decimal_key(reader_opts.get_true_values()) or
+                                             any_plain_decimal_key(reader_opts.get_false_values()) or
+                                             any_plain_decimal_key(na_values);
 
   // Handle user-defined true values, whereby field data is substituted with a
   // boolean true or numeric `1` value

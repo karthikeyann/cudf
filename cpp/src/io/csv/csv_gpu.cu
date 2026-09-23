@@ -941,9 +941,10 @@ __device__ __forceinline__ bool plain_double_value(parse_options_view const& opt
     if (num_exp < 1 || num_exp > 4 || digits_end(exp_begin) != len) { return false; }
   }
   auto const key_len = static_cast<size_t>(len);
-  if (serialized_trie_contains(opts.trie_na, {field_start, key_len}) or
-      serialized_trie_contains(opts.trie_true, {field_start, key_len}) or
-      serialized_trie_contains(opts.trie_false, {field_start, key_len})) {
+  if (opts.tries_may_hold_plain_decimals and
+      (serialized_trie_contains(opts.trie_na, {field_start, key_len}) or
+       serialized_trie_contains(opts.trie_true, {field_start, key_len}) or
+       serialized_trie_contains(opts.trie_false, {field_start, key_len}))) {
     return false;
   }
   // 8 characters starting at `k` (0 <= k <= 16)
