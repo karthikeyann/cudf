@@ -2200,18 +2200,62 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
  * @brief Returns the shared memory size needed to stage every block's rows (one block per
  * `csvparse_block_dim` rows), or 0 if that exceeds `budget` or the data is not 16-byte aligned.
  */
+/**
+ * @brief Largest span of a block's rows (from the first row's 16-byte aligned start to the end of
+ * its last row), with one block per `csvparse_block_dim` rows.
+ */
+CUDF_KERNEL void max_block_span_kernel(device_span<uint64_t const> row_offsets, size_t* max_span)
+{
+  auto const num_rows = row_offsets.size() - 1;
+  auto const block    = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  auto const first    = block * csvparse_block_dim;
+  size_t span         = 0;
+  if (first < num_rows) {
+    auto const last = cuda::std::min<size_t>(first + csvparse_block_dim, num_rows);
+    span            = static_cast<size_t>(row_offsets[last] - (row_offsets[first] & ~uint64_t{15}));
+  }
+  using block_reduce = cub::BlockReduce<size_t, 256>;
+  __shared__ typename block_reduce::TempStorage temp_storage;
+  auto const block_max = block_reduce(temp_storage).Reduce(span, cuda::maximum<size_t>{});
+  if (threadIdx.x == 0 && block_max != 0) {
+    atomicMax(reinterpret_cast<unsigned long long*>(max_span),
+              static_cast<unsigned long long>(block_max));
+  }
+}
+
+void compute_max_block_span(device_span<uint64_t const> row_offsets,
+                            size_t* max_block_span,
+                            cuda::stream_ref stream)
+{
+  CUDF_CUDA_TRY(cudaMemsetAsync(max_block_span, 0, sizeof(size_t), stream.get()));
+  if (row_offsets.size() < 2) { return; }
+  auto const num_blocks =
+    cudf::util::div_rounding_up_safe<size_t>(row_offsets.size() - 1, csvparse_block_dim);
+  constexpr int block_size = 256;
+  max_block_span_kernel<<<cudf::util::div_rounding_up_safe<size_t>(num_blocks, block_size),
+                          block_size,
+                          0,
+                          stream.get()>>>(row_offsets, max_block_span);
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
 size_t staging_smem_size(device_span<char const> data,
                          device_span<uint64_t const> row_offsets,
                          size_t budget,
+                         std::optional<size_t> known_max_block_span,
                          cuda::stream_ref stream)
 {
   auto const num_rows = row_offsets.size() - 1;
   if (num_rows == 0) { return 0; }
   auto const block_size = csvparse_block_dim;
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
-  // Skip the span reduction (and its sync) when an average block span already does not fit
+  // Skip the span reduction (and its sync) when the span is known, or when an average block span
+  // already does not fit. A span that turns out too small is safe: blocks whose rows do not fit
+  // read global memory (see stage_block_rows)
   auto const avg_block_span = data.size() / num_rows * block_size;
-  auto const max_block_span = avg_block_span > budget ? budget + 1 : thrust::transform_reduce(
+  auto const max_block_span = known_max_block_span.has_value() ? *known_max_block_span
+                              : avg_block_span > budget        ? budget + 1
+                                                               : thrust::transform_reduce(
     rmm::exec_policy(stream, cudf::get_current_device_resource_ref()),
     thrust::counting_iterator<size_t>(0),
     thrust::counting_iterator<size_t>(grid_size),
@@ -2243,12 +2287,17 @@ size_t detection_histogram_smem(size_t num_active_columns)
 size_t detection_stage_size(device_span<char const> data,
                             device_span<uint64_t const> row_starts,
                             size_t num_active_columns,
+                            std::optional<size_t> max_block_span,
                             cuda::stream_ref stream)
 {
   // Stage each block's rows in shared memory when they fit next to the histogram
   constexpr size_t max_smem_size = 48 * 1024;
   return staging_smem_size(
-    data, row_starts, max_smem_size - detection_histogram_smem(num_active_columns), stream);
+    data,
+    row_starts,
+    max_smem_size - detection_histogram_smem(num_active_columns),
+    max_block_span,
+    stream);
 }
 
 namespace {
@@ -2370,6 +2419,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
+                            std::optional<size_t> max_block_span,
                             cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -2380,7 +2430,8 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   // Stage each block's rows in shared memory, sized to fit the longest block span; skip staging
   // when that exceeds the default shared memory limit (blocks then read global memory directly)
   constexpr size_t max_smem_size = 48 * 1024;
-  auto const smem_size           = staging_smem_size(data, row_offsets, max_smem_size, stream);
+  auto const smem_size =
+    staging_smem_size(data, row_offsets, max_smem_size, max_block_span, stream);
   // Without staging every field is read from global memory, where parsing integers from a
   // register copy of the field saves one load per character
   auto const kernel = smem_size == 0 ? convert_csv_to_cudf<true> : convert_csv_to_cudf<false>;

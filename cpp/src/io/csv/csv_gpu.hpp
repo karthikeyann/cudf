@@ -14,6 +14,8 @@
 
 #include <cuda/stream>
 
+#include <optional>
+
 using cudf::device_span;
 
 namespace cudf {
@@ -220,6 +222,19 @@ rmm::device_uvector<column_type_histogram> detect_column_types(
 size_t detection_stage_size(device_span<char const> data,
                             device_span<uint64_t const> row_offsets,
                             size_t num_active_columns,
+                            std::optional<size_t> max_block_span,
+                            cuda::stream_ref stream);
+
+/**
+ * @brief Computes, without synchronizing, the largest span of a block's rows that the decode and
+ * detection kernels would stage in shared memory (the `max_block_span` they accept).
+ *
+ * @param row_offsets Row offsets as the kernels will see them
+ * @param[out] max_block_span Device memory for the result
+ * @param stream CUDA stream to use
+ */
+void compute_max_block_span(device_span<uint64_t const> row_offsets,
+                            size_t* max_block_span,
                             cuda::stream_ref stream);
 
 /**
@@ -273,6 +288,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
+                            std::optional<size_t> max_block_span,
                             cuda::stream_ref stream);
 
 }  // namespace gpu

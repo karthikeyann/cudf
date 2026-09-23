@@ -18,7 +18,9 @@
 
 #include <algorithm>
 #include <deque>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cudf {
@@ -28,78 +30,59 @@ std::vector<serial_trie_node> serialize_trie(std::vector<std::string> const& key
 {
   if (keys.empty()) { return {}; }
 
-  static constexpr int alphabet_size = std::numeric_limits<char>::max() + 1;
-  struct TreeTrieNode {
-    using TrieNodePtr = std::unique_ptr<TreeTrieNode>;
-    std::array<TrieNodePtr, alphabet_size> children;
-    bool is_end_of_word = false;
-  };
+  // Distinct keys in byte order: the keys below a node are then a contiguous range, and its
+  // children's first characters appear in ascending order
+  std::vector<std::string_view> sorted(keys.begin(), keys.end());
+  std::sort(sorted.begin(), sorted.end());
+  sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
-  // Construct a tree-structured trie
-  // The trie takes a lot of memory, but the lookup is fast:
-  // allows direct addressing of children nodes
-  TreeTrieNode tree_trie;
-  for (auto const& key : keys) {
-    auto* current_node = &tree_trie;
-
-    for (char const character : key) {
-      if (current_node->children[character] == nullptr)
-        current_node->children[character] = std::make_unique<TreeTrieNode>();
-
-      current_node = current_node->children[character].get();
-    }
-
-    current_node->is_end_of_word = true;
-  }
-
-  struct IndexedTrieNode {
-    TreeTrieNode const* const pnode;
-    int16_t const idx;
-    IndexedTrieNode(TreeTrieNode const* const node, int16_t index) : pnode(node), idx(index) {}
-  };
-
-  // Serialize the tree trie
-  std::deque<IndexedTrieNode> to_visit;
+  // If the trie matches empty strings, the root node is marked as 'end of word'. The first node in
+  // the serialized trie is also used to match empty strings.
   std::vector<serial_trie_node> nodes;
-
-  // If the Tree trie matches empty strings, the root node is marked as 'end of word'.
-  // The first node in the serialized trie is also used to match empty strings, so we're
-  // initializing it using the `is_end_of_word` value from the root node.
-  nodes.push_back(serial_trie_node(trie_terminating_character, tree_trie.is_end_of_word));
+  nodes.emplace_back(trie_terminating_character, sorted.front().empty());
   // The root's children offset is never followed (lookups start at index 1); it stores the length
   // of the longest key so that longer keys can be rejected without walking the trie
-  auto const max_key_length = std::max_element(keys.cbegin(),
-                                               keys.cend(),
-                                               [](auto const& a, auto const& b) {
-                                                 return a.size() < b.size();
-                                               })
-                                ->size();
+  auto const max_key_length =
+    std::max_element(sorted.cbegin(), sorted.cend(), [](auto const& a, auto const& b) {
+      return a.size() < b.size();
+    })->size();
   if (max_key_length <= static_cast<size_t>(std::numeric_limits<int16_t>::max())) {
     nodes.front().children_offset = static_cast<int16_t>(max_key_length);
   }
 
-  // Add root node to queue. this node is not included to the serialized trie
-  to_visit.emplace_back(&tree_trie, -1);
+  // Breadth-first over the nodes: the keys [begin, end) share the node's `depth` characters. The
+  // root (index -1) is not part of the serialized children lists.
+  struct pending_node {
+    size_t begin;
+    size_t end;
+    size_t depth;
+    int64_t index;
+  };
+  std::deque<pending_node> to_visit{{0, sorted.size(), 0, -1}};
   while (!to_visit.empty()) {
-    auto const node_and_idx = to_visit.front();
-    auto const node         = node_and_idx.pnode;
-    auto const idx          = node_and_idx.idx;
+    auto const node = to_visit.front();
     to_visit.pop_front();
-
+    // Keys that end at this node come first
+    auto first = node.begin;
+    while (first < node.end && sorted[first].size() == node.depth) {
+      ++first;
+    }
     bool has_children = false;
-    for (size_t i = 0; i < node->children.size(); ++i) {
-      if (node->children[i] != nullptr) {
-        // Update the children offset of the parent node, unless at the root
-        if (idx >= 0 && nodes[idx].children_offset < 0) {
-          nodes[idx].children_offset = static_cast<uint16_t>(nodes.size() - idx);
-        }
-        // Add node to the trie
-        nodes.emplace_back(static_cast<char>(i), node->children[i]->is_end_of_word);
-        // Add to the queue, with the index within the new trie
-        to_visit.emplace_back(node->children[i].get(), static_cast<uint16_t>(nodes.size()) - 1);
-
-        has_children = true;
+    while (first < node.end) {
+      auto const character = sorted[first][node.depth];
+      auto last            = first;
+      while (last < node.end && sorted[last][node.depth] == character) {
+        ++last;
       }
+      // Update the children offset of the parent node, unless at the root
+      if (node.index >= 0 && nodes[node.index].children_offset < 0) {
+        nodes[node.index].children_offset =
+          static_cast<int16_t>(static_cast<uint16_t>(nodes.size() - node.index));
+      }
+      nodes.emplace_back(character, sorted[first].size() == node.depth + 1);
+      to_visit.push_back({first, last, node.depth + 1, static_cast<int64_t>(nodes.size()) - 1});
+      has_children = true;
+      first        = last;
     }
     // Only add the terminating character if any nodes were added
     if (has_children) { nodes.emplace_back(trie_terminating_character); }
