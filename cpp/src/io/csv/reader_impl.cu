@@ -31,6 +31,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/utilities/traits.hpp>
 
 #include <rmm/exec_policy.hpp>
 
@@ -38,6 +39,7 @@
 #include <cuda/iterator>
 #include <cuda/stream>
 #include <thrust/host_vector.h>
+#include <thrust/tabulate.h>
 
 #include <algorithm>
 #include <memory>
@@ -743,8 +745,23 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
   auto d_valid_counts = cudf::detail::make_zeroed_device_uvector_async<size_type>(
     num_active_columns, stream, cudf::get_current_device_resource_ref());
 
+  // Floating-point parsing looks up powers of ten in a table of the device's own exp10 results
+  auto decode_opts         = parse_opts.view();
+  auto const has_float_col = std::any_of(column_types.begin(), column_types.end(), [](auto dtype) {
+    return cudf::is_floating_point(dtype);
+  });
+  rmm::device_uvector<double> exp10_table(
+    has_float_col ? 2 * exp10_table_bias + 1 : 0, stream, cudf::get_current_device_resource_ref());
+  if (has_float_col) {
+    thrust::tabulate(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                     exp10_table.begin(),
+                     exp10_table.end(),
+                     [] __device__(int i) { return exp10(double(i - exp10_table_bias)); });
+    decode_opts.exp10_table = exp10_table.data();
+  }
+
   cudf::io::csv::gpu::decode_row_column_data(
-    parse_opts.view(),
+    decode_opts,
     data,
     unescape_buffer,
     make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),

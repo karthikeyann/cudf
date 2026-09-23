@@ -21,6 +21,7 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cuda/std/iterator>
+#include <nv/target>
 #include <cuda/std/limits>
 #include <cuda/std/optional>
 #include <cuda/std/type_traits>
@@ -334,7 +335,17 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
       while (begin < end) {
         exponent = (exponent * 10) + decode_digit<T, as_hex>(*(begin++), &all_digits_valid);
       }
-      if (exponent != 0) { value *= exp10(double(exponent * exponent_sign)); }
+      if (exponent != 0) {
+        auto const power = exponent * exponent_sign;
+        // The table holds the device's own exp10 results, so the lookup is bit-identical
+        NV_IF_ELSE_TARGET(
+          NV_IS_DEVICE,
+          (value *= (opts.exp10_table != nullptr && power >= -exp10_table_bias &&
+                     power <= exp10_table_bias)
+                      ? opts.exp10_table[power + exp10_table_bias]
+                      : exp10(double(power));),
+          (value *= exp10(double(power));))
+      }
     }
   }
   if (!all_digits_valid) { return cuda::std::optional<T>{}; }

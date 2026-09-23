@@ -48,7 +48,13 @@ struct parse_options_view {
   cudf::detail::trie_view trie_false;
   cudf::detail::trie_view trie_na;
   bool multi_delimiter;
+  /// Optional device table of exp10(k) for k in [-exp10_table_bias, exp10_table_bias], computed
+  /// with the device exp10; lets numeric parsing look up powers of ten instead of calling exp10
+  double const* exp10_table = nullptr;
 };
+
+/// Exponent range covered by `parse_options_view::exp10_table`
+constexpr int exp10_table_bias = 350;
 
 struct parse_options {
   char delimiter;
