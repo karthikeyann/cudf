@@ -775,7 +775,27 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
   return predecoded;
 }
 
-std::vector<column_buffer> decode_data(parse_options const& parse_opts,
+/**
+ * @brief Zeroes a set of null masks (grid y: mask index; null pointers are skipped).
+ */
+CUDF_KERNEL void zero_null_masks_kernel(bitmask_type* const* masks, size_type num_words)
+{
+  auto* const mask = masks[blockIdx.y];
+  if (mask == nullptr) { return; }
+  for (auto i = static_cast<size_type>(blockIdx.x * blockDim.x + threadIdx.x); i < num_words;
+       i += gridDim.x * blockDim.x) {
+    mask[i] = 0;
+  }
+}
+
+/**
+ * @brief Decodes the active columns.
+ *
+ * String columns are decoded to (pointer, length) pairs, returned in `string_pairs` (one array per
+ * string column, in column order); their buffers in the returned vector hold no data.
+ */
+std::vector<column_buffer> decode_data(std::vector<rmm::device_uvector<string_index_pair>>& string_pairs,
+                                       parse_options const& parse_opts,
                                        host_span<column_parse::flags const> column_flags,
                                        std::vector<std::string> const& column_names,
                                        device_span<char const> data,
@@ -794,15 +814,15 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
 
   for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
     if (column_flags[col] & column_parse::enabled) {
-      // Only string (pointer, length) pairs need zeroing: fields that are missing from a row must
-      // read as null strings. Other data is only meaningful where the (zeroed) null mask is set.
+      // No initialization: the decode kernel writes every string entry (null for missing fields),
+      // and other data is only meaningful where the null mask (zeroed below, in one batch) is set.
       // Columns decoded during type inference need no buffers.
       auto out_buffer = column_buffer(column_types[active_col], true);
-      if (not(column_flags[col] & column_parse::predecoded)) {
-        out_buffer.create(num_records,
-                          column_types[active_col].id() == type_id::STRING,
-                          stream,
-                          mr);
+      if (column_types[active_col].id() == type_id::STRING) {
+        // No buffers: the pairs live in `string_pairs`, and validity comes from null pairs
+        string_pairs.emplace_back(num_records, stream, cudf::get_current_device_resource_ref());
+      } else if (not(column_flags[col] & column_parse::predecoded)) {
+        out_buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, false, stream, mr);
       }
 
       out_buffer.name = column_names[col];
@@ -814,13 +834,32 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
   auto h_data  = cudf::detail::make_host_vector<void*>(num_active_columns, stream);
   auto h_valid = cudf::detail::make_host_vector<bitmask_type*>(num_active_columns, stream);
 
-  for (int i = 0; i < num_active_columns; ++i) {
-    h_data[i]  = out_buffers[i].data();
+  for (int i = 0, str_idx = 0; i < num_active_columns; ++i) {
+    h_data[i]  = out_buffers[i].type.id() == type_id::STRING ? string_pairs[str_idx++].data()
+                                                             : out_buffers[i].data();
     h_valid[i] = out_buffers[i].null_mask();
   }
 
   auto d_valid_counts = cudf::detail::make_zeroed_device_uvector_async<size_type>(
     num_active_columns, stream, cudf::get_current_device_resource_ref());
+
+  // Zero all null masks with a single kernel instead of a memset per column
+  auto const d_valid =
+    make_device_uvector_async(h_valid, stream, cudf::get_current_device_resource_ref());
+  auto const num_mask_words = cudf::num_bitmask_words(num_records);
+  if (num_mask_words > 0) {
+    constexpr int block_size          = 256;
+    constexpr int max_blocks_per_mask = 1024;
+    constexpr int max_grid_masks      = 65535;  // grid y dimension limit
+    auto const blocks_per_mask        = std::min<int>(
+      max_blocks_per_mask, cudf::util::div_rounding_up_safe<int>(num_mask_words, block_size));
+    for (int first = 0; first < num_active_columns; first += max_grid_masks) {
+      dim3 const grid(blocks_per_mask, std::min(max_grid_masks, num_active_columns - first));
+      zero_null_masks_kernel<<<grid, block_size, 0, stream.get()>>>(
+        d_valid.data() + first, num_mask_words);
+    }
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
 
   // Floating-point parsing looks up powers of ten in a table of the device's own exp10 results
   auto decode_opts         = parse_opts.view();
@@ -851,7 +890,7 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     row_offsets,
     make_device_uvector_async(column_types, stream, cudf::get_current_device_resource_ref()),
     make_device_uvector_async(h_data, stream, cudf::get_current_device_resource_ref()),
-    make_device_uvector_async(h_valid, stream, cudf::get_current_device_resource_ref()),
+    d_valid,
     d_valid_counts,
     stream);
 
@@ -930,7 +969,7 @@ struct offsets_writer {
  * synchronization, instead of one `make_strings_column` call per column.
  */
 std::vector<std::unique_ptr<column>> make_strings_columns(
-  host_span<column_buffer* const> buffers,
+  host_span<rmm::device_uvector<string_index_pair> const> buffers,
   size_type num_rows,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
@@ -943,7 +982,7 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   auto h_columns = cudf::detail::make_host_vector<string_index_pair const*>(num_columns, stream);
   auto h_masks   = cudf::detail::make_host_vector<bitmask_type*>(num_columns, stream);
   for (size_t c = 0; c < num_columns; ++c) {
-    h_columns[c] = static_cast<string_index_pair const*>(buffers[c]->data());
+    h_columns[c] = buffers[c].data();
     null_masks.emplace_back(
       cudf::create_null_mask(num_rows, mask_state::UNINITIALIZED, stream, mr));
     h_masks[c] = static_cast<bitmask_type*>(null_masks.back().data());
@@ -1355,7 +1394,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       if (data_row_offsets.source_data) { owned.resize(data.size(), stream); }
       unescape_buffer = owned.data();
     }
+    std::vector<rmm::device_uvector<string_index_pair>> string_pairs;
     auto out_buffers = decode_data(  //
+      string_pairs,
       parse_opts,
       column_flags,
       column_names,
@@ -1370,11 +1411,17 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       mr);
 
     // Build all string columns together: a fixed number of kernels and one host sync
-    std::vector<column_buffer*> string_buffers;
-    for (auto& buffer : out_buffers) {
-      if (buffer.type.id() == type_id::STRING) { string_buffers.push_back(&buffer); }
-    }
-    auto string_columns = make_strings_columns(string_buffers, num_records, stream, mr);
+    // With few string columns the per-column factory (32-bit scans, no cross-column indexing) is
+    // faster; with many, its per-column kernels and syncs dominate and one batched build wins
+    constexpr size_t max_per_column_string_builds = 4;
+    auto string_columns = [&] {
+      if (string_pairs.size() > max_per_column_string_builds) {
+        return make_strings_columns(string_pairs, num_records, stream, mr);
+      }
+      std::vector<device_span<string_index_pair const>> spans(string_pairs.begin(),
+                                                              string_pairs.end());
+      return cudf::make_strings_column_batch(spans, stream, mr);
+    }();
     for (size_t i = 0, str_idx = 0; i < out_buffers.size(); ++i) {
       if (predecoded_columns[i].has_value()) {
         auto& values = *predecoded_columns[i];

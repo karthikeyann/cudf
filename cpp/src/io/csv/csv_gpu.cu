@@ -770,6 +770,19 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     field_start = next_field;
     ++col;
   }
+
+  // Columns missing from this row are null. String data is not zero-initialized, so write null
+  // strings for them (other types only need their validity bit, which stays unset).
+  for (; col < column_flags.size(); ++col) {
+    if (not(column_flags[col] & column_parse::enabled)) { continue; }
+    if (not(column_flags[col] & column_parse::predecoded) and
+        dtypes[actual_col].id() == cudf::type_id::STRING) {
+      auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
+      str_list[rec_id].first  = nullptr;
+      str_list[rec_id].second = 0;
+    }
+    ++actual_col;
+  }
 }
 
 /*
