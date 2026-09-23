@@ -699,6 +699,117 @@ __device__ int classify_field(parse_options_view const& opts,
 }
 
 /**
+ * @brief Value of the decimal digits in the low `n` bytes of `chars` (1 <= n <= 8), the first
+ * digit in the lowest byte. The bytes must be ASCII digits.
+ */
+__device__ __forceinline__ uint64_t swar_digits_value(uint64_t chars, int n)
+{
+  // Digit values in the high `n` bytes; the zeroed low bytes act as leading zeros
+  auto v = (chars - 0x3030'3030'3030'3030ULL) & (~uint64_t{0} >> (8 * (8 - n)));
+  v <<= 8 * (8 - n);
+  v = (v * 10 + (v >> 8)) & 0x00FF'00FF'00FF'00FFULL;          // 2-digit lanes, <= 99
+  v = (v * 100 + (v >> 16)) & 0x0000'FFFF'0000'FFFFULL;        // 4-digit lanes, <= 9999
+  return (v * 10000 + (v >> 32)) & 0xFFFF'FFFFULL;             // <= 99999999
+}
+
+/**
+ * @brief Whether the options leave a field of digits with an optional leading '-' untouched by
+ * trimming and parsing (no digit or '-' is a quote, decimal point or thousands separator)
+ */
+__device__ __forceinline__ bool plain_digits_parse(parse_options_view const& opts)
+{
+  auto const special = [](char c) { return (c >= '0' && c <= '9') || c == '-'; };
+  return not special(opts.quotechar) and not special(opts.decimal) and
+         not special(opts.thousands);
+}
+
+/**
+ * @brief Classifies and decodes a field that consists of 1 to 20 decimal digits with an optional
+ * leading '-', with word operations instead of per-character loops.
+ *
+ * For such a field (and `plain_digits_parse(opts)`), when it is not an N/A, true or false value,
+ * `classify_field` returns `integral_field_slot` of its digits (a small-integer slot for up to 18
+ * digits) and `predecode_integer_field` stores `parse_numeric<uint64_t>`'s value, which is the
+ * digits' value modulo 2^64, negated for '-'. Returns false (and nothing else is valid) for any
+ * other field.
+ *
+ * `field_start` must lie in a buffer from which the aligned 8-byte words that contain the field's
+ * characters can be read.
+ */
+__device__ __forceinline__ bool classify_plain_integer(parse_options_view const& opts,
+                                                       char const* field_start,
+                                                       char const* field_end,
+                                                       int& slot,
+                                                       uint64_t& value)
+{
+  auto const len    = static_cast<int>(field_end - field_start);
+  auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(field_start) & 7);
+  if (len < 1 || len > 21 || offset + len > 32) { return false; }
+  // Only the aligned words that hold the field's characters are read
+  auto const words = reinterpret_cast<uint64_t const*>(field_start - offset);
+  auto const used  = offset + len;
+  auto const w0    = words[0];
+  auto const w1    = used > 8 ? words[1] : 0;
+  auto const w2    = used > 16 ? words[2] : 0;
+  auto const w3    = used > 24 ? words[3] : 0;
+  // The field's first 24 bytes, 8 per word, first character in the lowest byte
+  auto const funnel = [](uint64_t low, uint64_t high, int shift) {
+    return shift == 0 ? low : (low >> shift) | (high << (64 - shift));
+  };
+  auto b0 = funnel(w0, w1, 8 * offset);
+  auto b1 = funnel(w1, w2, 8 * offset);
+  auto b2 = funnel(w2, w3, 8 * offset);
+  bool const negative = static_cast<char>(b0) == '-';
+  if (negative) {
+    b0 = funnel(b0, b1, 8);
+    b1 = funnel(b1, b2, 8);
+    b2 = funnel(b2, w3 >> (8 * offset), 8);
+  }
+  auto const num_digits = len - negative;
+  if (num_digits < 1 || num_digits > 20) { return false; }
+  // Every byte of the digit range is in '0'..'9': high nibble 3, and adding 6 keeps it 3 (a carry
+  // out of a byte only comes from a byte that fails the first test)
+  auto const all_digits = [](uint64_t chars, int n) {
+    if (n <= 0) { return true; }
+    auto const mask     = (~uint64_t{0} >> (8 * (8 - cuda::std::min(n, 8)))) & 0xF0F0'F0F0'F0F0'F0F0ULL;
+    auto const expected = 0x3030'3030'3030'3030ULL & mask;
+    return (chars & mask) == expected && ((chars + 0x0606'0606'0606'0606ULL) & mask) == expected;
+  };
+  if (not all_digits(b0, num_digits) or not all_digits(b1, num_digits - 8) or
+      not all_digits(b2, num_digits - 16)) {
+    return false;
+  }
+  auto const key_len = static_cast<size_t>(len);
+  if (serialized_trie_contains(opts.trie_na, {field_start, key_len}) or
+      serialized_trie_contains(opts.trie_true, {field_start, key_len}) or
+      serialized_trie_contains(opts.trie_false, {field_start, key_len})) {
+    return false;
+  }
+  // 8 digit characters starting at digit `k` (0 <= k <= 16)
+  auto const digits_at = [&](int k) {
+    return k < 8 ? funnel(b0, b1, 8 * k) : k < 16 ? funnel(b1, b2, 8 * (k - 8)) : b2;
+  };
+  // The digits' value modulo 2^64, as parse_numeric's `value * 10 + digit` accumulates it
+  uint64_t magnitude = 0;
+  if (num_digits <= 8) {
+    magnitude = swar_digits_value(b0, num_digits);
+  } else if (num_digits <= 16) {
+    auto const head = num_digits - 8;
+    magnitude = swar_digits_value(b0, head) * 100'000'000ULL + swar_digits_value(digits_at(head), 8);
+  } else {
+    auto const head = num_digits - 16;
+    magnitude       = swar_digits_value(b0, head) * 10'000'000'000'000'000ULL +
+                swar_digits_value(digits_at(head), 8) * 100'000'000ULL +
+                swar_digits_value(digits_at(head + 8), 8);
+  }
+  auto const digits_begin = field_start + negative;
+  slot  = num_digits < 19 ? (negative ? slot_negative_small_int : slot_positive_small_int)
+                          : integral_field_slot(digits_begin, field_end, negative, direct_word_reader{});
+  value = negative ? uint64_t{0} - magnitude : magnitude;
+  return true;
+}
+
+/**
  * @brief Decodes an integer-classified field exactly as `convert_csv_to_cudf` would decode it into
  * an INT64 or UINT64 column, and records the value and its validity.
  *
@@ -803,6 +914,9 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   // Unstaged rows: reuse loaded words across fields and while classifying
   cuda::std::conditional_t<CachedWords, caching_word_reader, direct_word_reader> words{};
 
+  // Staged rows only: unstaged rows are served by the cached word reader
+  bool const plain_ints = is_staged and plain_digits_parse(opts);
+
   // Going through all the columns of a given record
   while (has_row && col < column_flags.size() && field_start < row_end) {
     // In delim_whitespace mode, collapse leading delimiter runs so leading whitespace does
@@ -814,19 +928,39 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 
     // Checking if this is a column that the user wants --- user can filter columns
     if (column_flags[col] & column_parse::inferred) {
-      auto const slot = classify_field<Count>(opts,
-                                       field_start,
-                                       next_delimiter,
-                                       column_flags[col] & column_parse::as_datetime,
-                                       text,
-                                       scan_by_words,
-                                       words);
+      // Plain integers (the common case) are classified and decoded with word operations
+      int slot            = slot_string;
+      uint64_t value      = 0;
+      bool const is_plain_int = [&] {
+        if constexpr (CachedWords) {
+          return false;
+        } else {
+          return plain_ints and not(column_flags[col] & column_parse::as_datetime) and
+                 classify_plain_integer(opts, field_start, next_delimiter, slot, value);
+        }
+      }();
+      if (not is_plain_int) {
+        slot = classify_field<Count>(opts,
+                                     field_start,
+                                     next_delimiter,
+                                     column_flags[col] & column_parse::as_datetime,
+                                     text,
+                                     scan_by_words,
+                                     words);
+      }
       warp_aggregated_increment(counters, actual_col * histogram_slots + slot);
       // Integer fields are also decoded, in case the column is inferred as an integer column
-      if (not int_values.empty() and
-          (slot == slot_negative_small_int or slot == slot_positive_small_int or
-           slot == slot_big_int) and
+      if (is_plain_int and not int_values.empty() and
           not(column_flags[col] & column_parse::as_hexadecimal)) {
+        int_values[actual_col][rec_id] = value;
+        set_valid_warp_aggregated(int_valids[actual_col],
+                                  &int_valid_counts[actual_col],
+                                  actual_col,
+                                  static_cast<size_type>(rec_id));
+      } else if (not int_values.empty() and
+                 (slot == slot_negative_small_int or slot == slot_positive_small_int or
+                  slot == slot_big_int) and
+                 not(column_flags[col] & column_parse::as_hexadecimal)) {
         predecode_integer_field(opts,
                                 field_start,
                                 next_delimiter,
