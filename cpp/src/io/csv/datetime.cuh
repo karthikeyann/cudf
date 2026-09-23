@@ -55,6 +55,15 @@ __inline__ __device__ T to_non_negative_integer(char const* begin, char const* e
  * @param dayfirst Flag indicating that first field is the day
  * @return Extracted year, month and day in `cuda::std::chrono::year_month_day` format
  */
+/**
+ * @brief Returns the position after a separator found in [.., end), or `end` if none was found
+ * (so that subsequent searches never start past the end of the field).
+ */
+__inline__ __device__ char const* next_after(char const* sep_pos, char const* end)
+{
+  return sep_pos < end ? sep_pos + 1 : end;
+}
+
 __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const* begin,
                                                                      char const* end,
                                                                      bool dayfirst)
@@ -79,7 +88,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     y = year{to_non_negative_integer<int32_t>(begin, sep_pos)};  //  year is signed
 
     // Month
-    auto s2 = sep_pos + 1;
+    auto s2 = next_after(sep_pos, end);
     sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
     if (sep_pos == end) {
@@ -97,7 +106,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     if (dayfirst) {
       d = day{to_non_negative_integer<uint32_t>(begin, sep_pos)};
 
-      auto s2 = sep_pos + 1;
+      auto s2 = next_after(sep_pos, end);
       sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
       m = month{to_non_negative_integer<uint32_t>(s2, sep_pos)};
@@ -106,7 +115,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     } else {
       m = month{to_non_negative_integer<uint32_t>(begin, sep_pos)};
 
-      auto s2 = sep_pos + 1;
+      auto s2 = next_after(sep_pos, end);
       sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
       if (sep_pos == end) {
@@ -145,15 +154,16 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
 
   // Adjust for AM/PM and any whitespace before
   duration_h d_h{0};
+  // (all reads stay within [begin, end))
   auto last = end - 1;
-  if (*last == 'M' || *last == 'm') {
-    if (*(last - 1) == 'P' || *(last - 1) == 'p') { d_h = duration_h{12}; }
+  if (last >= begin && (*last == 'M' || *last == 'm')) {
+    if (last > begin && (*(last - 1) == 'P' || *(last - 1) == 'p')) { d_h = duration_h{12}; }
     last = last - 2;
-    while (*last == ' ') {
+    while (last >= begin && *last == ' ') {
       --last;
     }
   }
-  end = last + 1;
+  end = cuda::std::max(last + 1, begin);
 
   // Find hour-minute separator
   auto const hm_sep = thrust::find(thrust::seq, begin, end, sep);
@@ -165,7 +175,7 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
   duration_ms d_ms{0};
 
   // Find minute-second separator (if present)
-  auto const ms_sep = thrust::find(thrust::seq, hm_sep + 1, end, sep);
+  auto const ms_sep = thrust::find(thrust::seq, next_after(hm_sep, end), end, sep);
   if (ms_sep == end) {
     d_m = duration_m{to_non_negative_integer<int32_t>(hm_sep + 1, end)};
   } else {
