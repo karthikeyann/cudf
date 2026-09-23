@@ -24,10 +24,9 @@
 namespace cudf {
 namespace detail {
 
-rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::string> const& keys,
-                                                             cuda::stream_ref stream)
+std::vector<serial_trie_node> serialize_trie(std::vector<std::string> const& keys)
 {
-  if (keys.empty()) { return rmm::device_uvector<serial_trie_node>{0, stream}; }
+  if (keys.empty()) { return {}; }
 
   static constexpr int alphabet_size = std::numeric_limits<char>::max() + 1;
   struct TreeTrieNode {
@@ -105,7 +104,15 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
     // Only add the terminating character if any nodes were added
     if (has_children) { nodes.emplace_back(trie_terminating_character); }
   }
-  return cudf::detail::make_device_uvector(nodes, stream, cudf::get_current_device_resource_ref());
+  return nodes;
+}
+
+rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::string> const& keys,
+                                                             cuda::stream_ref stream)
+{
+  if (keys.empty()) { return rmm::device_uvector<serial_trie_node>{0, stream}; }
+  return cudf::detail::make_device_uvector(
+    serialize_trie(keys), stream, cudf::get_current_device_resource_ref());
 }
 
 }  // namespace detail

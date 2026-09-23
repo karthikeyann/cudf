@@ -66,5 +66,16 @@ inline trie_view make_trie_view(optional_trie const& t)
 CUDF_EXPORT trie create_serialized_trie(std::vector<std::string> const& keys,
                                         cuda::stream_ref stream);
 
+/**
+ * @brief Serializes a trie on the host, as `create_serialized_trie` does before its upload.
+ *
+ * Lets callers that build several tries upload them together.
+ *
+ * @param keys Array of strings to insert into the trie
+ *
+ * @return The nodes of the serialized trie; empty if `keys` is empty
+ */
+CUDF_EXPORT std::vector<serial_trie_node> serialize_trie(std::vector<std::string> const& keys);
+
 }  // namespace detail
 }  // namespace cudf

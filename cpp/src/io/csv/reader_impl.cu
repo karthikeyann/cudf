@@ -28,7 +28,6 @@
 #include <cudf/io/types.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/null_mask.hpp>
-#include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/table/table.hpp>
@@ -40,7 +39,6 @@
 #include <rmm/exec_policy.hpp>
 
 #include <cub/block/block_reduce.cuh>
-#include <cub/device/device_memcpy.cuh>
 #include <cuda/cmath>
 #include <cuda/functional>
 #include <cuda/iterator>
@@ -236,9 +234,9 @@ void erase_except_last(C& container, cuda::stream_ref stream)
 /**
  * @brief Reads a small range of the source into host memory.
  *
- * Sources that prefer device reads (e.g. device buffers) serve `host_read` with a pageable
- * device-to-host copy, which costs hundreds of microseconds even for a few bytes. Such sources are
- * read to device memory instead and copied back through a pinned buffer.
+ * For sources that prefer device reads (e.g. device buffers), `host_read` costs hundreds of
+ * microseconds even for a few bytes. Such sources are read with `device_read` instead (zero-copy
+ * for device buffers) and copied to the host on `stream`.
  *
  * @return Number of bytes read
  */
@@ -250,14 +248,12 @@ size_t read_to_host(cudf::io::datasource* source,
 {
   if (size == 0) { return 0; }
   if (not source->is_device_read_preferred(size)) { return source->host_read(offset, size, dst); }
-  rmm::device_uvector<uint8_t> d_buffer(size, stream);
-  auto const bytes_read = source->device_read(offset, size, d_buffer.data(), stream);
-  auto h_buffer         = cudf::detail::make_pinned_vector_async<uint8_t>(bytes_read, stream);
-  cudf::detail::cuda_memcpy(host_span<uint8_t>{h_buffer.data(), bytes_read},
-                            device_span<uint8_t const>{d_buffer.data(), bytes_read},
-                            stream);
-  std::copy(h_buffer.begin(), h_buffer.end(), dst);
-  return bytes_read;
+  auto const available = source->size() - std::min(offset, source->size());
+  auto const buffer    = source->device_read(offset, std::min(size, available), stream);
+  CUDF_CUDA_TRY(
+    cudaMemcpyAsync(dst, buffer->data(), buffer->size(), cudaMemcpyDefault, stream.get()));
+  stream.sync();
+  return buffer->size();
 }
 
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
@@ -967,6 +963,118 @@ CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* cons
 }
 
 /**
+ * @brief Output of a string column's chars copy: its offsets (32 or 64-bit) and chars buffer.
+ */
+struct string_chars_target {
+  void const* offsets;
+  char* chars;
+  bool is_64;
+};
+
+constexpr int copy_string_chars_block_size = 256;
+
+/**
+ * @brief Copies the chars of each string column's strings into its chars buffer.
+ *
+ * The strings of a warp's 32 consecutive rows are contiguous in the output. The warp writes that
+ * range in 128-byte windows aligned to 4 bytes, with each lane writing one 4-byte word, so that
+ * the stores are coalesced and neighboring lanes read neighboring source bytes. Each lane finds the
+ * strings its bytes belong to by searching the rows' offsets in shared memory; its four byte loads
+ * are independent of each other.
+ *
+ * Grid: one block per (block of rows, column), with the columns of a block of rows adjacent, so
+ * that the columns' strings in the same rows are copied together and share cached source reads.
+ */
+CUDF_KERNEL void copy_string_chars_kernel(string_index_pair const* const* columns,
+                                          string_chars_target const* targets,
+                                          size_type num_rows,
+                                          int num_columns)
+{
+  constexpr int warp_size = cudf::detail::warp_size;
+  constexpr int word_size = sizeof(uint32_t);
+
+  auto const col       = static_cast<int>(blockIdx.x % num_columns);
+  auto const row_block = static_cast<int64_t>(blockIdx.x / num_columns);
+  auto const row       = row_block * blockDim.x + threadIdx.x;
+  auto const lane     = static_cast<int>(threadIdx.x % warp_size);
+  auto const warp_row = row - lane;
+  if (warp_row >= num_rows) { return; }
+  auto const target = targets[col];
+
+  // Output offset and source of each row's string. Rows past the end sort after every valid row.
+  __shared__ int64_t starts[copy_string_chars_block_size];
+  __shared__ char const* sources[copy_string_chars_block_size];
+  auto item   = string_index_pair{nullptr, 0};
+  auto offset = cuda::std::numeric_limits<int64_t>::max();
+  if (row < num_rows) {
+    item   = columns[col][row];
+    offset = target.is_64 ? static_cast<int64_t const*>(target.offsets)[row]
+                          : static_cast<int32_t const*>(target.offsets)[row];
+  }
+  auto const size        = item.first != nullptr ? item.second : size_type{0};
+  auto const warp_starts = starts + (threadIdx.x - lane);
+  auto const warp_srcs   = sources + (threadIdx.x - lane);
+  warp_starts[lane]      = offset;
+  warp_srcs[lane]        = item.first;
+
+  constexpr auto full_mask = 0xffff'ffffu;
+  auto const last  = static_cast<int>(cuda::std::min<int64_t>(warp_size, num_rows - warp_row)) - 1;
+  auto const begin = __shfl_sync(full_mask, offset, 0);
+  auto const end   = __shfl_sync(full_mask, offset + size, last);
+  __syncwarp();
+
+  for (auto window = begin & ~int64_t{word_size - 1}; window < end;
+       window += warp_size * word_size) {
+    auto const first = window + lane * word_size;
+    // The byte at `first` belongs to the last row whose string starts at or before it (an empty
+    // string shares its start with the next row's)
+    int k = 0;
+    for (int delta = warp_size / 2; delta > 0; delta /= 2) {
+      if (warp_starts[k + delta] <= first) { k += delta; }
+    }
+    uint32_t word  = 0;
+    uint32_t valid = 0;
+    for (int i = 0; i < word_size; ++i) {
+      auto const pos = first + i;
+      while (k < last && warp_starts[k + 1] <= pos) {
+        ++k;
+      }
+      if (pos >= begin && pos < end) {
+        auto const byte = static_cast<uint8_t>(warp_srcs[k][pos - warp_starts[k]]);
+        word |= static_cast<uint32_t>(byte) << (8 * i);
+        valid |= 1u << i;
+      }
+    }
+    if (valid == 0xfu) {
+      *reinterpret_cast<uint32_t*>(target.chars + first) = word;
+    } else {
+      for (int i = 0; i < word_size; ++i) {
+        if (valid & (1u << i)) { target.chars[first + i] = static_cast<char>(word >> (8 * i)); }
+      }
+    }
+  }
+}
+
+/**
+ * @brief Copies the chars of all string columns (see `copy_string_chars_kernel`).
+ */
+void copy_string_chars(string_index_pair const* const* d_columns,
+                       host_span<string_chars_target const> targets,
+                       size_type num_rows,
+                       cuda::stream_ref stream)
+{
+  auto const num_columns = static_cast<int64_t>(targets.size());
+  auto const num_blocks =
+    cudf::util::div_rounding_up_safe<int64_t>(num_rows, copy_string_chars_block_size) * num_columns;
+  if (num_blocks == 0) { return; }
+  auto const d_targets =
+    cudf::detail::make_device_uvector_async(targets, stream, cudf::get_current_device_resource_ref());
+  copy_string_chars_kernel<<<num_blocks, copy_string_chars_block_size, 0, stream.get()>>>(
+    d_columns, d_targets.data(), num_rows, static_cast<int>(num_columns));
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+/**
  * @brief Writes a scanned offset to the (32 or 64-bit) offsets column of its string column.
  *
  * Used with a tabulate output iterator; a named functor keeps the iterator copy-assignable.
@@ -1075,7 +1183,9 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
 
   if (per_column) {
     auto const threshold = cudf::strings::detail::get_offset64_threshold();
-    std::vector<std::unique_ptr<column>> out;
+    std::vector<std::unique_ptr<column>> offsets_cols;
+    std::vector<rmm::device_uvector<char>> chars;
+    auto h_targets = cudf::detail::make_host_vector<string_chars_target>(num_columns, stream);
     for (size_t c = 0; c < num_columns; ++c) {
       auto const bytes = h_counts[num_columns + c];
       CUDF_EXPECTS(cudf::strings::detail::is_large_strings_enabled() || (bytes < threshold),
@@ -1093,13 +1203,18 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
           sizes + num_rows + 1,
           offsets->mutable_view().data<int64_t>());
       }
-      auto chars = cudf::strings::detail::make_chars_buffer(
-        offsets->view(), bytes, buffers[c].data(), num_rows, stream, mr);
+      chars.emplace_back(bytes, stream, mr);
+      h_targets[c] = {offsets->view().head(), chars.back().data(), bytes >= threshold};
+      offsets_cols.emplace_back(std::move(offsets));
+    }
+    copy_string_chars(d_columns, h_targets, num_rows, stream);
+    std::vector<std::unique_ptr<column>> out;
+    for (size_t c = 0; c < num_columns; ++c) {
       auto const null_count = static_cast<size_type>(h_counts[c]);
       out.emplace_back(make_strings_column(
         num_rows,
-        std::move(offsets),
-        chars.release(),
+        std::move(offsets_cols[c]),
+        chars[c].release(),
         null_count,
         null_count > 0 ? std::move(null_masks[c]) : rmm::device_buffer{0, stream, mr}));
     }
@@ -1111,7 +1226,6 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   std::vector<rmm::device_uvector<char>> chars;
   auto h_offsets = cudf::detail::make_host_vector<void*>(num_columns, stream);
   auto h_is_64   = cudf::detail::make_host_vector<bool>(num_columns, stream);
-  auto h_chars   = cudf::detail::make_host_vector<char*>(num_columns, stream);
   auto const threshold = cudf::strings::detail::get_offset64_threshold();
   for (size_t c = 0; c < num_columns; ++c) {
     auto const bytes = h_counts[num_columns + c];
@@ -1127,14 +1241,11 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
       mr);
     h_offsets[c] = offsets_buffers.back().data();
     chars.emplace_back(bytes, stream, mr);
-    h_chars[c] = chars.back().data();
   }
   auto const d_offsets =
     cudf::detail::make_device_uvector_async(h_offsets, stream, cudf::get_current_device_resource_ref());
   auto const d_is_64 =
     cudf::detail::make_device_uvector_async(h_is_64, stream, cudf::get_current_device_resource_ref());
-  auto const d_chars =
-    cudf::detail::make_device_uvector_async(h_chars, stream, cudf::get_current_device_resource_ref());
 
   // Offsets of all columns in one segmented scan (one segment of num_rows + 1 per column)
   // Index math uses precomputed divisions: 64-bit `/` and `%` per element are expensive
@@ -1164,50 +1275,12 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
                                 sizes,
                                 offsets_out);
 
-  // Chars of all columns in one batched copy
-  auto const num_strings = static_cast<int64_t>(num_rows) * static_cast<int64_t>(num_columns);
-  auto const rows       = static_cast<uint64_t>(num_rows);
-  auto const rows_div   = cuda::fast_mod_div<uint64_t>{rows};
-  auto const item_at    = [rows, rows_div, columns = d_columns] __device__(int64_t idx) {
-    auto const col = static_cast<uint64_t>(idx) / rows_div;
-    return columns[col][static_cast<uint64_t>(idx) - col * rows];
-  };
-  auto const src_ptrs = cuda::transform_iterator(
-    cuda::counting_iterator<int64_t>{0},
-    cuda::proclaim_return_type<void*>([item_at] __device__(int64_t idx) {
-      // cub requires non-const source pointers; the source is only read
-      return reinterpret_cast<void*>(const_cast<char*>(item_at(idx).first));
-    }));
-  auto const src_sizes = cuda::transform_iterator(
-    cuda::counting_iterator<int64_t>{0},
-    cuda::proclaim_return_type<size_type>([item_at] __device__(int64_t idx) {
-      auto const item = item_at(idx);
-      return item.first != nullptr ? item.second : 0;
-    }));
-  auto const dst_ptrs = cuda::transform_iterator(
-    cuda::counting_iterator<int64_t>{0},
-    cuda::proclaim_return_type<void*>([rows,
-                                       rows_div,
-                                       offsets = d_offsets.data(),
-                                       is_64   = d_is_64.data(),
-                                       chars   = d_chars.data()] __device__(int64_t idx) {
-      auto const col    = static_cast<uint64_t>(idx) / rows_div;
-      auto const row    = static_cast<uint64_t>(idx) - col * rows;
-      auto const offset = is_64[col] ? static_cast<int64_t const*>(offsets[col])[row]
-                                     : static_cast<int64_t>(static_cast<int32_t const*>(offsets[col])[row]);
-      return static_cast<void*>(chars[col] + offset);
-    }));
-  size_t temp_storage_bytes = 0;
-  CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(
-    nullptr, temp_storage_bytes, src_ptrs, dst_ptrs, src_sizes, num_strings, stream.get()));
-  rmm::device_buffer d_temp_storage(temp_storage_bytes, stream);
-  CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(d_temp_storage.data(),
-                                           temp_storage_bytes,
-                                           src_ptrs,
-                                           dst_ptrs,
-                                           src_sizes,
-                                           num_strings,
-                                           stream.get()));
+  // Chars of all columns
+  auto h_targets = cudf::detail::make_host_vector<string_chars_target>(num_columns, stream);
+  for (size_t c = 0; c < num_columns; ++c) {
+    h_targets[c] = {h_offsets[c], chars[c].data(), h_is_64[c]};
+  }
+  copy_string_chars(d_columns, h_targets, num_rows, stream);
 
   std::vector<std::unique_ptr<column>> out;
   for (size_t c = 0; c < num_columns; ++c) {
@@ -1554,11 +1627,10 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 }
 
 /**
- * @brief Create a serialized trie for N/A value matching, based on the options.
+ * @brief Serializes the trie for N/A value matching, based on the options.
  */
-cudf::detail::trie create_na_trie(char quotechar,
-                                  csv_reader_options const& reader_opts,
-                                  cuda::stream_ref stream)
+std::vector<cudf::detail::serial_trie_node> serialize_na_trie(char quotechar,
+                                                              csv_reader_options const& reader_opts)
 {
   // Default values to recognize as null values
   static std::vector<std::string> const default_na_values{"",
@@ -1580,7 +1652,7 @@ cudf::detail::trie create_na_trie(char quotechar,
                                                           "nan",
                                                           "null"};
 
-  if (!reader_opts.is_enabled_na_filter()) { return cudf::detail::trie(0, stream); }
+  if (!reader_opts.is_enabled_na_filter()) { return {}; }
 
   std::vector<std::string> na_values = reader_opts.get_na_values();
   if (reader_opts.is_enabled_keep_default_na()) {
@@ -1592,7 +1664,7 @@ cudf::detail::trie create_na_trie(char quotechar,
     na_values.emplace_back(2, quotechar);
   }
 
-  return cudf::detail::create_serialized_trie(na_values, stream);
+  return cudf::detail::serialize_trie(na_values);
 }
 
 parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::stream_ref stream)
@@ -1632,22 +1704,31 @@ parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::st
   CUDF_EXPECTS(parse_opts.thousands != parse_opts.delimiter,
                "Thousands separator cannot be the same as the delimiter");
 
+  // The tries are serialized on the host, then uploaded together with a single sync
+  auto const true_nodes  = cudf::detail::serialize_trie(reader_opts.get_true_values());
+  auto const false_nodes = cudf::detail::serialize_trie(reader_opts.get_false_values());
+  auto const na_nodes    = serialize_na_trie(parse_opts.quotechar, reader_opts);
+
   // Handle user-defined true values, whereby field data is substituted with a
   // boolean true or numeric `1` value
   if (not reader_opts.get_true_values().empty()) {
     parse_opts.trie_true =
-      cudf::detail::create_serialized_trie(reader_opts.get_true_values(), stream);
+      make_device_uvector_async(true_nodes, stream, cudf::get_current_device_resource_ref());
   }
 
   // Handle user-defined false values, whereby field data is substituted with a
   // boolean false or numeric `0` value
   if (not reader_opts.get_false_values().empty()) {
     parse_opts.trie_false =
-      cudf::detail::create_serialized_trie(reader_opts.get_false_values(), stream);
+      make_device_uvector_async(false_nodes, stream, cudf::get_current_device_resource_ref());
   }
 
   // Handle user-defined N/A values, whereby field data is treated as null
-  parse_opts.trie_na = create_na_trie(parse_opts.quotechar, reader_opts, stream);
+  parse_opts.trie_na =
+    make_device_uvector_async(na_nodes, stream, cudf::get_current_device_resource_ref());
+
+  // The host nodes must outlive the copies
+  stream.sync();
 
   return parse_opts;
 }
