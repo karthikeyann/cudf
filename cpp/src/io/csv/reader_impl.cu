@@ -711,13 +711,21 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
     });
   if (num_inferred_columns == 0) { return predecoded; }
 
+  // Integer fields are decoded during detection only when detection reads staged (shared memory)
+  // rows: re-reading each field is then cheap, while for rows read from global memory it costs
+  // more than decoding the column later
+  auto const stage_size = cudf::io::csv::gpu::detection_stage_size(
+    data, row_offsets, num_inferred_columns, stream);
+  bool const predecode = stage_size != 0;
+
   // Output-ready buffers for the integer values of each inferred column (allocated with `mr`, as
   // they become column data if the column is inferred as an integer column)
   std::vector<rmm::device_buffer> int_values;
   std::vector<rmm::device_buffer> int_valids;
-  auto h_int_values = cudf::detail::make_host_vector<uint64_t*>(num_inferred_columns, stream);
-  auto h_int_valids = cudf::detail::make_host_vector<bitmask_type*>(num_inferred_columns, stream);
-  for (int i = 0; i < num_inferred_columns; ++i) {
+  auto const num_predecoded = predecode ? num_inferred_columns : 0;
+  auto h_int_values = cudf::detail::make_host_vector<uint64_t*>(num_predecoded, stream);
+  auto h_int_valids = cudf::detail::make_host_vector<bitmask_type*>(num_predecoded, stream);
+  for (int i = 0; i < num_predecoded; ++i) {
     int_values.emplace_back(num_records * sizeof(uint64_t), stream, mr);
     int_valids.emplace_back(
       cudf::create_null_mask(num_records, mask_state::ALL_NULL, stream, mr));
@@ -725,7 +733,7 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
     h_int_valids[i] = static_cast<bitmask_type*>(int_valids.back().data());
   }
   auto d_int_valid_counts = cudf::detail::make_zeroed_device_uvector_async<size_type>(
-    num_inferred_columns, stream, cudf::get_current_device_resource_ref());
+    num_predecoded, stream, cudf::get_current_device_resource_ref());
 
   auto const column_stats = cudf::io::csv::gpu::detect_column_types(
     parse_opts.view(),
@@ -736,6 +744,7 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
     make_device_uvector_async(h_int_values, stream, cudf::get_current_device_resource_ref()),
     make_device_uvector_async(h_int_valids, stream, cudf::get_current_device_resource_ref()),
     d_int_valid_counts,
+    stage_size,
     stream);
   auto const h_int_valid_counts = cudf::detail::make_host_vector(d_int_valid_counts, stream);
 
@@ -765,7 +774,7 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
       column_types[col_idx] = data_type(cudf::type_id::UINT64);
     }
     auto const inferred_type = column_types[col_idx].id();
-    if ((inferred_type == type_id::INT64 or inferred_type == type_id::UINT64) and
+    if (predecode and (inferred_type == type_id::INT64 or inferred_type == type_id::UINT64) and
         not(column_flags[col_idx] & column_parse::as_hexadecimal)) {
       predecoded[col_idx] = predecoded_column{std::move(int_values[inf_col_idx - 1]),
                                               std::move(int_valids[inf_col_idx - 1]),

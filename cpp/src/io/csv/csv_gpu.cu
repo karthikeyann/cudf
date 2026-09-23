@@ -1592,6 +1592,27 @@ size_t staging_smem_size(device_span<char const> data,
   return is_aligned && wanted_smem_size <= budget ? wanted_smem_size : 0;
 }
 
+namespace {
+/// Shared memory used by the detection histogram (0 when it is kept in global memory)
+size_t detection_histogram_smem(size_t num_active_columns)
+{
+  auto const histogram_bytes = num_active_columns * sizeof(column_type_histogram);
+  return histogram_bytes <= 32 * 1024 ? util::round_up_safe<size_t>(histogram_bytes, sizeof(uint4))
+                                      : 0;
+}
+}  // namespace
+
+size_t detection_stage_size(device_span<char const> data,
+                            device_span<uint64_t const> row_starts,
+                            size_t num_active_columns,
+                            cuda::stream_ref stream)
+{
+  // Stage each block's rows in shared memory when they fit next to the histogram
+  constexpr size_t max_smem_size = 48 * 1024;
+  return staging_smem_size(
+    data, row_starts, max_smem_size - detection_histogram_smem(num_active_columns), stream);
+}
+
 cudf::detail::host_vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> const data,
@@ -1601,6 +1622,7 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   device_span<uint64_t* const> int_values,
   device_span<cudf::bitmask_type* const> int_valids,
   device_span<size_type> int_valid_counts,
+  size_t stage_size,
   cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -1611,15 +1633,9 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
     num_active_columns, stream, cudf::get_current_device_resource_ref());
 
   // Accumulate per-block histograms in shared memory when they fit in the default limit
-  auto const histogram_bytes      = num_active_columns * sizeof(column_type_histogram);
-  bool const use_shared_histogram = histogram_bytes <= 32 * 1024;
-  auto const histogram_smem =
-    use_shared_histogram ? util::round_up_safe<size_t>(histogram_bytes, sizeof(uint4)) : 0;
-  // Stage each block's rows in shared memory when they fit next to the histogram
-  constexpr size_t max_smem_size = 48 * 1024;
-  auto const stage_size =
-    staging_smem_size(data, row_starts, max_smem_size - histogram_smem, stream);
-  auto const smem_bytes = histogram_smem + stage_size;
+  auto const histogram_smem       = detection_histogram_smem(num_active_columns);
+  bool const use_shared_histogram = histogram_smem != 0;
+  auto const smem_bytes           = histogram_smem + stage_size;
   // 32-bit character counters (fewer registers, higher occupancy) are exact unless a single field
   // can exceed INT_MAX characters, which requires a buffer larger than that
   if (data.size() <= static_cast<size_t>(cuda::std::numeric_limits<int>::max())) {

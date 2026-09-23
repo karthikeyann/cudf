@@ -189,6 +189,7 @@ device_span<uint64_t> remove_blank_rows(cudf::io::parse_options_view const& opti
  * as for an INT64/UINT64 column; empty to skip decoding
  * @param[out] int_valids Per inferred column, zero-initialized validity masks of `int_values`
  * @param[out] int_valid_counts Per inferred column, zero-initialized number of valid `int_values`
+ * @param[in] stage_size Shared memory for staging rows, from `detection_stage_size`
  * @param[in] stream CUDA stream to use
  *
  * @return stats Histogram of each dtypes' occurrence for each column
@@ -202,7 +203,22 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   device_span<uint64_t* const> int_values,
   device_span<cudf::bitmask_type* const> int_valids,
   device_span<size_type> int_valid_counts,
+  size_t stage_size,
   cuda::stream_ref stream);
+
+/**
+ * @brief Returns the shared memory size `detect_column_types` uses to stage each block's rows
+ * (0 when the rows are read from global memory instead)
+ *
+ * @param data The row-column data
+ * @param row_offsets List of row data start positions (offsets)
+ * @param num_active_columns Number of active columns
+ * @param stream CUDA stream to use
+ */
+size_t detection_stage_size(device_span<char const> data,
+                            device_span<uint64_t const> row_offsets,
+                            size_t num_active_columns,
+                            cuda::stream_ref stream);
 
 /**
  * @brief Gathers the offsets of all rows in a single chunk of data, such as a whole file.
