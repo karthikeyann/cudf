@@ -219,6 +219,32 @@ __inline__ __device__ timestamp_type to_timestamp(char const* begin, char const*
 {
   using duration_type = typename timestamp_type::duration;
 
+  // Fast path for the ISO layout `YYYY-MM-DDTHH:MM:SS.<fraction>`: for such input the general
+  // parsing below finds every separator at these fixed positions (no '/' in the date, the date
+  // ends at the 'T', no AM/PM suffix), so parsing the same subranges gives the same result.
+  if (end - begin >= 20) {
+    auto const digit_at = [begin](int i) { return is_digit(begin[i]); };
+    auto const last     = end[-1];
+    if (digit_at(0) and digit_at(1) and digit_at(2) and digit_at(3) and begin[4] == '-' and
+        digit_at(5) and digit_at(6) and begin[7] == '-' and digit_at(8) and digit_at(9) and
+        begin[10] == 'T' and digit_at(11) and digit_at(12) and begin[13] == ':' and
+        digit_at(14) and digit_at(15) and begin[16] == ':' and digit_at(17) and digit_at(18) and
+        begin[19] == '.' and last != 'M' and last != 'm') {
+      using namespace cuda::std::chrono;
+      auto const ymd = year_month_day{year{to_non_negative_integer<int32_t>(begin, begin + 4)},
+                                      month{to_non_negative_integer<uint32_t>(begin + 5, begin + 7)},
+                                      day{to_non_negative_integer<uint32_t>(begin + 8, begin + 10)}};
+      timestamp_type answer{sys_days{ymd}};
+      auto const d_h  = duration_h{0} + duration_h{to_non_negative_integer<int>(begin + 11, begin + 13)};
+      auto const d_m  = duration_m{to_non_negative_integer<int32_t>(begin + 14, begin + 16)};
+      auto const d_s  = duration_s{to_non_negative_integer<int64_t>(begin + 17, begin + 19)};
+      auto const d_ms = duration_ms{to_non_negative_integer<int64_t>(begin + 20, end)};
+      auto const t    = hh_mm_ss<duration_ms>{d_h + d_m + d_s + d_ms};
+      answer += duration_cast<duration_type>(t.to_duration());
+      return answer;
+    }
+  }
+
   auto sep_pos = end;
 
   // Find end of the date portion
