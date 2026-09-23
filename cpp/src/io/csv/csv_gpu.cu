@@ -1494,9 +1494,11 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
             global_start = unescaped.first;
             global_end   = unescaped.second;
           }
-          auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-          str_list[rec_id].first  = global_start;
-          str_list[rec_id].second = global_end - global_start;
+          auto const decoded = static_cast<char*>(columns[actual_col]);
+          *reinterpret_cast<char const**>(decoded + decoded_string_pointer_offset(rec_id)) =
+            global_start;
+          *reinterpret_cast<size_type*>(decoded + decoded_string_size_offset(rec_id)) =
+            static_cast<size_type>(global_end - global_start);
         } else {
           bool stored = false;
           if constexpr (WindowedIntegers and TypedFastPaths) {
@@ -1524,9 +1526,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           }
         }
       } else if (type == cudf::type_id::STRING) {
-        auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-        str_list[rec_id].first  = nullptr;
-        str_list[rec_id].second = 0;
+        *reinterpret_cast<size_type*>(static_cast<char*>(columns[actual_col]) +
+                                      decoded_string_size_offset(rec_id)) = null_string_size;
       }
       ++actual_col;
     }
@@ -1541,9 +1542,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     if (not(column_flags[col] & column_parse::enabled)) { continue; }
     if (not(column_flags[col] & column_parse::predecoded) and
         dtypes[actual_col].id() == cudf::type_id::STRING) {
-      auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-      str_list[rec_id].first  = nullptr;
-      str_list[rec_id].second = 0;
+      *reinterpret_cast<size_type*>(static_cast<char*>(columns[actual_col]) +
+                                    decoded_string_size_offset(rec_id)) = null_string_size;
     }
     ++actual_col;
   }

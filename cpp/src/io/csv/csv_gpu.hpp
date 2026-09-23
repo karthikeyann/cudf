@@ -32,6 +32,45 @@ namespace gpu {
  */
 enum { ROW_CTX_NONE = 0, ROW_CTX_QUOTE = 1, ROW_CTX_COMMENT = 2, ROW_CTX_EOF = 3 };
 
+/**
+ * @brief Layouts of the (pointer, size) pairs that the decode kernel writes for string columns.
+ *
+ * AoS: one `std::pair<char const*, size_t>` per row, `{nullptr, 0}` for null rows.
+ * SoA: groups of `decoded_string_group_rows` rows, each holding the rows' pointers followed by
+ * their 32-bit sizes; null rows have size `null_string_size` and no pointer. Addresses depend only
+ * on the row, and the string kernels read 4 bytes per row to find validity and sizes.
+ */
+constexpr size_type null_string_size          = -1;
+constexpr size_t decoded_string_group_rows    = 32;
+constexpr size_t decoded_string_group_bytes   =
+  decoded_string_group_rows * (sizeof(char const*) + sizeof(size_type));
+constexpr size_t decoded_string_aos_row_bytes = sizeof(char const*) + sizeof(size_t);
+
+/// Byte offset of row `row`'s pointer in an SoA decoded string column
+__host__ __device__ inline size_t decoded_string_pointer_offset(size_type row)
+{
+  auto const r = static_cast<uint32_t>(row);
+  return static_cast<size_t>(r / decoded_string_group_rows) * decoded_string_group_bytes +
+         (r % decoded_string_group_rows) * sizeof(char const*);
+}
+
+/// Byte offset of row `row`'s size in an SoA decoded string column
+__host__ __device__ inline size_t decoded_string_size_offset(size_type row)
+{
+  auto const r = static_cast<uint32_t>(row);
+  return static_cast<size_t>(r / decoded_string_group_rows) * decoded_string_group_bytes +
+         decoded_string_group_rows * sizeof(char const*) +
+         (r % decoded_string_group_rows) * sizeof(size_type);
+}
+
+/// Bytes of one decoded string column of `num_rows` rows in the given layout
+__host__ __device__ inline size_t decoded_string_column_bytes(size_t num_rows, bool soa)
+{
+  return soa ? (num_rows + decoded_string_group_rows - 1) / decoded_string_group_rows *
+                 decoded_string_group_bytes
+             : num_rows * decoded_string_aos_row_bytes;
+}
+
 constexpr uint32_t rowofs_block_dim = 512;
 /// Character block size for gather_row_offsets
 constexpr uint32_t rowofs_block_bytes = rowofs_block_dim * 32;  // 16KB/threadblock

@@ -877,11 +877,13 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
 /**
  * @brief Decodes the active columns.
  *
- * String columns are decoded to (pointer, length) pairs, returned in `string_pairs` (one segment of
+ * String columns are decoded to (pointer, length) pairs in the given layout (see
+ * gpu::decoded_string_column_bytes), returned in `decoded_strings` (one segment of
  * `num_records` pairs per string column, in column order); their buffers in the returned vector
  * hold no data.
  */
-std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& string_pairs,
+std::vector<column_buffer> decode_data(rmm::device_buffer& decoded_strings,
+                                       bool soa_string_pairs,
                                        parse_options const& parse_opts,
                                        host_span<column_parse::flags const> column_flags,
                                        std::vector<std::string> const& column_names,
@@ -905,8 +907,11 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
     std::count_if(column_types.begin(), column_types.end(), [](auto const& dtype) {
       return dtype.id() == type_id::STRING;
     });
-  string_pairs = rmm::device_uvector<string_index_pair>(
-    static_cast<size_t>(num_string_cols) * num_records, stream, cudf::get_current_device_resource_ref());
+  auto const string_column_bytes =
+    cudf::io::csv::gpu::decoded_string_column_bytes(num_records, soa_string_pairs);
+  decoded_strings = rmm::device_buffer(static_cast<size_t>(num_string_cols) * string_column_bytes,
+                                       stream,
+                                       cudf::get_current_device_resource_ref());
 
   for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
     if (column_flags[col] & column_parse::enabled) {
@@ -915,7 +920,7 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
       // Columns decoded during type inference need no buffers.
       auto out_buffer = column_buffer(column_types[active_col], true);
       if (column_types[active_col].id() == type_id::STRING) {
-        // No buffers: the pairs live in `string_pairs`, and validity comes from null pairs
+        // No buffers: the pairs live in `decoded_strings`, and validity comes from null pairs
       } else if (not(column_flags[col] & column_parse::predecoded)) {
         out_buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, false, stream, mr);
       }
@@ -948,7 +953,7 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
   auto const h_valid = reinterpret_cast<bitmask_type**>(h_inputs.data() + data_bytes);
   for (int i = 0, str_idx = 0; i < num_active_columns; ++i) {
     h_data[i]  = out_buffers[i].type.id() == type_id::STRING
-                   ? string_pairs.data() + static_cast<size_t>(str_idx++) * num_records
+                   ? static_cast<char*>(decoded_strings.data()) + str_idx++ * string_column_bytes
                    : out_buffers[i].data();
     h_valid[i] = out_buffers[i].null_mask();
   }
@@ -1026,7 +1031,36 @@ constexpr int strings_block_size = 256;  ///< Rows per block in the string-colum
  *
  * Grid: x covers the rows, y is the string column index.
  */
-CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* const* columns,
+/**
+ * @brief Size of row `row` of a decoded string column (see gpu::decoded_string_column_bytes), or
+ * `gpu::null_string_size` for a null row.
+ */
+template <bool SoA>
+__device__ __forceinline__ size_type decoded_string_size(void const* column, size_type row)
+{
+  if constexpr (SoA) {
+    return *reinterpret_cast<size_type const*>(static_cast<char const*>(column) +
+                                               cudf::io::csv::gpu::decoded_string_size_offset(row));
+  } else {
+    auto const item = static_cast<string_index_pair const*>(column)[row];
+    return item.first != nullptr ? item.second : cudf::io::csv::gpu::null_string_size;
+  }
+}
+
+/// Characters of row `row` of a decoded string column (only for non-null rows)
+template <bool SoA>
+__device__ __forceinline__ char const* decoded_string_data(void const* column, size_type row)
+{
+  if constexpr (SoA) {
+    return *reinterpret_cast<char const* const*>(
+      static_cast<char const*>(column) + cudf::io::csv::gpu::decoded_string_pointer_offset(row));
+  } else {
+    return static_cast<string_index_pair const*>(column)[row].first;
+  }
+}
+
+template <bool SoA>
+CUDF_KERNEL void strings_validity_and_sizes_kernel(void const* const* columns,
                                                    size_type num_rows,
                                                    bitmask_type* const* null_masks,
                                                    int64_t* null_counts,
@@ -1038,8 +1072,9 @@ CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* cons
   auto const lane = threadIdx.x % cudf::detail::size_in_bits<bitmask_type>();
 
   auto const in_range   = row < num_rows;
-  auto const item       = in_range ? columns[col][row] : string_index_pair{nullptr, 0};
-  auto const is_valid   = item.first != nullptr;
+  auto const size       = in_range ? decoded_string_size<SoA>(columns[col], row)
+                                   : cudf::io::csv::gpu::null_string_size;
+  auto const is_valid   = size != cudf::io::csv::gpu::null_string_size;
   auto const valid_mask = __ballot_sync(0xffff'ffffu, is_valid);
   // Rows are warp aligned, so each warp owns one mask word
   if (lane == 0 && row < num_rows) {
@@ -1055,7 +1090,7 @@ CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* cons
   using block_reduce = cub::BlockReduce<int64_t, strings_block_size>;
   __shared__ typename block_reduce::TempStorage temp_storage;
   auto const bytes =
-    block_reduce(temp_storage).Sum(is_valid ? static_cast<int64_t>(item.second) : int64_t{0});
+    block_reduce(temp_storage).Sum(is_valid ? static_cast<int64_t>(size) : int64_t{0});
   if (threadIdx.x == 0) {
     block_bytes[static_cast<int64_t>(col) * gridDim.x + blockIdx.x] = bytes;
     if (bytes != 0) {
@@ -1089,7 +1124,8 @@ struct string_column_target {
  * Grid: one block per (block of rows, column), with the columns of a block of rows adjacent, so
  * that the columns' strings in the same rows are copied together and share cached source reads.
  */
-CUDF_KERNEL void write_string_columns_kernel(string_index_pair const* const* columns,
+template <bool SoA>
+CUDF_KERNEL void write_string_columns_kernel(void const* const* columns,
                                              string_column_target const* targets,
                                              int64_t const* block_offsets,
                                              size_type num_rows,
@@ -1109,8 +1145,11 @@ CUDF_KERNEL void write_string_columns_kernel(string_index_pair const* const* col
   auto const warp_row       = row - lane;
   auto const target         = targets[col];
 
-  auto const item = row < num_rows ? columns[col][row] : string_index_pair{nullptr, 0};
-  auto const size = item.first != nullptr ? item.second : size_type{0};
+  // Null and empty strings have no characters (and null rows of SoA columns no pointer)
+  auto const size =
+    row < num_rows ? cuda::std::max(size_type{0}, decoded_string_size<SoA>(columns[col], row))
+                   : size_type{0};
+  auto const source = size > 0 ? decoded_string_data<SoA>(columns[col], row) : nullptr;
 
   // Offsets: the block's offset, plus the sizes of the preceding warps, plus a scan within the warp
   int64_t prefix = size;
@@ -1145,7 +1184,7 @@ CUDF_KERNEL void write_string_columns_kernel(string_index_pair const* const* col
   auto const warp_starts = starts + (threadIdx.x - lane);
   auto const warp_srcs   = sources + (threadIdx.x - lane);
   warp_starts[lane]      = offset;
-  warp_srcs[lane]        = item.first;
+  warp_srcs[lane]        = source;
 
   auto const last  = static_cast<int>(cuda::std::min<int64_t>(warp_size, num_rows - warp_row)) - 1;
   auto const begin = __shfl_sync(full_mask, offset, 0);
@@ -1185,14 +1224,16 @@ CUDF_KERNEL void write_string_columns_kernel(string_index_pair const* const* col
 }
 
 /**
- * @brief Creates the output string columns from decoded (pointer, length) pairs.
+ * @brief Creates the output string columns from the decode kernel's (pointer, size) pairs, in
+ * the SoA or AoS layout (see gpu::decoded_string_column_bytes), one buffer per column.
  *
  * All string columns are built together, with a fixed number of kernels and a single host
  * synchronization: one kernel computes the validity and the character counts, and after the
  * output is allocated, one kernel writes the offsets and copies the chars.
  */
 std::vector<std::unique_ptr<column>> make_strings_columns(
-  host_span<device_span<string_index_pair const> const> buffers,
+  host_span<void const* const> buffers,
+  bool soa_string_pairs,
   size_type num_rows,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr)
@@ -1213,14 +1254,14 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   std::vector<rmm::device_buffer> null_masks;
   auto h_pointers = cudf::detail::make_host_vector<void*>(2 * num_columns, stream);
   for (size_t c = 0; c < num_columns; ++c) {
-    h_pointers[c] = const_cast<string_index_pair*>(buffers[c].data());
+    h_pointers[c] = const_cast<void*>(buffers[c]);
     // Uninitialized: the validity kernel writes every word
     null_masks.emplace_back(cudf::bitmask_allocation_size_bytes(num_rows), stream, mr);
     h_pointers[num_columns + c] = null_masks.back().data();
   }
   auto const d_pointers =
     cudf::detail::make_device_uvector_async(h_pointers, stream, cudf::get_current_device_resource_ref());
-  auto const d_columns = reinterpret_cast<string_index_pair const* const*>(d_pointers.data());
+  auto const d_columns = const_cast<void const* const*>(d_pointers.data());
   auto const d_masks   = reinterpret_cast<bitmask_type* const*>(d_pointers.data() + num_columns);
   // Null counts followed by chars sizes
   auto d_counts = cudf::detail::make_zeroed_device_uvector_async<int64_t>(
@@ -1231,7 +1272,9 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   constexpr size_t max_grid_columns = 65535;  // grid y dimension limit
   for (size_t first = 0; first < num_columns; first += max_grid_columns) {
     dim3 const grid(num_row_blocks, std::min(max_grid_columns, num_columns - first));
-    strings_validity_and_sizes_kernel<<<grid, strings_block_size, 0, stream.get()>>>(
+    auto const kernel = soa_string_pairs ? strings_validity_and_sizes_kernel<true>
+                                         : strings_validity_and_sizes_kernel<false>;
+    kernel<<<grid, strings_block_size, 0, stream.get()>>>(
       d_columns + first,
       num_rows,
       d_masks + first,
@@ -1276,10 +1319,12 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   }
   auto const d_targets =
     cudf::detail::make_device_uvector_async(h_targets, stream, cudf::get_current_device_resource_ref());
-  write_string_columns_kernel<<<num_row_blocks * static_cast<int64_t>(num_columns),
-                                strings_block_size,
-                                0,
-                                stream.get()>>>(
+  auto const write_kernel =
+    soa_string_pairs ? write_string_columns_kernel<true> : write_string_columns_kernel<false>;
+  write_kernel<<<num_row_blocks * static_cast<int64_t>(num_columns),
+                 strings_block_size,
+                 0,
+                 stream.get()>>>(
     d_columns, d_targets.data(), block_offsets.data(), num_rows, static_cast<int>(num_columns));
   CUDF_CUDA_TRY(cudaGetLastError());
 
@@ -1573,9 +1618,12 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       if (data_row_offsets.source_data) { owned.resize(data.size(), stream); }
       unescape_buffer = owned.data();
     }
-    rmm::device_uvector<string_index_pair> string_pairs(0, stream);
+    // Layout of the string columns' (pointer, size) pairs, shared by the decode and string kernels
+    bool const soa_string_pairs = true;
+    rmm::device_buffer decoded_strings(0, stream);
     auto out_buffers = decode_data(  //
-      string_pairs,
+      decoded_strings,
+      soa_string_pairs,
       parse_opts,
       column_flags,
       column_names,
@@ -1592,11 +1640,13 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 
     // Build all string columns together, with one host sync
     auto string_columns = [&] {
-      std::vector<device_span<string_index_pair const>> spans;
-      for (size_t first = 0; first < string_pairs.size(); first += num_records) {
-        spans.emplace_back(string_pairs.data() + first, num_records);
+      std::vector<void const*> columns;
+      auto const column_bytes =
+        cudf::io::csv::gpu::decoded_string_column_bytes(num_records, soa_string_pairs);
+      for (size_t first = 0; first < decoded_strings.size(); first += column_bytes) {
+        columns.push_back(static_cast<char const*>(decoded_strings.data()) + first);
       }
-      return make_strings_columns(spans, num_records, stream, mr);
+      return make_strings_columns(columns, soa_string_pairs, num_records, stream, mr);
     }();
     for (size_t i = 0, str_idx = 0; i < out_buffers.size(); ++i) {
       if (predecoded_columns[i].has_value()) {
