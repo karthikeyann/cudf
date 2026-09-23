@@ -188,14 +188,15 @@ __device__ __forceinline__ void warp_aggregated_increment(T* counters, int idx)
 }
 
 /**
- * @brief Marks row `rec_id` of a column as valid and counts it, aggregated across the warp.
+ * @brief Marks row `rec_id` of a column as valid, aggregated across the warp.
  *
  * A warp covers 32 consecutive, word-aligned rows (the grid is 1D with a multiple-of-32 block
  * size), so all lanes that mark the same column target the same bitmask word, with bit == lane.
- * One lane per column sets all of their bits and adds their count with a single atomic each.
+ * One lane per column sets all of their bits with a single atomic. Valid counts are not updated
+ * here: `count_valid_bits` derives them from the finished masks (a per-field counter atomic would
+ * make every warp of the grid update the same address).
  */
 __device__ __forceinline__ void set_valid_warp_aggregated(cudf::bitmask_type* valid_mask,
-                                                          size_type* valid_count,
                                                           int column,
                                                           size_type rec_id)
 {
@@ -204,7 +205,6 @@ __device__ __forceinline__ void set_valid_warp_aggregated(cudf::bitmask_type* va
   auto const leader = __ffs(peers) - 1;
   if (static_cast<int>(threadIdx.x % cudf::detail::warp_size) == leader) {
     atomicOr(&valid_mask[cudf::word_index(rec_id)], peers);
-    atomicAdd(valid_count, static_cast<size_type>(__popc(peers)));
   }
 }
 
@@ -897,7 +897,6 @@ __device__ __forceinline__ void predecode_integer_field(parse_options_view const
                                                         char const* field_end,
                                                         uint64_t* values,
                                                         cudf::bitmask_type* valid_mask,
-                                                        size_type* valid_count,
                                                         int column,
                                                         size_type rec_id)
 {
@@ -913,7 +912,7 @@ __device__ __forceinline__ void predecode_integer_field(parse_options_view const
   }
   if (value.has_value()) {
     values[rec_id] = *value;
-    set_valid_warp_aggregated(valid_mask, valid_count, column, rec_id);
+    set_valid_warp_aggregated(valid_mask, column, rec_id);
   }
 }
 
@@ -936,7 +935,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       bool use_shared_histogram,
                       device_span<uint64_t* const> int_values,
                       device_span<cudf::bitmask_type* const> int_valids,
-                      device_span<size_type> int_valid_counts,
                       size_t stage_size)
 {
   // Dynamic shared memory: the per-block histogram (when it fits), flushed to global memory at the
@@ -1027,10 +1025,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
       if (is_plain_int and not int_values.empty() and
           not(column_flags[col] & column_parse::as_hexadecimal)) {
         int_values[actual_col][rec_id] = value;
-        set_valid_warp_aggregated(int_valids[actual_col],
-                                  &int_valid_counts[actual_col],
-                                  actual_col,
-                                  static_cast<size_type>(rec_id));
+        set_valid_warp_aggregated(int_valids[actual_col], actual_col, static_cast<size_type>(rec_id));
       } else if (not int_values.empty() and
                  (slot == slot_negative_small_int or slot == slot_positive_small_int or
                   slot == slot_big_int) and
@@ -1040,7 +1035,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                 next_delimiter,
                                 int_values[actual_col],
                                 int_valids[actual_col],
-                                &int_valid_counts[actual_col],
                                 actual_col,
                                 static_cast<size_type>(rec_id));
       }
@@ -1160,7 +1154,6 @@ __device__ size_t stage_block_rows(device_span<char const> data,
  * @param[in] dtypes The data type of the column
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether column fields are valid
- * @param[out] valid_counts The number of valid fields in each column
  * @tparam WindowedIntegers Parse integers from a register copy of the field (for unstaged rows)
  */
 template <bool WindowedIntegers>
@@ -1173,7 +1166,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
                       device_span<cudf::bitmask_type* const> valids,
-                      device_span<size_type> valid_counts,
                       size_t smem_size)
 {
   extern __shared__ uint4 staged_rows[];
@@ -1231,7 +1223,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                    rec_id,
                                    load_aligned_word)) {
       // Plain integers (the common case) are decoded with word operations
-      set_valid_warp_aggregated(valids[actual_col], &valid_counts[actual_col], actual_col, rec_id);
+      set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
       ++actual_col;
     } else if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
@@ -1313,8 +1305,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                     options,
                                     column_flags[col] & column_parse::as_hexadecimal)) {
             // set the valid bitmap - all bits were set to 0 to start
-            set_valid_warp_aggregated(
-              valids[actual_col], &valid_counts[actual_col], actual_col, rec_id);
+            set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
           }
         }
       } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
@@ -2111,6 +2102,56 @@ size_t detection_stage_size(device_span<char const> data,
     data, row_starts, max_smem_size - detection_histogram_smem(num_active_columns), stream);
 }
 
+namespace {
+/**
+ * @brief Adds the number of set bits in the first `num_words` words of each mask to the mask's
+ * count (grid y: mask index; null pointers are skipped)
+ */
+template <int block_size>
+CUDF_KERNEL void __launch_bounds__(block_size)
+  count_valid_bits_kernel(cudf::bitmask_type* const* masks, size_type num_words, size_type* counts)
+{
+  auto const* const mask = masks[blockIdx.y];
+  if (mask == nullptr) { return; }
+  size_type count = 0;
+  for (auto i = static_cast<size_type>(blockIdx.x * blockDim.x + threadIdx.x); i < num_words;
+       i += gridDim.x * blockDim.x) {
+    count += __popc(mask[i]);
+  }
+  using block_reduce = cub::BlockReduce<size_type, block_size>;
+  __shared__ typename block_reduce::TempStorage temp_storage;
+  auto const total = block_reduce(temp_storage).Sum(count);
+  if (threadIdx.x == 0 and total != 0) { atomicAdd(&counts[blockIdx.y], total); }
+}
+
+/**
+ * @brief Adds each mask's number of valid rows to `counts`.
+ *
+ * The decode kernels set each (row, column) validity bit at most once and leave the other bits of
+ * the zeroed masks alone, so the set bits are exactly the valid fields.
+ */
+void count_valid_bits(device_span<cudf::bitmask_type* const> masks,
+                      size_type num_rows,
+                      device_span<size_type> counts,
+                      cuda::stream_ref stream)
+{
+  auto const num_masks = static_cast<int>(masks.size());
+  auto const num_words = cudf::num_bitmask_words(num_rows);
+  if (num_masks == 0 or num_words == 0) { return; }
+  constexpr int block_size          = 256;
+  constexpr int max_blocks_per_mask = 64;
+  constexpr int max_grid_masks      = 65535;  // grid y dimension limit
+  auto const blocks_per_mask        = std::min<int>(
+    max_blocks_per_mask, cudf::util::div_rounding_up_safe<int>(num_words, block_size));
+  for (int first = 0; first < num_masks; first += max_grid_masks) {
+    dim3 const grid(blocks_per_mask, std::min(max_grid_masks, num_masks - first));
+    count_valid_bits_kernel<block_size><<<grid, block_size, 0, stream.get()>>>(
+      masks.data() + first, num_words, counts.data() + first);
+  }
+  CUDF_CUDA_TRY(cudaGetLastError());
+}
+}  // namespace
+
 rmm::device_uvector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> const data,
@@ -2147,7 +2188,6 @@ rmm::device_uvector<column_type_histogram> detect_column_types(
       use_shared_histogram,
       int_values,
       int_valids,
-      int_valid_counts,
       stage_size);
   } else {
     auto const kernel =
@@ -2161,10 +2201,13 @@ rmm::device_uvector<column_type_histogram> detect_column_types(
       use_shared_histogram,
       int_values,
       int_valids,
-      int_valid_counts,
       stage_size);
   }
   CUDF_CUDA_TRY(cudaGetLastError());
+  if (not row_starts.empty()) {
+    count_valid_bits(
+      int_valids, static_cast<size_type>(row_starts.size() - 1), int_valid_counts, stream);
+  }
 
   return d_stats;
 }
@@ -2200,9 +2243,9 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                                                              dtypes,
                                                              columns,
                                                              valids,
-                                                             valid_counts,
                                                              smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
+  count_valid_bits(valids, static_cast<size_type>(num_rows), valid_counts, stream);
 }
 
 rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view const& options,
