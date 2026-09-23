@@ -846,6 +846,140 @@ __device__ __forceinline__ bool classify_plain_integer(parse_options_view const&
 }
 
 /**
+ * @brief `parse_numeric<double>(field_start, field_end, opts)` for a field of the form
+ * `-?D{1,15}(<decimal>D*)?([eE][+-]?D{1,4})?` (D a decimal digit) of at most 24 bytes that is not
+ * an N/A, true or false value, finding the field's structure with word operations.
+ *
+ * Returns false (and leaves `value` unspecified) for any other field. For an accepted field, with
+ * `plain_digits_parse(opts)` and a decimal point that is not 'e', 'E' or '+', trimming leaves it
+ * unchanged and `parse_numeric` reads exactly these parts; the floating-point steps below are
+ * the same expressions in the same order, so the result is bit-identical.
+ *
+ * `field_start` must lie in a buffer from which the aligned 8-byte words that contain the field's
+ * characters can be read.
+ */
+template <typename LoadWord>
+__device__ __forceinline__ bool plain_double_value(parse_options_view const& opts,
+                                                   char const* field_start,
+                                                   char const* field_end,
+                                                   LoadWord&& load_word,
+                                                   double& value)
+{
+  auto const len    = static_cast<int>(field_end - field_start);
+  auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(field_start) & 7);
+  if (len < 1 || len > 24 || offset + len > 32) { return false; }
+  auto const words = field_start - offset;
+  auto const used  = offset + len;
+  auto const w0    = load_word(words);
+  auto const w1    = used > 8 ? load_word(words + 8) : 0;
+  auto const w2    = used > 16 ? load_word(words + 16) : 0;
+  auto const w3    = used > 24 ? load_word(words + 24) : 0;
+  auto const funnel = [](uint64_t low, uint64_t high, int shift) {
+    return shift == 0 ? low : (low >> shift) | (high << (64 - shift));
+  };
+  // The field's 24 bytes, first character in the lowest byte
+  auto const b0      = funnel(w0, w1, 8 * offset);
+  auto const b1      = funnel(w1, w2, 8 * offset);
+  auto const b2      = funnel(w2, w3, 8 * offset);
+  auto const char_at = [&](int i) {
+    auto const word = i < 8 ? b0 : (i < 16 ? b1 : b2);
+    return static_cast<char>(word >> (8 * (i & 7)));
+  };
+  // High bit of each byte that is not a digit or lies past the field end: a byte is a digit iff
+  // its high nibble is 3 and adding 6 keeps it 3 (a carry into a byte only comes from a byte that
+  // is not a digit itself); `(x & 0x7F..) + 0x7F..) | x` flags exactly the nonzero bytes
+  constexpr uint64_t highs = 0x8080'8080'8080'8080ULL;
+  auto const non_digits    = [&](uint64_t w, int k) {
+    auto const z = ((w & 0xF0F0'F0F0'F0F0'F0F0ULL) ^ 0x3030'3030'3030'3030ULL) |
+                   (((w + 0x0606'0606'0606'0606ULL) & 0xF0F0'F0F0'F0F0'F0F0ULL) ^
+                    0x3030'3030'3030'3030ULL);
+    auto flags         = (((z & 0x7F7F'7F7F'7F7F'7F7FULL) + 0x7F7F'7F7F'7F7F'7F7FULL) | z) & highs;
+    auto const in_word = len - 8 * k;  // field bytes in this word
+    if (in_word < 8) { flags |= in_word <= 0 ? highs : (highs << (8 * in_word)); }
+    return flags;
+  };
+  auto const nd0 = non_digits(b0, 0);
+  auto const nd1 = non_digits(b1, 1);
+  auto const nd2 = non_digits(b2, 2);
+  // Position of the first non-digit (or the field end) at or after `k`
+  auto const digits_end = [&](int k) {
+    auto const first = [](uint64_t flags, int from) {
+      auto const f = from > 0 ? flags & (~uint64_t{0} << (8 * from)) : flags;
+      return f == 0 ? -1 : (__ffsll(static_cast<long long>(f)) - 1) / 8;
+    };
+    if (k < 8) {
+      if (auto const i = first(nd0, k); i >= 0) { return i; }
+    }
+    if (k < 16) {
+      if (auto const i = first(nd1, cuda::std::max(k - 8, 0)); i >= 0) { return 8 + i; }
+    }
+    if (auto const i = first(nd2, cuda::std::max(k - 16, 0)); i >= 0) { return 16 + i; }
+    return 24;
+  };
+  bool const negative    = char_at(0) == '-';
+  auto const whole_begin = static_cast<int>(negative);
+  auto const whole_end   = digits_end(whole_begin);
+  auto const num_whole   = whole_end - whole_begin;
+  if (num_whole < 1 || num_whole > 15) { return false; }
+  int frac_begin = whole_end;
+  int frac_end   = whole_end;
+  if (whole_end < len && char_at(whole_end) == opts.decimal) {
+    frac_begin = whole_end + 1;
+    frac_end   = digits_end(frac_begin);
+  }
+  int exp_begin      = len;
+  int exponent_sign  = 1;
+  if (frac_end < len) {
+    auto const e = char_at(frac_end);
+    if (e != 'e' && e != 'E') { return false; }
+    exp_begin = frac_end + 1;
+    if (exp_begin < len && (char_at(exp_begin) == '-' || char_at(exp_begin) == '+')) {
+      exponent_sign = char_at(exp_begin) == '-' ? -1 : 1;
+      ++exp_begin;
+    }
+    auto const num_exp = len - exp_begin;
+    if (num_exp < 1 || num_exp > 4 || digits_end(exp_begin) != len) { return false; }
+  }
+  auto const key_len = static_cast<size_t>(len);
+  if (serialized_trie_contains(opts.trie_na, {field_start, key_len}) or
+      serialized_trie_contains(opts.trie_true, {field_start, key_len}) or
+      serialized_trie_contains(opts.trie_false, {field_start, key_len})) {
+    return false;
+  }
+  // 8 characters starting at `k` (0 <= k <= 16)
+  auto const chars_at = [&](int k) {
+    return k < 8 ? funnel(b0, b1, 8 * k) : k < 16 ? funnel(b1, b2, 8 * (k - 8)) : b2;
+  };
+  // Whole part: the same integer parse_numeric accumulates (below 10^15, exact)
+  uint64_t whole = num_whole <= 8 ? swar_digits_value(chars_at(whole_begin), num_whole)
+                                  : swar_digits_value(chars_at(whole_begin), num_whole - 8) *
+                                        100'000'000ULL +
+                                      swar_digits_value(chars_at(whole_end - 8), 8);
+  value = static_cast<double>(whole);
+  // Fraction and exponent: the same floating-point steps as parse_numeric
+  for (int i = frac_begin, divisor_index = 0; i < frac_end; ++i) {
+    double const divisor = cudf::io::detail::decimal_divisor(divisor_index++);
+    value += static_cast<uint8_t>(char_at(i) - '0') * divisor;
+  }
+  if (exp_begin < len) {
+    int32_t exponent = 0;
+    for (int i = exp_begin; i < len; ++i) {
+      exponent = (exponent * 10) + static_cast<uint8_t>(char_at(i) - '0');
+    }
+    if (exponent != 0) {
+      auto const power = exponent * exponent_sign;
+      value *= (opts.exp10_table != nullptr && power >= -exp10_table_bias &&
+                power <= exp10_table_bias)
+                 ? opts.exp10_table[power + exp10_table_bias]
+                 : exp10(double(power));
+    }
+  }
+  int32_t const sign = negative ? -1 : 1;
+  value              = value * sign;
+  return true;
+}
+
+/**
  * @brief `convert_csv_to_cudf`'s decoding of a valid field into an integer column (any integral
  * type but BOOL8) for a field accepted by `plain_integer_value`. Returns false, and stores
  * nothing, for any other field or column type.
@@ -1201,6 +1335,9 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   // Staged rows only: the word loads need the staging slack, and in the unstaged instance the
   // extra code costs more registers than it saves
   bool const plain_ints = not WindowedIntegers and is_staged and plain_digits_parse(options);
+  bool const plain_floats =
+    plain_ints and options.decimal != 'e' and options.decimal != 'E' and options.decimal != '+';
+  double plain_double = 0;
 
   while (col < column_flags.size() && field_start < row_end) {
     // In delim_whitespace mode, collapse leading delimiter runs so leading whitespace does
@@ -1226,6 +1363,16 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                    load_aligned_word)) {
       // Plain integers (the common case) are decoded with word operations
       set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
+      ++actual_col;
+    } else if (plain_floats and (column_flags[col] & column_parse::enabled) and
+               dtypes[actual_col].id() == type_id::FLOAT64 and
+               plain_double_value(
+                 options, field_start, next_delimiter, load_aligned_word, plain_double)) {
+      // Plain decimal numbers are decoded with word operations (same floating-point steps)
+      static_cast<double*>(columns[actual_col])[rec_id] = plain_double;
+      if (not isnan(plain_double)) {
+        set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
+      }
       ++actual_col;
     } else if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
