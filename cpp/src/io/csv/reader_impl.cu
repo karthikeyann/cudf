@@ -718,7 +718,13 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
 
   for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
     if (column_flags[col] & column_parse::enabled) {
-      auto out_buffer = column_buffer(column_types[active_col], num_records, true, stream, mr);
+      // Only string (pointer, length) pairs need zeroing: fields that are missing from a row must
+      // read as null strings. Other data is only meaningful where the (zeroed) null mask is set.
+      auto out_buffer = column_buffer(column_types[active_col], true);
+      out_buffer.create(num_records,
+                        column_types[active_col].id() == type_id::STRING,
+                        stream,
+                        mr);
 
       out_buffer.name = column_names[col];
       out_buffers.emplace_back(std::move(out_buffer));
