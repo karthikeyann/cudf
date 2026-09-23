@@ -784,9 +784,10 @@ __device__ __forceinline__ bool plain_integer_value(parse_options_view const& op
     return false;
   }
   auto const key_len = static_cast<size_t>(len);
-  if (serialized_trie_contains(opts.trie_na, {field_start, key_len}) or
-      serialized_trie_contains(opts.trie_true, {field_start, key_len}) or
-      serialized_trie_contains(opts.trie_false, {field_start, key_len})) {
+  if (opts.tries_may_hold_plain_integers and
+      (serialized_trie_contains(opts.trie_na, {field_start, key_len}) or
+       serialized_trie_contains(opts.trie_true, {field_start, key_len}) or
+       serialized_trie_contains(opts.trie_false, {field_start, key_len}))) {
     return false;
   }
   // 8 digit characters starting at digit `k` (0 <= k <= 16)

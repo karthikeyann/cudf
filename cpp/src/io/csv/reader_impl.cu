@@ -1546,10 +1546,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 }
 
 /**
- * @brief Serializes the trie for N/A value matching, based on the options.
+ * @brief Returns the keys of the N/A value trie, based on the options (none without N/A filtering).
  */
-std::vector<cudf::detail::serial_trie_node> serialize_na_trie(char quotechar,
-                                                              csv_reader_options const& reader_opts)
+std::vector<std::string> na_keys(char quotechar, csv_reader_options const& reader_opts)
 {
   // Default values to recognize as null values
   static std::vector<std::string> const default_na_values{"",
@@ -1583,7 +1582,7 @@ std::vector<cudf::detail::serial_trie_node> serialize_na_trie(char quotechar,
     na_values.emplace_back(2, quotechar);
   }
 
-  return cudf::detail::serialize_trie(na_values);
+  return na_values;
 }
 
 parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::stream_ref stream)
@@ -1626,7 +1625,21 @@ parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::st
   // The tries are serialized on the host, then uploaded together with a single sync
   auto const true_nodes  = cudf::detail::serialize_trie(reader_opts.get_true_values());
   auto const false_nodes = cudf::detail::serialize_trie(reader_opts.get_false_values());
-  auto const na_nodes    = serialize_na_trie(parse_opts.quotechar, reader_opts);
+  auto const na_values   = na_keys(parse_opts.quotechar, reader_opts);
+  auto const na_nodes    = cudf::detail::serialize_trie(na_values);
+
+  // Plain integer fields (an optional '-' then digits) can only match a key of that form
+  auto const is_plain_integer_key = [](std::string const& key) {
+    auto const digits_begin = key.begin() + (!key.empty() && key.front() == '-');
+    return digits_begin != key.end() &&
+           std::all_of(digits_begin, key.end(), [](char c) { return c >= '0' && c <= '9'; });
+  };
+  auto const any_plain_integer_key = [&](std::vector<std::string> const& keys) {
+    return std::any_of(keys.begin(), keys.end(), is_plain_integer_key);
+  };
+  parse_opts.tries_may_hold_plain_integers = any_plain_integer_key(reader_opts.get_true_values()) or
+                                             any_plain_integer_key(reader_opts.get_false_values()) or
+                                             any_plain_integer_key(na_values);
 
   // Handle user-defined true values, whereby field data is substituted with a
   // boolean true or numeric `1` value
