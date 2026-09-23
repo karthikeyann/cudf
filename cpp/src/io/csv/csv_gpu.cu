@@ -1025,6 +1025,47 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  * @param[out] block_pos Position of the thread's first character in `data`
  * @return {row bitmaps for input states NONE, QUOTE and COMMENT; packed output states}
  */
+/**
+ * @brief Returns the row context transition of an in-range character `c` preceded by `c_prev`
+ * (see compute_char_contexts for the meaning of the states).
+ */
+__device__ __forceinline__ uint32_t char_context(
+  int c, int c_prev, int terminator, int delimiter, int quotechar, int commentchar)
+{
+  if (c_prev == terminator) {
+    if (c == commentchar) {
+      // Start of a new comment row
+      return make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
+    } else if (c == quotechar) {
+      // Quoted string on newrow, or quoted string ending in terminator
+      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+    }
+    // Start of a new row unless within a quote
+    return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
+  } else if (c == quotechar) {
+    // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
+    // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
+    // exit because it might be the first quote of a "" escape sequence. We transition to
+    // COMMENT (pending exit) and wait for the next character:
+    //   - If next char is quote: it's a "" escape, return to QUOTE
+    //   - If next char is anything else: exit confirmed, go to NONE
+    // This doesn't conflict with actual comment handling because comments are only
+    // detected at row boundaries (after newline), where COMMENT state is set with row
+    // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
+    if (c_prev == delimiter) {
+      // Quote after delimiter: start field or pending exit
+      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+    } else if (c_prev == quotechar) {
+      // Quote after quote: "" escape or stay NONE (Spark compatibility)
+      return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+    }
+    // Quote after regular char: pending exit or stay NONE
+    return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
+  }
+  // Non-quote char: stay in current state, or exit from pending
+  return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+}
+
 __device__ uint4 compute_char_contexts(device_span<char const> const data,
                                        size_t chunk_size,
                                        size_t parse_pos,
@@ -1072,13 +1113,20 @@ __device__ uint4 compute_char_contexts(device_span<char const> const data,
     auto const bytes4       = [](int ch) { return static_cast<uint32_t>(ch & 0xff) * 0x0101'0101u; };
     uint32_t special        = 0;
     uint32_t terminators    = 0;
+    uint32_t quotes         = 0;
+    // One bit per byte: gather the top bit of each 0xff byte into 4 consecutive bits
+    auto const to_bits = [](uint32_t mask) {
+      return ((((mask >> 7) & 0x0101'0101u) * 0x0020'4081u) >> 21) & 0xf;
+    };
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
-      if (quotechar < 0x100) { special |= __vcmpeq4(words[i], bytes4(quotechar)); }
+      if (quotechar < 0x100) {
+        auto const q = __vcmpeq4(words[i], bytes4(quotechar));
+        special |= q;
+        quotes |= to_bits(q) << (4 * i);
+      }
       if (commentchar < 0x100) { special |= __vcmpeq4(words[i], bytes4(commentchar)); }
-      // One bit per byte: gather the top bit of each 0xff byte into 4 consecutive bits
-      auto const eq = (__vcmpeq4(words[i], bytes4(terminator)) >> 7) & 0x0101'0101u;
-      terminators |= (((eq * 0x0020'4081u) >> 21) & 0xf) << (4 * i);
+      terminators |= to_bits(__vcmpeq4(words[i], bytes4(terminator))) << (4 * i);
     }
     if (special == 0) {
       fast_path          = true;
@@ -1088,6 +1136,26 @@ __device__ uint4 compute_char_contexts(device_span<char const> const data,
       ctx_map.z          = rowmap;
       ctx_map.w =
         (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_NONE << 4) | (ROW_CTX_EOF << 6);
+    } else {
+      // Event path: only row starts (after a terminator) and quote characters can change the
+      // state differently from a regular character. Consecutive regular characters act like a
+      // single one (NONE->NONE, QUOTE->QUOTE, COMMENT->NONE, no rows), so each run is merged once.
+      fast_path              = true;
+      auto const row_starts  = (terminators << 1) | (c_prev == terminator ? 1u : 0u);
+      auto const regular     = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+      uint32_t events        = row_starts | quotes;
+      uint32_t pos           = 0;
+      while (events != 0) {
+        auto const k = static_cast<uint32_t>(__ffs(events)) - 1;
+        events &= events - 1;
+        if (k > pos) { merge_char_context(ctx_map, regular, pos); }
+        int const ch      = cur[k];
+        int const ch_prev = k > 0 ? static_cast<int>(cur[k - 1]) : c_prev;
+        merge_char_context(
+          ctx_map, char_context(ch, ch_prev, terminator, delimiter, quotechar, commentchar), k);
+        pos = k + 1;
+      }
+      if (pos < 32) { merge_char_context(ctx_map, regular, pos); }
     }
   }
   if (!fast_path) {
@@ -1095,42 +1163,8 @@ __device__ uint4 compute_char_contexts(device_span<char const> const data,
     for (uint32_t pos = 0; pos < 32; pos++, cur++, c_prev = c) {
       uint32_t ctx;
       if (cur < end) {
-        c = cur[0];
-        if (c_prev == terminator) {
-          if (c == commentchar) {
-            // Start of a new comment row
-            ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
-          } else if (c == quotechar) {
-            // Quoted string on newrow, or quoted string ending in terminator
-            ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
-          } else {
-            // Start of a new row unless within a quote
-            ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
-          }
-        } else if (c == quotechar) {
-          // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
-          // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
-          // exit because it might be the first quote of a "" escape sequence. We transition to
-          // COMMENT (pending exit) and wait for the next character:
-          //   - If next char is quote: it's a "" escape, return to QUOTE
-          //   - If next char is anything else: exit confirmed, go to NONE
-          // This doesn't conflict with actual comment handling because comments are only
-          // detected at row boundaries (after newline), where COMMENT state is set with row
-          // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
-          if (c_prev == delimiter) {
-            // Quote after delimiter: start field or pending exit
-            ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-          } else if (c_prev == quotechar) {
-            // Quote after quote: "" escape or stay NONE (Spark compatibility)
-            ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
-          } else {
-            // Quote after regular char: pending exit or stay NONE
-            ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
-          }
-        } else {
-          // Non-quote char: stay in current state, or exit from pending
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
-        }
+        c   = cur[0];
+        ctx = char_context(c, c_prev, terminator, delimiter, quotechar, commentchar);
       } else {
         bool const is_last_chunk = data_end_off <= data.size();
         if (is_last_chunk && cur <= end && cur == data_end) {
