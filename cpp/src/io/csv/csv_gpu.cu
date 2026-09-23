@@ -1398,24 +1398,28 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     bool may_have_quote_pair = true;
     auto next_delimiter      = seek_field_end_by_words(
       field_start, row_end, raw_csv, options, &may_have_quote_pair, words);
+    // Per-column metadata, read once per field (the stores below may alias it for the compiler)
+    auto const flags = column_flags[col];
+    auto const type =
+      (flags & column_parse::enabled) ? dtypes[actual_col].id() : cudf::type_id::EMPTY;
 
-    if (column_flags[col] & column_parse::predecoded) {
+    if (flags & column_parse::predecoded) {
       // Already decoded during type inference
       ++actual_col;
-    } else if (plain_ints and (column_flags[col] & column_parse::enabled) and
-               not(column_flags[col] & column_parse::as_hexadecimal) and
+    } else if (plain_ints and (flags & column_parse::enabled) and
+               not(flags & column_parse::as_hexadecimal) and
                store_plain_integer(options,
                                    field_start,
                                    next_delimiter,
-                                   dtypes[actual_col].id(),
+                                   type,
                                    columns[actual_col],
                                    rec_id,
                                    load_aligned_word)) {
       // Plain integers (the common case) are decoded with word operations
       set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
       ++actual_col;
-    } else if (plain_floats and (column_flags[col] & column_parse::enabled) and
-               dtypes[actual_col].id() == type_id::FLOAT64 and
+    } else if (plain_floats and (flags & column_parse::enabled) and
+               type == type_id::FLOAT64 and
                plain_double_value(
                  options, field_start, next_delimiter, load_aligned_word, plain_double)) {
       // Plain decimal numbers are decoded with word operations (same floating-point steps)
@@ -1424,7 +1428,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
         set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
       }
       ++actual_col;
-    } else if (column_flags[col] & column_parse::enabled) {
+    } else if (flags & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
       // Unstaged rows read the field's characters from the words the seek already loaded
       auto const field_len = static_cast<size_t>(next_delimiter - field_start);
@@ -1437,7 +1441,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 
       // Modify field_start & end to ignore whitespace and quotechars
       auto field_end = next_delimiter;
-      if (is_valid && dtypes[actual_col].id() != cudf::type_id::STRING) {
+      if (is_valid && type != cudf::type_id::STRING) {
         auto const trimmed_field = [&] {
           if constexpr (WindowedIntegers) {
             return trim_whitespaces_quotes_at(field_start, field_end, options.quotechar, words);
@@ -1450,7 +1454,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
       }
       if (is_valid) {
         // Type dispatcher does not handle STRING
-        if (dtypes[actual_col].id() == cudf::type_id::STRING) {
+        if (type == cudf::type_id::STRING) {
           auto end        = next_delimiter;
           bool was_quoted = false;
           if (not options.keepquotes) {
@@ -1497,12 +1501,12 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           bool stored = false;
           if constexpr (WindowedIntegers and TypedFastPaths) {
             // Plain integers are decoded from the seek's words without a per-character loop
-            stored = not(column_flags[col] & column_parse::as_hexadecimal) and
+            stored = not(flags & column_parse::as_hexadecimal) and
                      store_window_integer(options,
                                           words.window,
                                           field_start,
                                           field_end,
-                                          dtypes[actual_col].id(),
+                                          type,
                                           columns[actual_col],
                                           rec_id);
           }
@@ -1514,12 +1518,12 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                     rec_id,
                                     dtypes[actual_col],
                                     options,
-                                    column_flags[col] & column_parse::as_hexadecimal)) {
+                                    flags & column_parse::as_hexadecimal)) {
             // set the valid bitmap - all bits were set to 0 to start
             set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
           }
         }
-      } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
+      } else if (type == cudf::type_id::STRING) {
         auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
         str_list[rec_id].first  = nullptr;
         str_list[rec_id].second = 0;
