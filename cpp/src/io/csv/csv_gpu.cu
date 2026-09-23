@@ -1875,39 +1875,23 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   }
 }
 
-/// Block size of the tile start state scan
-constexpr int start_state_block_dim = 1024;
-
 /**
- * @brief Computes each tile's starting parser state from the tile transitions (one block), and
- * lists the tiles that do not start in the NONE state.
+ * @brief Records each tile's starting parser state, from the exclusive scan of the tile
+ * transitions, and lists the tiles that do not start in the NONE state.
  */
-CUDF_KERNEL void __launch_bounds__(start_state_block_dim)
-  tile_start_states_gpu(tile_transition const* tile_transitions,
-                        uint32_t num_tiles,
-                        uint8_t* start_states,
-                        uint32_t* redo_tiles,
-                        uint32_t* redo_count)
+CUDF_KERNEL void tile_start_states_gpu(tile_transition const* tile_prefixes,
+                                       uint32_t num_tiles,
+                                       uint8_t* start_states,
+                                       uint32_t* redo_tiles,
+                                       uint32_t* redo_count)
 {
-  using block_scan = cub::BlockScan<tile_transition, start_state_block_dim>;
-  __shared__ typename block_scan::TempStorage temp_storage;
-  tile_transition carry = identity_transition;  // transition of all tiles before this chunk
-  for (uint32_t first = 0; first < num_tiles; first += start_state_block_dim) {
-    auto const tile = first + threadIdx.x;
-    auto const in   = tile < num_tiles ? tile_transitions[tile] : identity_transition;
-    tile_transition prefix;
-    tile_transition chunk;
-    block_scan(temp_storage).ExclusiveScan(in, prefix, carry, compose_transitions{}, chunk);
-    // The data starts in the NONE state
-    if (tile < num_tiles) {
-      auto const start_state = prefix & 3;
-      start_states[tile]     = start_state;
-      // Tiles that do not start in the NONE state assumed by the first launch must be redone
-      if (start_state != ROW_CTX_NONE) { redo_tiles[atomicAdd(redo_count, 1u)] = tile; }
-    }
-    carry = compose_transitions{}(carry, chunk);
-    __syncthreads();
-  }
+  auto const tile = static_cast<uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (tile >= num_tiles) { return; }
+  // The data starts in the NONE state
+  auto const start_state = tile_prefixes[tile] & 3;
+  start_states[tile]     = start_state;
+  // Tiles that do not start in the NONE state assumed by the first launch must be redone
+  if (start_state != ROW_CTX_NONE) { redo_tiles[atomicAdd(redo_count, 1u)] = tile; }
 }
 
 /**
@@ -2039,7 +2023,7 @@ size_t detection_stage_size(device_span<char const> data,
     data, row_starts, max_smem_size - detection_histogram_smem(num_active_columns), stream);
 }
 
-cudf::detail::host_vector<column_type_histogram> detect_column_types(
+rmm::device_uvector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> const data,
   device_span<column_parse::flags const> const column_flags,
@@ -2094,7 +2078,7 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   }
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  return cudf::detail::make_host_vector(d_stats, stream);
+  return d_stats;
 }
 
 void decode_row_column_data(cudf::io::parse_options_view const& options,
@@ -2182,8 +2166,20 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
   };
   // Assume every tile starts outside of quotes, then redo the tiles where that was wrong
   launch(nullptr);
-  tile_start_states_gpu<<<1, start_state_block_dim, 0, stream.get()>>>(
-    tile_transitions.data(), num_tiles, start_states.data(), redo_tiles.data(), redo_count.data());
+  // Each tile's transition from the start of the data: the composition of all earlier tiles'
+  rmm::device_uvector<tile_transition> tile_prefixes(num_tiles, stream);
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, mr),
+                         tile_transitions.begin(),
+                         tile_transitions.end(),
+                         tile_prefixes.begin(),
+                         identity_transition,
+                         compose_transitions{});
+  constexpr int start_state_block_dim = 256;
+  tile_start_states_gpu<<<cudf::util::div_rounding_up_safe<uint32_t>(num_tiles, start_state_block_dim),
+                          start_state_block_dim,
+                          0,
+                          stream.get()>>>(
+    tile_prefixes.data(), num_tiles, start_states.data(), redo_tiles.data(), redo_count.data());
   CUDF_CUDA_TRY(cudaGetLastError());
   launch(start_states.data());
 

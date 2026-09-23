@@ -10,6 +10,8 @@
 #include <cudf/detail/utilities/host_vector.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <cuda/stream>
 
 using cudf::device_span;
@@ -192,9 +194,9 @@ device_span<uint64_t> remove_blank_rows(cudf::io::parse_options_view const& opti
  * @param[in] stage_size Shared memory for staging rows, from `detection_stage_size`
  * @param[in] stream CUDA stream to use
  *
- * @return stats Histogram of each dtypes' occurrence for each column
+ * @return stats Histogram of each dtypes' occurrence for each column (not synchronized)
  */
-cudf::detail::host_vector<column_type_histogram> detect_column_types(
+rmm::device_uvector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> data,
   device_span<column_parse::flags const> column_flags,

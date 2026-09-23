@@ -772,7 +772,7 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
     make_device_uvector_async(h_int_valids, stream, cudf::get_current_device_resource_ref());
   zero_null_masks(d_int_valids, num_records, stream);
 
-  auto const column_stats = cudf::io::csv::gpu::detect_column_types(
+  auto const d_column_stats = cudf::io::csv::gpu::detect_column_types(
     parse_opts.view(),
     data,
     make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
@@ -783,7 +783,10 @@ std::vector<std::optional<predecoded_column>> infer_column_types(
     d_int_valid_counts,
     stage_size,
     stream);
-  auto const h_int_valid_counts = cudf::detail::make_host_vector(d_int_valid_counts, stream);
+  // Both results with a single sync
+  auto const column_stats       = cudf::detail::make_host_vector_async(d_column_stats, stream);
+  auto const h_int_valid_counts = cudf::detail::make_host_vector_async(d_int_valid_counts, stream);
+  stream.sync();
 
   auto inf_col_idx = 0;
   for (auto col_idx = 0u; col_idx < column_flags.size(); ++col_idx) {
@@ -872,6 +875,12 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
     }
   }
 
+  // Nothing to decode if type inference already decoded every column
+  auto const all_predecoded = std::all_of(column_flags.begin(), column_flags.end(), [](auto flags) {
+    return not(flags & column_parse::enabled) or (flags & column_parse::predecoded);
+  });
+  if (all_predecoded) { return out_buffers; }
+
   auto h_data  = cudf::detail::make_host_vector<void*>(num_active_columns, stream);
   auto h_valid = cudf::detail::make_host_vector<bitmask_type*>(num_active_columns, stream);
 
@@ -904,12 +913,6 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
                      [] __device__(int i) { return exp10(double(i - exp10_table_bias)); });
     decode_opts.exp10_table = exp10_table.data();
   }
-
-  // Nothing to decode if type inference already decoded every column
-  auto const all_predecoded = std::all_of(column_flags.begin(), column_flags.end(), [](auto flags) {
-    return not(flags & column_parse::enabled) or (flags & column_parse::predecoded);
-  });
-  if (all_predecoded) { return out_buffers; }
 
   cudf::io::csv::gpu::decode_row_column_data(
     decode_opts,
