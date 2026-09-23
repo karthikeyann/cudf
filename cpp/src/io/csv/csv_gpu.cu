@@ -243,10 +243,31 @@ __device__ __forceinline__ char const* seek_field_end_by_words(char const* begin
       reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(current) & ~uintptr_t{7});
     // Words must lie within [data_begin, end); the data buffer itself need not be aligned
     if (word_begin >= data_begin && word_begin + 8 <= end) {
-      auto const word = *reinterpret_cast<uint64_t const*>(word_begin);
-      for (auto i = static_cast<int>(current - word_begin); i < 8; ++i) {
-        if (ends_field(static_cast<char>(word >> (8 * i)), word_begin + i)) {
-          return word_begin + i;
+      auto const word  = *reinterpret_cast<uint64_t const*>(word_begin);
+      auto const first = static_cast<int>(current - word_begin);
+      if (field_starts_with_quote) {
+        for (auto i = first; i < 8; ++i) {
+          if (ends_field(static_cast<char>(word >> (8 * i)), word_begin + i)) {
+            return word_begin + i;
+          }
+        }
+      } else {
+        // Unquoted field: only a delimiter, a terminator or '\r' can end it. Flag candidate bytes
+        // with a zero-byte test; the lowest flag is exact, and every flag is verified below
+        constexpr uint64_t ones  = 0x0101'0101'0101'0101ULL;
+        constexpr uint64_t highs = 0x8080'8080'8080'8080ULL;
+        auto const zero_bytes    = [](uint64_t v) { return (v - ones) & ~v & highs; };
+        auto const repeat_byte   = [](char c) { return ones * static_cast<uint8_t>(c); };
+        auto candidates          = (zero_bytes(word ^ repeat_byte(opts.delimiter)) |
+                           zero_bytes(word ^ repeat_byte(opts.terminator)) |
+                           zero_bytes(word ^ repeat_byte('\r'))) &
+                          (~uint64_t{0} << (8 * first));
+        while (candidates != 0) {
+          auto const i = (__ffsll(static_cast<long long>(candidates)) - 1) / 8;
+          if (ends_field(static_cast<char>(word >> (8 * i)), word_begin + i)) {
+            return word_begin + i;
+          }
+          candidates &= candidates - 1;
         }
       }
       current = word_begin + 8;
