@@ -201,8 +201,9 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
  * @brief Launches kernel for decoding row-column data
  *
  * @param[in] options Options that control individual field data conversion
- * @param[in,out] data The row-column data; quoted string fields are unescaped in place when
- * `options.doublequote` is set (escaped `""` pairs are collapsed to a single quote character)
+ * @param[in] data The row-column data
+ * @param[out] unescape_buffer Buffer at the same offsets as `data` that receives quoted string
+ * fields with escaped quotes (`""` collapsed to `"`); may alias `data`, nullptr if doublequote is off
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] dtypes List of dtype corresponding to each column
@@ -212,7 +213,8 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
  * @param[in] stream CUDA stream to use
  */
 void decode_row_column_data(cudf::io::parse_options_view const& options,
-                            device_span<char> data,
+                            device_span<char const> data,
+                            char* unescape_buffer,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,

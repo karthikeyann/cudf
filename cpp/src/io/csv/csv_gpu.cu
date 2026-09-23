@@ -29,6 +29,7 @@
 #include <cuda/atomic>
 #include <cuda/functional>
 #include <cuda/std/algorithm>
+#include <cuda/std/utility>
 #include <cuda/stream>
 #include <thrust/count.h>
 #include <thrust/detail/copy.h>
@@ -298,30 +299,40 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 }
 
 /**
- * @brief Collapses escaped quote pairs (`""` -> `"`) of a quoted field in place.
+ * @brief Collapses escaped quote pairs (`""` -> `"`) of a quoted field.
  *
  * Pairs are matched left to right without overlap, matching a `""` -> `"` string replace.
+ * Fields without escaped pairs are returned unchanged; otherwise the unescaped field is written to
+ * `out` (which may alias `begin`, since the output never overtakes the input).
  *
  * @param begin First character of the field content (after the opening quote)
  * @param end One past the last character of the field content (before the closing quote)
+ * @param out Output location for the unescaped field
  * @param quotechar Quote character
- * @return New end of the field content
+ * @return Begin and end of the unescaped field
  */
-__device__ __forceinline__ char* unescape_doublequotes(char* begin, char* end, char quotechar)
+__device__ __forceinline__ cuda::std::pair<char const*, char const*> unescape_doublequotes(
+  char const* begin, char const* end, char* out, char quotechar)
 {
   auto in = begin;
-  // Nothing to move until the first escaped pair
   while (in + 1 < end && !(in[0] == quotechar && in[1] == quotechar)) {
     ++in;
   }
-  if (in + 1 >= end) { return end; }
-  auto out = in;
+  if (in + 1 >= end) { return {begin, end}; }
+  auto out_it = out;
+  if (out != begin) {
+    for (auto it = begin; it < in; ++it) {
+      *out_it++ = *it;
+    }
+  } else {
+    out_it += in - begin;
+  }
   while (in < end) {
     auto const c = *in;
-    *out++       = c;
+    *out_it++    = c;
     in += (c == quotechar && in + 1 < end && in[1] == quotechar) ? 2 : 1;
   }
-  return out;
+  return {out, out_it};
 }
 
 /**
@@ -381,7 +392,8 @@ __device__ size_t stage_block_rows(device_span<char const> data,
  */
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
-                      device_span<char> data,
+                      device_span<char const> data,
+                      char* unescape_buffer,
                       device_span<column_parse::flags const> column_flags,
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
@@ -397,7 +409,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   auto const staged_begin = stage_block_rows(data, row_offsets, smem, smem_size);
   auto const is_staged    = staged_begin != data.size();
   auto const base_offset  = is_staged ? staged_begin : 0;
-  // Read-only view of the data; only quoted string fields are written to (see below)
   char const* const raw_csv = is_staged ? smem : data.data();
   // Maps a parsing pointer back into the global data buffer
   auto const to_global = [&](char const* ptr) {
@@ -466,10 +477,16 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           // Unescape doubled quotes ("" -> ") in place. The field bytes belong only to this
           // (row, column), so compacting them within [field_start, end) is race-free.
           // Strings reference the global data buffer, not the staged copy
-          auto const global_start = to_global(field_start);
-          auto global_end         = to_global(end);
-          if (was_quoted && options.doublequote) {
-            global_end = unescape_doublequotes(global_start, global_end, options.quotechar);
+          auto global_start = to_global(field_start);
+          auto global_end   = to_global(end);
+          if (was_quoted && unescape_buffer != nullptr) {
+            auto const unescaped =
+              unescape_doublequotes(global_start,
+                                    global_end,
+                                    unescape_buffer + (global_start - data.data()),
+                                    options.quotechar);
+            global_start = unescaped.first;
+            global_end   = unescaped.second;
           }
           auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
           str_list[rec_id].first  = global_start;
@@ -947,7 +964,8 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
 }
 
 void decode_row_column_data(cudf::io::parse_options_view const& options,
-                            device_span<char> data,
+                            device_span<char const> data,
+                            char* unescape_buffer,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
@@ -964,7 +982,9 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   // Stage each block's rows in shared memory, sized to fit the longest block span; skip staging
   // when that exceeds the default shared memory limit (blocks then read global memory directly)
   constexpr size_t max_smem_size = 48 * 1024;
-  auto const max_block_span      = thrust::transform_reduce(
+  // Skip the span reduction (and its sync) when an average block span already does not fit
+  auto const avg_block_span = data.size() / num_rows * block_size;
+  auto const max_block_span = avg_block_span > max_smem_size ? max_smem_size + 1 : thrust::transform_reduce(
     rmm::exec_policy(stream, cudf::get_current_device_resource_ref()),
     thrust::counting_iterator<size_t>(0),
     thrust::counting_iterator<size_t>(grid_size),
@@ -977,9 +997,21 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
     cuda::maximum<size_t>{});
   // Room for the final 16-byte load, which may extend past the span
   auto const wanted_smem_size = util::round_up_safe<size_t>(max_block_span + 16, 16);
-  auto const smem_size        = wanted_smem_size <= max_smem_size ? wanted_smem_size : 0;
+  // Staging uses 16-byte loads relative to the data start (not aligned e.g. after a skipped BOM in
+  // a zero-copy source)
+  auto const is_aligned = reinterpret_cast<uintptr_t>(data.data()) % 16 == 0;
+  auto const smem_size  = is_aligned && wanted_smem_size <= max_smem_size ? wanted_smem_size : 0;
   convert_csv_to_cudf<<<grid_size, block_size, smem_size, stream.get()>>>(
-    options, data, column_flags, row_offsets, dtypes, columns, valids, valid_counts, smem_size);
+    options,
+    data,
+    unescape_buffer,
+    column_flags,
+    row_offsets,
+    dtypes,
+    columns,
+    valids,
+    valid_counts,
+    smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
