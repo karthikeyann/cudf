@@ -483,8 +483,11 @@ data_and_row_offsets load_data_and_gather_row_offsets(
     pos = target_pos;
   } while (pos < max_input_size);
 
+  // Whole-file gathering already excludes blank rows
   auto const non_blank_row_offsets =
-    io::csv::gpu::remove_blank_rows(parse_opts.view(), input_data(), all_row_offsets, stream);
+    load_whole_file
+      ? device_span<uint64_t>{all_row_offsets}
+      : io::csv::gpu::remove_blank_rows(parse_opts.view(), input_data(), all_row_offsets, stream);
   auto row_offsets = selected_rows_offsets{std::move(all_row_offsets), non_blank_row_offsets};
 
   // Remove header rows and extract header

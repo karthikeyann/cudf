@@ -34,6 +34,7 @@
 #include <thrust/count.h>
 #include <thrust/detail/copy.h>
 #include <thrust/remove.h>
+#include <thrust/scan.h>
 #include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
 #include <thrust/transform_reduce.h>
@@ -1114,6 +1115,24 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
 }
 
 /**
+ * @brief Characters that make a row blank when they start it (see remove_blank_rows).
+ */
+struct blank_row_chars {
+  char newline;
+  char comment;
+  char carriage;
+
+  static blank_row_chars from(parse_options_view const& options)
+  {
+    auto const newline  = options.skipblanklines ? options.terminator : options.comment;
+    auto const comment  = options.comment != '\0' ? options.comment : newline;
+    auto const carriage = (options.skipblanklines && options.terminator == '\n') ? '\r' : comment;
+    return {newline, comment, carriage};
+  }
+  __device__ bool is_blank(char c) const { return c == newline || c == comment || c == carriage; }
+};
+
+/**
  * @brief Row context transition of a sequence of character blocks, with 64-bit row counts.
  *
  * Unlike packed contexts (18-bit counts), composites of many blocks cannot overflow.
@@ -1186,7 +1205,8 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          uint32_t* tile_status,
                          uint64_t* tile_aggregate,
                          uint64_t* tile_inclusive,
-                         uint64_t* tile_first_row,
+                         blank_row_chars blank_chars,
+                         uint64_t* tile_kept_rows,
                          uint32_t* row_bitmaps)
 {
   __shared__ uint64_t bk_ctxtree[bk_ctxtree_size];
@@ -1197,11 +1217,12 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
 
   // Each thread handles slices_per_thread consecutive 32-character slices
   uint4 ctx_maps[slices_per_thread];
+  size_t slice_pos[slices_per_thread];
   packed_rowctx_t thread_ctx = 0;
 #pragma unroll
   for (int j = 0; j < slices_per_thread; ++j) {
-    size_t block_pos = 0;
-    ctx_maps[j]      = compute_char_contexts(
+    auto& block_pos = slice_pos[j];
+    ctx_maps[j]     = compute_char_contexts(
       data,
       chunk_size,
       parse_pos,
@@ -1271,21 +1292,31 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     if (lane == 0) {
       tile_inclusive[tile] = select_row_context(prefix, aggregate);
       status.store(TILE_INCLUSIVE, cuda::memory_order_release);
-      tile_first_row[tile] = prefix >> 2;
       bk_ctxtree[0]        = prefix;
     }
   }
   __syncthreads();
 
   // Walk back the transform tree with the known initial parser state
-  auto state = rowctx_inverse_merge_transform(bk_ctxtree, t) & 3;
+  auto state          = rowctx_inverse_merge_transform(bk_ctxtree, t) & 3;
+  uint32_t kept_rows = 0;
 #pragma unroll
   for (int j = 0; j < slices_per_thread; ++j) {
-    row_bitmaps[(static_cast<size_t>(tile) * rowofs_block_dim + t) * slices_per_thread + j] =
-      select_rowmap(ctx_maps[j], state);
+    auto rowmap = select_rowmap(ctx_maps[j], state);
+    // Drop blank rows (see remove_blank_rows); the end-of-data row is always kept
+    for (auto bits = rowmap; bits != 0; bits &= bits - 1) {
+      auto const pos = slice_pos[j] + __ffs(bits) - 1;
+      if (pos != data.size() && blank_chars.is_blank(data[pos])) { rowmap &= ~(1u << (__ffs(bits) - 1)); }
+    }
+    kept_rows += __popc(rowmap);
+    row_bitmaps[(static_cast<size_t>(tile) * rowofs_block_dim + t) * slices_per_thread + j] = rowmap;
     // Output state of the slice for this input state (EOF stays EOF)
     state = state < 3 ? (ctx_maps[j].w >> (2 * state)) & 3 : state;
   }
+  using block_reduce = cub::BlockReduce<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_reduce::TempStorage reduce_storage;
+  kept_rows = block_reduce(reduce_storage).Sum(kept_rows);
+  if (t == 0) { tile_kept_rows[tile] = kept_rows; }
 }
 
 /**
@@ -1452,14 +1483,15 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
   auto const tile_bytes = static_cast<size_t>(rowofs_block_bytes) * slices_per_thread;
   auto const num_tiles  = static_cast<uint32_t>(1 + (chunk_size / tile_bytes));
   auto const mr        = cudf::get_current_device_resource_ref();
-  // Zeroed counter and statuses, followed by the aggregates, inclusive prefixes and first rows
+  // Zeroed counter and statuses, followed by the aggregates, inclusive prefixes and kept row
+  // counts (with one extra zero, so that their exclusive scan ends with the total)
   auto tile_state = cudf::detail::make_zeroed_device_uvector_async<uint64_t>(
-    1 + 4 * static_cast<size_t>(num_tiles), stream, mr);
+    2 + 4 * static_cast<size_t>(num_tiles), stream, mr);
   auto const tile_counter   = reinterpret_cast<uint32_t*>(tile_state.data());
   auto const tile_status    = tile_counter + 2;  // after the 64-bit counter slot
   auto const tile_aggregate = tile_state.data() + 1 + num_tiles;
   auto const tile_inclusive = tile_aggregate + num_tiles;
-  auto const tile_first_row = tile_inclusive + num_tiles;
+  auto const tile_kept_rows = tile_inclusive + num_tiles;
   static_assert(sizeof(uint32_t) * 2 == sizeof(uint64_t));
   rmm::device_uvector<uint32_t> row_bitmaps(static_cast<size_t>(num_tiles) * rowofs_block_dim * slices_per_thread,
                                             stream);
@@ -1479,19 +1511,24 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
     tile_status,
     tile_aggregate,
     tile_inclusive,
-    tile_first_row,
+    blank_row_chars::from(options),
+    tile_kept_rows,
     row_bitmaps.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  // The total row count is the last tile's inclusive row count
-  auto const last_inclusive =
-    cudf::detail::make_host_vector(device_span<uint64_t const>{tile_inclusive + num_tiles - 1, 1}, stream);
-  auto const num_rows = static_cast<size_t>(last_inclusive[0] >> 2);
+  // First kept row of each tile; the last entry is the total number of kept rows
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, mr),
+                         tile_kept_rows,
+                         tile_kept_rows + num_tiles + 1,
+                         tile_kept_rows);
+  auto const total_rows =
+    cudf::detail::make_host_vector(device_span<uint64_t const>{tile_kept_rows + num_tiles, 1}, stream);
+  auto const num_rows = static_cast<size_t>(total_rows[0]);
 
   rmm::device_uvector<uint64_t> offsets(num_rows, stream);
   auto const parse_off = parse_pos > start_offset ? parse_pos - start_offset : 0;
   row_bitmaps_to_offsets_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
-    row_bitmaps.data(), tile_first_row, parse_off, offsets);
+    row_bitmaps.data(), tile_kept_rows, parse_off, offsets);
   CUDF_CUDA_TRY(cudaGetLastError());
   return offsets;
 }
