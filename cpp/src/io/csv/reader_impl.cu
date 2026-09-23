@@ -28,6 +28,7 @@
 #include <cudf/io/types.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/strings/detail/strings_children.cuh>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/utilities/bit.hpp>
 #include <cudf/table/table.hpp>
@@ -923,13 +924,17 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
 /**
  * @brief Computes validity bitmasks, null counts and total character counts of all string columns.
  *
- * Grid: x covers the rows, y is the string column index.
+ * If `sizes` is not null, also writes each string's size to `sizes[col][row]`, and 0 to
+ * `sizes[col][num_rows]` (for an in-place exclusive scan into offsets).
+ *
+ * Grid: x covers the rows plus one, y is the string column index.
  */
 CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* const* columns,
                                                    size_type num_rows,
                                                    bitmask_type* const* null_masks,
-                                                   size_type* null_counts,
-                                                   int64_t* total_bytes)
+                                                   int64_t* null_counts,
+                                                   int64_t* total_bytes,
+                                                   size_type* const* sizes)
 {
   auto const col  = blockIdx.y;
   auto const row  = static_cast<size_type>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -938,13 +943,17 @@ CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* cons
   auto const in_range = row < num_rows;
   auto const item     = in_range ? columns[col][row] : string_index_pair{nullptr, 0};
   auto const is_valid = item.first != nullptr;
+  if (sizes != nullptr && row <= num_rows) { sizes[col][row] = is_valid ? item.second : 0; }
   auto const valid_mask = __ballot_sync(0xffff'ffffu, is_valid);
   // Rows are warp aligned, so each warp owns one mask word
   if (lane == 0 && row < num_rows) {
     null_masks[col][row / cudf::detail::size_in_bits<bitmask_type>()] = valid_mask;
     auto const rows_in_warp = cuda::std::min<size_type>(cudf::detail::size_in_bits<bitmask_type>(), num_rows - row);
     auto const warp_nulls   = rows_in_warp - __popc(valid_mask);
-    if (warp_nulls != 0) { atomicAdd(null_counts + col, warp_nulls); }
+    if (warp_nulls != 0) {
+      atomicAdd(reinterpret_cast<unsigned long long*>(null_counts + col),
+                static_cast<unsigned long long>(warp_nulls));
+    }
   }
 
   using block_reduce = cub::BlockReduce<int64_t, 256>;
@@ -981,10 +990,25 @@ struct offsets_writer {
 };
 
 /**
+ * @brief Returns the size of each string, as a 64-bit offsets scan input.
+ */
+struct string_size_fn {
+  string_index_pair const* pairs;
+  size_type num_rows;
+
+  __device__ int64_t operator()(size_type idx) const
+  {
+    return idx < num_rows && pairs[idx].first != nullptr ? pairs[idx].second : 0;
+  }
+};
+
+/**
  * @brief Creates the output string columns from decoded (pointer, length) pairs.
  *
- * All string columns are built together, with a fixed number of kernels and a single host
- * synchronization, instead of one `make_strings_column` call per column.
+ * All string columns are built together, with a single host synchronization. Validity, null
+ * counts and sizes come from one kernel over all columns. With few columns, that kernel also
+ * writes the sizes into 32-bit offsets columns, which are scanned in place per column; with many,
+ * one segmented scan and one batched copy serve all columns, instead of kernels per column.
  */
 std::vector<std::unique_ptr<column>> make_strings_columns(
   host_span<device_span<string_index_pair const> const> buffers,
@@ -995,47 +1019,92 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   auto const num_columns = buffers.size();
   if (num_columns == 0) { return {}; }
 
-  // Validity masks, null counts and chars sizes
+  // Per-column 32-bit offsets, filled with the string sizes and then scanned in place
+  constexpr size_t max_per_column_builds = 4;
+  auto const per_column = num_columns <= max_per_column_builds;
+
+  // Validity masks, null counts and chars sizes. The column, mask and (per-column only) offsets
+  // pointers are uploaded together
   std::vector<rmm::device_buffer> null_masks;
-  auto h_columns = cudf::detail::make_host_vector<string_index_pair const*>(num_columns, stream);
-  auto h_masks   = cudf::detail::make_host_vector<bitmask_type*>(num_columns, stream);
+  std::vector<std::unique_ptr<column>> offsets32;
+  auto h_pointers =
+    cudf::detail::make_host_vector<void*>((per_column ? 3 : 2) * num_columns, stream);
   for (size_t c = 0; c < num_columns; ++c) {
-    h_columns[c] = buffers[c].data();
+    h_pointers[c] = const_cast<string_index_pair*>(buffers[c].data());
     // Uninitialized: the validity kernel writes every word
     null_masks.emplace_back(cudf::bitmask_allocation_size_bytes(num_rows), stream, mr);
-    h_masks[c] = static_cast<bitmask_type*>(null_masks.back().data());
+    h_pointers[num_columns + c] = null_masks.back().data();
+    if (per_column) {
+      offsets32.emplace_back(make_numeric_column(
+        data_type{type_id::INT32}, num_rows + 1, mask_state::UNALLOCATED, stream, mr));
+      h_pointers[2 * num_columns + c] = offsets32.back()->mutable_view().data<size_type>();
+    }
   }
-  auto const d_columns =
-    cudf::detail::make_device_uvector_async(h_columns, stream, cudf::get_current_device_resource_ref());
-  auto const d_masks =
-    cudf::detail::make_device_uvector_async(h_masks, stream, cudf::get_current_device_resource_ref());
-  // Null counts (as int64) followed by chars sizes
+  auto const d_pointers =
+    cudf::detail::make_device_uvector_async(h_pointers, stream, cudf::get_current_device_resource_ref());
+  auto const d_columns = reinterpret_cast<string_index_pair const* const*>(d_pointers.data());
+  auto const d_masks   = reinterpret_cast<bitmask_type* const*>(d_pointers.data() + num_columns);
+  auto const d_sizes   = reinterpret_cast<size_type* const*>(d_pointers.data() + 2 * num_columns);
+  // Null counts followed by chars sizes
   auto d_counts = cudf::detail::make_zeroed_device_uvector_async<int64_t>(
     2 * num_columns, stream, cudf::get_current_device_resource_ref());
-  auto d_null_counts = rmm::device_uvector<size_type>(num_columns, stream);
-  CUDF_CUDA_TRY(cudaMemsetAsync(
-    d_null_counts.data(), 0, num_columns * sizeof(size_type), stream.get()));
 
   constexpr int block_size         = 256;
   constexpr size_t max_grid_columns = 65535;  // grid y dimension limit
   for (size_t first = 0; first < num_columns; first += max_grid_columns) {
-    dim3 const grid(cudf::util::div_rounding_up_safe<size_type>(num_rows, block_size),
+    dim3 const grid(cudf::util::div_rounding_up_safe<size_type>(num_rows + 1, block_size),
                     std::min(max_grid_columns, num_columns - first));
     strings_validity_and_sizes_kernel<<<grid, block_size, 0, stream.get()>>>(
-      d_columns.data() + first,
+      d_columns + first,
       num_rows,
-      d_masks.data() + first,
-      d_null_counts.data() + first,
-      d_counts.data() + num_columns + first);
+      d_masks + first,
+      d_counts.data() + first,
+      d_counts.data() + num_columns + first,
+      per_column ? d_sizes + first : nullptr);
   }
   CUDF_CUDA_TRY(cudaGetLastError());
-  thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                    d_null_counts.begin(),
-                    d_null_counts.end(),
-                    d_counts.begin(),
-                    cuda::proclaim_return_type<int64_t>(
-                      [] __device__(size_type count) { return static_cast<int64_t>(count); }));
+  // Unsigned, so that columns that need 64-bit offsets (rebuilt below) wrap without overflow
+  for (size_t c = 0; c < offsets32.size(); ++c) {
+    auto const offsets = static_cast<uint32_t*>(h_pointers[2 * num_columns + c]);
+    thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                           offsets,
+                           offsets + num_rows + 1,
+                           offsets);
+  }
   auto const h_counts = cudf::detail::make_host_vector(d_counts, stream);
+
+  if (per_column) {
+    auto const threshold = cudf::strings::detail::get_offset64_threshold();
+    std::vector<std::unique_ptr<column>> out;
+    for (size_t c = 0; c < num_columns; ++c) {
+      auto const bytes = h_counts[num_columns + c];
+      CUDF_EXPECTS(cudf::strings::detail::is_large_strings_enabled() || (bytes < threshold),
+                   "Size of output exceeds the column size limit",
+                   std::overflow_error);
+      auto offsets = std::move(offsets32[c]);
+      if (bytes >= threshold) {
+        offsets = make_numeric_column(
+          data_type{type_id::INT64}, num_rows + 1, mask_state::UNALLOCATED, stream, mr);
+        auto const sizes = cuda::transform_iterator(cuda::counting_iterator<size_type>{0},
+                                                    string_size_fn{buffers[c].data(), num_rows});
+        thrust::exclusive_scan(
+          rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+          sizes,
+          sizes + num_rows + 1,
+          offsets->mutable_view().data<int64_t>());
+      }
+      auto chars = cudf::strings::detail::make_chars_buffer(
+        offsets->view(), bytes, buffers[c].data(), num_rows, stream, mr);
+      auto const null_count = static_cast<size_type>(h_counts[c]);
+      out.emplace_back(make_strings_column(
+        num_rows,
+        std::move(offsets),
+        chars.release(),
+        null_count,
+        null_count > 0 ? std::move(null_masks[c]) : rmm::device_buffer{0, stream, mr}));
+    }
+    return out;
+  }
 
   // Offsets columns (32 or 64-bit, depending on each column's size) and chars buffers
   std::vector<rmm::device_buffer> offsets_buffers;
@@ -1080,7 +1149,7 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   auto const sizes = cuda::transform_iterator(
     cuda::counting_iterator<int64_t>{0},
     cuda::proclaim_return_type<int64_t>(
-      [segment_size, segment_div, columns = d_columns.data()] __device__(int64_t idx) -> int64_t {
+      [segment_size, segment_div, columns = d_columns] __device__(int64_t idx) -> int64_t {
         auto const col = static_cast<uint64_t>(idx) / segment_div;
         auto const row = static_cast<uint64_t>(idx) - col * segment_size;
         if (row == segment_size - 1) { return 0; }
@@ -1099,7 +1168,7 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
   auto const num_strings = static_cast<int64_t>(num_rows) * static_cast<int64_t>(num_columns);
   auto const rows       = static_cast<uint64_t>(num_rows);
   auto const rows_div   = cuda::fast_mod_div<uint64_t>{rows};
-  auto const item_at    = [rows, rows_div, columns = d_columns.data()] __device__(int64_t idx) {
+  auto const item_at    = [rows, rows_div, columns = d_columns] __device__(int64_t idx) {
     auto const col = static_cast<uint64_t>(idx) / rows_div;
     return columns[col][static_cast<uint64_t>(idx) - col * rows];
   };
@@ -1443,19 +1512,13 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       stream,
       mr);
 
-    // Build all string columns together: a fixed number of kernels and one host sync
-    // With few string columns the per-column factory (32-bit scans, no cross-column indexing) is
-    // faster; with many, its per-column kernels and syncs dominate and one batched build wins
-    constexpr size_t max_per_column_string_builds = 4;
+    // Build all string columns together, with one host sync
     auto string_columns = [&] {
       std::vector<device_span<string_index_pair const>> spans;
       for (size_t first = 0; first < string_pairs.size(); first += num_records) {
         spans.emplace_back(string_pairs.data() + first, num_records);
       }
-      if (spans.size() > max_per_column_string_builds) {
-        return make_strings_columns(spans, num_records, stream, mr);
-      }
-      return cudf::make_strings_column_batch(spans, stream, mr);
+      return make_strings_columns(spans, num_records, stream, mr);
     }();
     for (size_t i = 0, str_idx = 0; i < out_buffers.size(); ++i) {
       if (predecoded_columns[i].has_value()) {
