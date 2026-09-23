@@ -119,7 +119,7 @@ constexpr int num_decimal_divisors = 324;
  * (generated offline, round-to-nearest with subnormals), so parsing can look them up instead of
  * dividing: double division is very slow on GPUs with reduced FP64 throughput.
  */
-static __device__ double const decimal_divisors[num_decimal_divisors] = {
+static __constant__ double const decimal_divisors[num_decimal_divisors] = {
   0x1.999999999999ap-4, 0x1.47ae147ae147bp-7, 0x1.0624dd2f1a9fcp-10,
   0x1.a36e2eb1c432dp-14, 0x1.4f8b588e368f1p-17, 0x1.0c6f7a0b5ed8ep-20,
   0x1.ad7f29abcaf4ap-24, 0x1.5798ee2308c3bp-27, 0x1.12e0be826d696p-30,
