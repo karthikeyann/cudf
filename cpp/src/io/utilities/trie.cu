@@ -16,6 +16,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <deque>
 #include <string>
 #include <vector>
@@ -66,6 +67,17 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
   // The first node in the serialized trie is also used to match empty strings, so we're
   // initializing it using the `is_end_of_word` value from the root node.
   nodes.push_back(serial_trie_node(trie_terminating_character, tree_trie.is_end_of_word));
+  // The root's children offset is never followed (lookups start at index 1); it stores the length
+  // of the longest key so that longer keys can be rejected without walking the trie
+  auto const max_key_length = std::max_element(keys.cbegin(),
+                                               keys.cend(),
+                                               [](auto const& a, auto const& b) {
+                                                 return a.size() < b.size();
+                                               })
+                                ->size();
+  if (max_key_length <= static_cast<size_t>(std::numeric_limits<int16_t>::max())) {
+    nodes.front().children_offset = static_cast<int16_t>(max_key_length);
+  }
 
   // Add root node to queue. this node is not included to the serialized trie
   to_visit.emplace_back(&tree_trie, -1);

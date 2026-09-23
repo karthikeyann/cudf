@@ -867,54 +867,26 @@ rowctx_inverse_merge_transform(uint64_t const* ctxtree, uint32_t t)
 constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
 
 /**
- * @brief Gather row offsets from CSV character data split into 16KB chunks
+ * @brief Computes, for one thread's 32 characters, the row start bitmaps and output parser
+ * states for each possible input parser state (see gather_row_offsets_gpu).
  *
- * This is done in two phases: the first phase returns the possible row counts
- * per 16K character block for each possible parsing context at the start of the block,
- * along with the resulting parsing context at the end of the block.
- * The caller can then compute the actual parsing context at the beginning of each
- * individual block and total row count.
- * The second phase outputs the location of each row in the block, using the parsing
- * context and initial row counter accumulated from the results of the previous phase.
- * Row parsing context will be updated after phase 2 such that the value contains
- * the number of rows starting at byte_range_end or beyond.
- *
- * @param row_ctx Row parsing context (output of phase 1 or input to phase 2)
- * @param offsets_out Row offsets (nullptr for phase1, non-null indicates phase 2)
- * @param data Base pointer of character data (all row offsets are relative to this)
- * @param chunk_size Total number of characters to parse
- * @param parse_pos Current parsing position in the file
- * @param start_offset Position of the start of the character buffer in the file
- * @param data_size CSV file size
- * @param byte_range_start Ignore rows starting before this position in the file
- * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
- * @param skip_rows Number of rows to skip (ignored in phase 1)
- * @param terminator Line terminator character
- * @param delimiter Column delimiter character
- * @param quotechar Quote character
- * @param escapechar Delimiter escape character
- * @param commentchar Comment line character (skip rows starting with this character)
+ * @param char_pos Position of the 32 characters relative to `parse_pos`
+ * @param[out] block_pos Position of the thread's first character in `data`
+ * @return {row bitmaps for input states NONE, QUOTE and COMMENT; packed output states}
  */
-CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
-  gather_row_offsets_gpu(uint64_t* row_ctx,
-                         device_span<uint64_t> offsets_out,
-                         device_span<char const> const data,
-                         size_t chunk_size,
-                         size_t parse_pos,
-                         size_t start_offset,
-                         size_t data_size,
-                         size_t byte_range_start,
-                         size_t byte_range_end,
-                         size_t skip_rows,
-                         int terminator,
-                         int delimiter,
-                         int quotechar,
-                         int escapechar,
-                         int commentchar)
+__device__ uint4 compute_char_contexts(device_span<char const> const data,
+                                       size_t chunk_size,
+                                       size_t parse_pos,
+                                       size_t start_offset,
+                                       size_t data_size,
+                                       size_t byte_range_start,
+                                       size_t char_pos,
+                                       int terminator,
+                                       int delimiter,
+                                       int quotechar,
+                                       int commentchar,
+                                       size_t& block_pos)
 {
-  // Per-block row context merge tree
-  __shared__ uint64_t bk_ctxtree[bk_ctxtree_size];
-
   auto start = data.data();
 
   // file-level end position for this scan, clamped to the file size
@@ -928,8 +900,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   auto const data_end       = start + cuda::std::min(data_end_off, data.size());
   // Offset of `parse_pos` inside the local `data` window, clamped to avoid underflow
   auto const parse_off = parse_pos > start_offset ? parse_pos - start_offset : 0;
-  uint32_t const t     = threadIdx.x;
-  size_t block_pos     = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
+  block_pos            = parse_off + char_pos;
   auto cur             = start + block_pos;
 
   // Initial state is neutral context (no state transitions), zero rows
@@ -1034,6 +1005,74 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     ctx_map.z &= mask;
   }
 
+  return ctx_map;
+}
+
+/**
+ * @brief Gather row offsets from CSV character data split into 16KB chunks
+ *
+ * This is done in two phases: the first phase returns the possible row counts
+ * per 16K character block for each possible parsing context at the start of the block,
+ * along with the resulting parsing context at the end of the block.
+ * The caller can then compute the actual parsing context at the beginning of each
+ * individual block and total row count.
+ * The second phase outputs the location of each row in the block, using the parsing
+ * context and initial row counter accumulated from the results of the previous phase.
+ * Row parsing context will be updated after phase 2 such that the value contains
+ * the number of rows starting at byte_range_end or beyond.
+ *
+ * @param row_ctx Row parsing context (output of phase 1 or input to phase 2)
+ * @param offsets_out Row offsets (nullptr for phase1, non-null indicates phase 2)
+ * @param data Base pointer of character data (all row offsets are relative to this)
+ * @param chunk_size Total number of characters to parse
+ * @param parse_pos Current parsing position in the file
+ * @param start_offset Position of the start of the character buffer in the file
+ * @param data_size CSV file size
+ * @param byte_range_start Ignore rows starting before this position in the file
+ * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
+ * @param skip_rows Number of rows to skip (ignored in phase 1)
+ * @param terminator Line terminator character
+ * @param delimiter Column delimiter character
+ * @param quotechar Quote character
+ * @param escapechar Delimiter escape character
+ * @param commentchar Comment line character (skip rows starting with this character)
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  gather_row_offsets_gpu(uint64_t* row_ctx,
+                         device_span<uint64_t> offsets_out,
+                         device_span<char const> const data,
+                         size_t chunk_size,
+                         size_t parse_pos,
+                         size_t start_offset,
+                         size_t data_size,
+                         size_t byte_range_start,
+                         size_t byte_range_end,
+                         size_t skip_rows,
+                         int terminator,
+                         int delimiter,
+                         int quotechar,
+                         int escapechar,
+                         int commentchar)
+{
+  // Per-block row context merge tree
+  __shared__ uint64_t bk_ctxtree[bk_ctxtree_size];
+
+  uint32_t const t = threadIdx.x;
+  size_t block_pos = 0;
+  auto const ctx_map = compute_char_contexts(data,
+                                             chunk_size,
+                                             parse_pos,
+                                             start_offset,
+                                             data_size,
+                                             byte_range_start,
+                                             blockIdx.x * static_cast<size_t>(rowofs_block_bytes) +
+                                               t * size_t{32},
+                                             terminator,
+                                             delimiter,
+                                             quotechar,
+                                             commentchar,
+                                             block_pos);
+
   // Convert the long-form {rowmap,outctx}[inctx] version into packed version
   // {rowcount,ouctx}[inctx], then merge the row contexts of the 32-character blocks into
   // a single 16K-character block context
@@ -1071,6 +1110,217 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   } else {
     // Just store the row counts and output contexts
     if (t == 0) { row_ctx[blockIdx.x] = bk_ctxtree[1]; }
+  }
+}
+
+/**
+ * @brief Row context transition of a sequence of character blocks, with 64-bit row counts.
+ *
+ * Unlike packed contexts (18-bit counts), composites of many blocks cannot overflow.
+ */
+struct wide_row_context {
+  uint64_t count[3];  ///< Rows, per input state NONE, QUOTE, COMMENT
+  uint32_t out[3];    ///< Output state, per input state
+
+  __device__ static wide_row_context identity()
+  {
+    return {{0, 0, 0}, {ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_COMMENT}};
+  }
+  /// This sequence followed by a block with the given packed context
+  __device__ wide_row_context then(packed_rowctx_t next) const
+  {
+    wide_row_context result;
+    for (int s = 0; s < 3; ++s) {
+      auto const ctx  = get_row_context(next, out[s]);
+      result.count[s] = count[s] + (ctx >> 2);
+      result.out[s]   = ctx & 3;
+    }
+    return result;
+  }
+  /// This sequence followed by another sequence
+  __device__ wide_row_context then(wide_row_context const& next) const
+  {
+    wide_row_context result;
+    for (int s = 0; s < 3; ++s) {
+      auto const o    = out[s];
+      result.count[s] = count[s] + (o < 3 ? next.count[o] : 0);
+      result.out[s]   = o < 3 ? next.out[o] : o;
+    }
+    return result;
+  }
+  /// Applies this sequence to a resolved context (row_count * 4 + state)
+  __device__ rowctx64_t apply(rowctx64_t ctx) const
+  {
+    auto const s = static_cast<uint32_t>(ctx & 3);
+    if (s >= 3) { return ctx; }  // EOF stays EOF with no rows
+    return ((ctx >> 2) + count[s]) * 4 + out[s];
+  }
+};
+
+/// 32-character slices per thread in single-pass row gathering (64KB tiles)
+constexpr int slices_per_thread = 2;
+
+/// Look-back status of a row context tile (a block of rowofs_block_bytes characters)
+enum tile_status : uint32_t { TILE_INVALID = 0, TILE_AGGREGATE = 1, TILE_INCLUSIVE = 2 };
+
+/**
+ * @brief Single-pass row gathering, phase 1: resolves each block's starting parser state with a
+ * decoupled look-back and writes each thread's row start bitmap (for its resolved input state).
+ *
+ * Blocks take tile indices in launch order from `tile_counter` so that every tile they wait on
+ * is already running. Aggregates are packed row contexts; inclusive prefixes are
+ * `row_count * 4 + state` (see select_row_context).
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  gather_row_bitmaps_gpu(device_span<char const> const data,
+                         size_t chunk_size,
+                         size_t parse_pos,
+                         size_t start_offset,
+                         size_t data_size,
+                         size_t byte_range_start,
+                         int terminator,
+                         int delimiter,
+                         int quotechar,
+                         int commentchar,
+                         uint32_t* tile_counter,
+                         uint32_t* tile_status,
+                         uint64_t* tile_aggregate,
+                         uint64_t* tile_inclusive,
+                         uint64_t* tile_first_row,
+                         uint32_t* row_bitmaps)
+{
+  __shared__ uint64_t bk_ctxtree[bk_ctxtree_size];
+  __shared__ uint32_t tile;
+  uint32_t const t = threadIdx.x;
+  if (t == 0) { tile = atomicAdd(tile_counter, 1); }
+  __syncthreads();
+
+  // Each thread handles slices_per_thread consecutive 32-character slices
+  uint4 ctx_maps[slices_per_thread];
+  packed_rowctx_t thread_ctx = 0;
+#pragma unroll
+  for (int j = 0; j < slices_per_thread; ++j) {
+    size_t block_pos = 0;
+    ctx_maps[j]      = compute_char_contexts(
+      data,
+      chunk_size,
+      parse_pos,
+      start_offset,
+      data_size,
+      byte_range_start,
+      ((static_cast<size_t>(tile) * rowofs_block_dim + t) * slices_per_thread + j) * 32,
+      terminator,
+      delimiter,
+      quotechar,
+      commentchar,
+      block_pos);
+    thread_ctx = j == 0 ? pack_rowmaps(ctx_maps[j])
+                        : merge_row_contexts(thread_ctx, pack_rowmaps(ctx_maps[j]));
+  }
+  rowctx_merge_transform(bk_ctxtree, thread_ctx, t);
+  __syncthreads();
+
+  if (t < cudf::detail::warp_size) {
+    auto const lane      = t;
+    auto const aggregate = bk_ctxtree[1];
+    auto status          = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{tile_status[tile]};
+    if (tile != 0 && lane == 0) {
+      tile_aggregate[tile] = aggregate;
+      status.store(TILE_AGGREGATE, cuda::memory_order_release);
+    }
+    // Composite of the tiles between the look-back window and this tile, per input state
+    wide_row_context later = wide_row_context::identity();
+    // The row context before the first tile: no rows, not in a quote
+    rowctx64_t prefix = ROW_CTX_NONE;
+    // Look back over windows of one tile per lane, nearest window first
+    for (int64_t window_end = tile; window_end > 0; window_end -= cudf::detail::warp_size) {
+      auto const idx = window_end - static_cast<int64_t>(cudf::detail::warp_size) + lane;
+      uint32_t st    = TILE_INCLUSIVE;  // tiles before the first one act as a known (empty) prefix
+      if (idx >= 0) {
+        auto prev = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{tile_status[idx]};
+        while ((st = prev.load(cuda::memory_order_acquire)) == TILE_INVALID) {}
+      }
+      auto const value = idx < 0                 ? rowctx64_t{ROW_CTX_NONE}
+                         : st == TILE_INCLUSIVE ? tile_inclusive[idx]
+                                                : tile_aggregate[idx];
+      auto const inclusive_lanes = __ballot_sync(0xffff'ffffu, st == TILE_INCLUSIVE);
+      // Start from the nearest known prefix in the window (if any), then apply the aggregates of
+      // the following tiles in order
+      int const first_lane = inclusive_lanes ? 31 - __clz(inclusive_lanes) : -1;
+      auto const window_prefix =
+        __shfl_sync(0xffff'ffffu, value, first_lane >= 0 ? first_lane : 0);
+      // Ordered composite of the aggregates after the nearest known prefix (tree reduction)
+      auto window = static_cast<int>(lane) > first_lane
+                      ? wide_row_context::identity().then(static_cast<packed_rowctx_t>(value))
+                      : wide_row_context::identity();
+      for (int offset = 1; offset < static_cast<int>(cudf::detail::warp_size); offset *= 2) {
+        wide_row_context other;
+        for (int k = 0; k < 3; ++k) {
+          other.count[k] = __shfl_down_sync(0xffff'ffffu, window.count[k], offset);
+          other.out[k]   = __shfl_down_sync(0xffff'ffffu, window.out[k], offset);
+        }
+        if (lane + offset < cudf::detail::warp_size) { window = window.then(other); }
+      }
+      // Lane 0 holds the window composite
+      if (first_lane >= 0) {
+        prefix = later.apply(window.apply(window_prefix));
+        break;
+      }
+      later = window.then(later);  // only lane 0's value is used
+    }
+    if (lane == 0) {
+      tile_inclusive[tile] = select_row_context(prefix, aggregate);
+      status.store(TILE_INCLUSIVE, cuda::memory_order_release);
+      tile_first_row[tile] = prefix >> 2;
+      bk_ctxtree[0]        = prefix;
+    }
+  }
+  __syncthreads();
+
+  // Walk back the transform tree with the known initial parser state
+  auto state = rowctx_inverse_merge_transform(bk_ctxtree, t) & 3;
+#pragma unroll
+  for (int j = 0; j < slices_per_thread; ++j) {
+    row_bitmaps[(static_cast<size_t>(tile) * rowofs_block_dim + t) * slices_per_thread + j] =
+      select_rowmap(ctx_maps[j], state);
+    // Output state of the slice for this input state (EOF stays EOF)
+    state = state < 3 ? (ctx_maps[j].w >> (2 * state)) & 3 : state;
+  }
+}
+
+/**
+ * @brief Single-pass row gathering, phase 2: converts the row start bitmaps into row offsets.
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  row_bitmaps_to_offsets_gpu(uint32_t const* row_bitmaps,
+                             uint64_t const* tile_first_row,
+                             size_t parse_off,
+                             device_span<uint64_t> offsets_out)
+{
+  using block_scan = cub::BlockScan<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_scan::TempStorage temp_storage;
+  uint32_t const t       = threadIdx.x;
+  auto const first_word  = (static_cast<size_t>(blockIdx.x) * rowofs_block_dim + t) * slices_per_thread;
+  uint32_t rowmaps[slices_per_thread];
+  uint32_t thread_rows = 0;
+#pragma unroll
+  for (int j = 0; j < slices_per_thread; ++j) {
+    rowmaps[j] = row_bitmaps[first_word + j];
+    thread_rows += __popc(rowmaps[j]);
+  }
+  uint32_t row_in_block;
+  block_scan(temp_storage).ExclusiveSum(thread_rows, row_in_block);
+  auto row = tile_first_row[blockIdx.x] + row_in_block;
+#pragma unroll
+  for (int j = 0; j < slices_per_thread; ++j) {
+    auto rowmap          = rowmaps[j];
+    auto const block_pos = parse_off + (first_word + j) * 32;
+    while (rowmap != 0) {
+      auto const bit = __ffs(rowmap) - 1;
+      if (row < offsets_out.size()) { offsets_out[row] = block_pos + bit; }
+      ++row;
+      rowmap &= rowmap - 1;
+    }
   }
 }
 
@@ -1188,6 +1438,62 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
     valid_counts,
     smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view const& options,
+                                                             device_span<char const> const data,
+                                                             size_t chunk_size,
+                                                             size_t parse_pos,
+                                                             size_t start_offset,
+                                                             size_t data_size,
+                                                             size_t byte_range_start,
+                                                             cuda::stream_ref stream)
+{
+  auto const tile_bytes = static_cast<size_t>(rowofs_block_bytes) * slices_per_thread;
+  auto const num_tiles  = static_cast<uint32_t>(1 + (chunk_size / tile_bytes));
+  auto const mr        = cudf::get_current_device_resource_ref();
+  // Zeroed counter and statuses, followed by the aggregates, inclusive prefixes and first rows
+  auto tile_state = cudf::detail::make_zeroed_device_uvector_async<uint64_t>(
+    1 + 4 * static_cast<size_t>(num_tiles), stream, mr);
+  auto const tile_counter   = reinterpret_cast<uint32_t*>(tile_state.data());
+  auto const tile_status    = tile_counter + 2;  // after the 64-bit counter slot
+  auto const tile_aggregate = tile_state.data() + 1 + num_tiles;
+  auto const tile_inclusive = tile_aggregate + num_tiles;
+  auto const tile_first_row = tile_inclusive + num_tiles;
+  static_assert(sizeof(uint32_t) * 2 == sizeof(uint64_t));
+  rmm::device_uvector<uint32_t> row_bitmaps(static_cast<size_t>(num_tiles) * rowofs_block_dim * slices_per_thread,
+                                            stream);
+
+  gather_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    data,
+    chunk_size,
+    parse_pos,
+    start_offset,
+    data_size,
+    byte_range_start,
+    options.terminator,
+    options.delimiter,
+    (options.quotechar) ? options.quotechar : 0x100,
+    (options.comment) ? options.comment : 0x100,
+    tile_counter,
+    tile_status,
+    tile_aggregate,
+    tile_inclusive,
+    tile_first_row,
+    row_bitmaps.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+
+  // The total row count is the last tile's inclusive row count
+  auto const last_inclusive =
+    cudf::detail::make_host_vector(device_span<uint64_t const>{tile_inclusive + num_tiles - 1, 1}, stream);
+  auto const num_rows = static_cast<size_t>(last_inclusive[0] >> 2);
+
+  rmm::device_uvector<uint64_t> offsets(num_rows, stream);
+  auto const parse_off = parse_pos > start_offset ? parse_pos - start_offset : 0;
+  row_bitmaps_to_offsets_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    row_bitmaps.data(), tile_first_row, parse_off, offsets);
+  CUDF_CUDA_TRY(cudaGetLastError());
+  return offsets;
 }
 
 uint32_t __host__ gather_row_offsets(parse_options_view const& options,

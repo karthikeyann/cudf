@@ -198,6 +198,32 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   cuda::stream_ref stream);
 
 /**
+ * @brief Gathers the offsets of all rows in a single chunk of data, such as a whole file.
+ *
+ * Equivalent to the two `gather_row_offsets` phases with no rows to skip and no byte range end,
+ * but resolves the parser state of each character block in one pass over the data and only
+ * synchronizes once, to size the output.
+ *
+ * @param options Parsing options
+ * @param data Character data, starting at `start_offset` in the file
+ * @param chunk_size Number of characters to parse, starting at `parse_pos`
+ * @param parse_pos Position in the file where parsing starts
+ * @param start_offset Position of the start of `data` in the file
+ * @param data_size File size
+ * @param byte_range_start Rows starting before this file position are ignored
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @return Row offsets relative to the start of `data`, including the end-of-data offset
+ */
+rmm::device_uvector<uint64_t> gather_all_row_offsets(cudf::io::parse_options_view const& options,
+                                                     device_span<char const> data,
+                                                     size_t chunk_size,
+                                                     size_t parse_pos,
+                                                     size_t start_offset,
+                                                     size_t data_size,
+                                                     size_t byte_range_start,
+                                                     cuda::stream_ref stream);
+
+/**
  * @brief Launches kernel for decoding row-column data
  *
  * @param[in] options Options that control individual field data conversion

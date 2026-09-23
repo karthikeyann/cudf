@@ -31,6 +31,8 @@ static constexpr char trie_terminating_character = '\n';
  * contiguously. The `children_offset` member is the offset between the node and its first child.
  * Matching is successful if all characters are matched and the final node is the last character of
  * a word (i.e. `is_leaf` is true).
+ * The first (root) node only matches empty keys; its `children_offset` holds the length of the
+ * longest key, or -1 if that does not fit.
  *
  */
 struct serial_trie_node {

@@ -375,6 +375,21 @@ data_and_row_offsets load_data_and_gather_row_offsets(
       }
     }
 
+    if (load_whole_file) {
+      // The whole file is a single chunk with no rows to skip and no range end: resolve the
+      // parser state of every character block in one pass
+      all_row_offsets = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(),
+                                                                   input_data(),
+                                                                   chunk_size,
+                                                                   pos,
+                                                                   input_pos,
+                                                                   max_input_size,
+                                                                   range_begin,
+                                                                   stream);
+      pos             = target_pos;
+      continue;
+    }
+
     // Pass 1: Count the potential number of rows in each character block for each
     // possible parser state at the beginning of the block.
     auto const num_blocks = cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
