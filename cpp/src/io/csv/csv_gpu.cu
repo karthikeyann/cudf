@@ -732,7 +732,10 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           bool was_quoted = false;
           if (not options.keepquotes) {
             if (not options.detect_whitespace_around_quotes) {
-              if ((*field_start == options.quotechar) && (*(end - 1) == options.quotechar)) {
+              // A lone quote character is not a quoted (empty) string: stripping it would leave
+              // a negative length
+              if (end - field_start >= 2 && (*field_start == options.quotechar) &&
+                  (*(end - 1) == options.quotechar)) {
                 ++field_start;
                 --end;
                 was_quoted = true;
@@ -740,7 +743,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
             } else {
               // If the string is quoted, whitespace around the quotes get removed as well
               auto const trimmed_field = trim_whitespaces(field_start, end);
-              if ((*trimmed_field.first == options.quotechar) &&
+              if (trimmed_field.second - trimmed_field.first >= 2 &&
+                  (*trimmed_field.first == options.quotechar) &&
                   (*(trimmed_field.second - 1) == options.quotechar)) {
                 field_start = trimmed_field.first + 1;
                 end         = trimmed_field.second - 1;
@@ -1278,63 +1282,36 @@ struct blank_row_chars {
   __device__ bool is_blank(char c) const { return c == newline || c == comment || c == carriage; }
 };
 
-/**
- * @brief Row context transition of a sequence of character blocks, with 64-bit row counts.
- *
- * Unlike packed contexts (18-bit counts), composites of many blocks cannot overflow.
- */
-struct wide_row_context {
-  uint64_t count[3];  ///< Rows, per input state NONE, QUOTE, COMMENT
-  uint32_t out[3];    ///< Output state, per input state
-
-  __device__ static wide_row_context identity()
-  {
-    return {{0, 0, 0}, {ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_COMMENT}};
-  }
-  /// This sequence followed by a block with the given packed context
-  __device__ wide_row_context then(packed_rowctx_t next) const
-  {
-    wide_row_context result;
-    for (int s = 0; s < 3; ++s) {
-      auto const ctx  = get_row_context(next, out[s]);
-      result.count[s] = count[s] + (ctx >> 2);
-      result.out[s]   = ctx & 3;
-    }
-    return result;
-  }
-  /// This sequence followed by another sequence
-  __device__ wide_row_context then(wide_row_context const& next) const
-  {
-    wide_row_context result;
-    for (int s = 0; s < 3; ++s) {
-      auto const o    = out[s];
-      result.count[s] = count[s] + (o < 3 ? next.count[o] : 0);
-      result.out[s]   = o < 3 ? next.out[o] : o;
-    }
-    return result;
-  }
-  /// Applies this sequence to a resolved context (row_count * 4 + state)
-  __device__ rowctx64_t apply(rowctx64_t ctx) const
-  {
-    auto const s = static_cast<uint32_t>(ctx & 3);
-    if (s >= 3) { return ctx; }  // EOF stays EOF with no rows
-    return ((ctx >> 2) + count[s]) * 4 + out[s];
-  }
-};
-
 /// 32-character slices per thread in single-pass row gathering (64KB tiles)
 constexpr int slices_per_thread = 2;
 
-/// Look-back status of a row context tile (a block of rowofs_block_bytes characters)
-enum tile_status : uint32_t { TILE_INVALID = 0, TILE_AGGREGATE = 1, TILE_INCLUSIVE = 2 };
+/// Parser state transition of a tile, packed as 2 bits per input state (NONE, QUOTE, COMMENT, EOF)
+using tile_transition = uint8_t;
+constexpr tile_transition identity_transition =
+  ROW_CTX_NONE | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6);
+
+/// The transition of `first` followed by `second`
+struct compose_transitions {
+  __device__ tile_transition operator()(tile_transition first, tile_transition second) const
+  {
+    tile_transition result = 0;
+    for (int s = 0; s < 4; ++s) {
+      auto const mid = (first >> (2 * s)) & 3;
+      result |= ((second >> (2 * mid)) & 3) << (2 * s);
+    }
+    return result;
+  }
+};
 
 /**
- * @brief Single-pass row gathering, phase 1: resolves each block's starting parser state with a
- * decoupled look-back and writes each thread's row start bitmap (for its resolved input state).
+ * @brief Single-pass row gathering, phase 1: writes each thread's row start bitmap and each
+ * tile's number of (non-blank) rows.
  *
- * Blocks take tile indices in launch order from `tile_counter` so that every tile they wait on
- * is already running. Aggregates are packed row contexts; inclusive prefixes are
- * `row_count * 4 + state` (see select_row_context).
+ * The parser state at the start of a tile is only known once all previous tiles are processed.
+ * Since it is almost always NONE (no quoted field spans the tile boundary), the first launch
+ * (`start_states == nullptr`) assumes NONE for every tile and records each tile's state
+ * transition. After the start states are computed from the transitions, a second launch redoes
+ * only the tiles whose actual start state differs.
  */
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   gather_row_bitmaps_gpu(device_span<char const> const data,
@@ -1347,19 +1324,18 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          int delimiter,
                          int quotechar,
                          int commentchar,
-                         uint32_t* tile_counter,
-                         uint32_t* tile_status,
-                         uint64_t* tile_aggregate,
-                         uint64_t* tile_inclusive,
+                         tile_transition* tile_transitions,
+                         uint8_t const* start_states,
                          blank_row_chars blank_chars,
                          uint64_t* tile_kept_rows,
                          uint32_t* row_bitmaps)
 {
   __shared__ uint64_t bk_ctxtree[bk_ctxtree_size];
-  __shared__ uint32_t tile;
-  uint32_t const t = threadIdx.x;
-  if (t == 0) { tile = atomicAdd(tile_counter, 1); }
-  __syncthreads();
+  uint32_t const t    = threadIdx.x;
+  auto const tile     = blockIdx.x;
+  auto const is_redo  = start_states != nullptr;
+  auto const start_st = is_redo ? start_states[tile] : uint8_t{ROW_CTX_NONE};
+  if (is_redo && start_st == ROW_CTX_NONE) { return; }  // the first launch was correct
 
   // Each thread handles slices_per_thread consecutive 32-character slices
   uint4 ctx_maps[slices_per_thread];
@@ -1387,63 +1363,21 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   rowctx_merge_transform(bk_ctxtree, thread_ctx, t);
   __syncthreads();
 
-  if (t < cudf::detail::warp_size) {
-    auto const lane      = t;
-    auto const aggregate = bk_ctxtree[1];
-    auto status          = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{tile_status[tile]};
-    if (tile != 0 && lane == 0) {
-      tile_aggregate[tile] = aggregate;
-      status.store(TILE_AGGREGATE, cuda::memory_order_release);
-    }
-    // Composite of the tiles between the look-back window and this tile, per input state
-    wide_row_context later = wide_row_context::identity();
-    // The row context before the first tile: no rows, not in a quote
-    rowctx64_t prefix = ROW_CTX_NONE;
-    // Look back over windows of one tile per lane, nearest window first
-    for (int64_t window_end = tile; window_end > 0; window_end -= cudf::detail::warp_size) {
-      auto const idx = window_end - static_cast<int64_t>(cudf::detail::warp_size) + lane;
-      uint32_t st    = TILE_INCLUSIVE;  // tiles before the first one act as a known (empty) prefix
-      if (idx >= 0) {
-        auto prev = cuda::atomic_ref<uint32_t, cuda::thread_scope_device>{tile_status[idx]};
-        while ((st = prev.load(cuda::memory_order_acquire)) == TILE_INVALID) {}
+  if (t == 0) {
+    if (!is_redo) {
+      auto const aggregate = bk_ctxtree[1];
+      tile_transition transition =
+        static_cast<tile_transition>(ROW_CTX_EOF << 6);  // EOF input stays EOF
+      for (uint32_t s = 0; s < 3; ++s) {
+        transition |= (get_row_context(aggregate, s) & 3) << (2 * s);
       }
-      auto const value = idx < 0                 ? rowctx64_t{ROW_CTX_NONE}
-                         : st == TILE_INCLUSIVE ? tile_inclusive[idx]
-                                                : tile_aggregate[idx];
-      auto const inclusive_lanes = __ballot_sync(0xffff'ffffu, st == TILE_INCLUSIVE);
-      // Start from the nearest known prefix in the window (if any), then apply the aggregates of
-      // the following tiles in order
-      int const first_lane = inclusive_lanes ? 31 - __clz(inclusive_lanes) : -1;
-      auto const window_prefix =
-        __shfl_sync(0xffff'ffffu, value, first_lane >= 0 ? first_lane : 0);
-      // Ordered composite of the aggregates after the nearest known prefix (tree reduction)
-      auto window = static_cast<int>(lane) > first_lane
-                      ? wide_row_context::identity().then(static_cast<packed_rowctx_t>(value))
-                      : wide_row_context::identity();
-      for (int offset = 1; offset < static_cast<int>(cudf::detail::warp_size); offset *= 2) {
-        wide_row_context other;
-        for (int k = 0; k < 3; ++k) {
-          other.count[k] = __shfl_down_sync(0xffff'ffffu, window.count[k], offset);
-          other.out[k]   = __shfl_down_sync(0xffff'ffffu, window.out[k], offset);
-        }
-        if (lane + offset < cudf::detail::warp_size) { window = window.then(other); }
-      }
-      // Lane 0 holds the window composite
-      if (first_lane >= 0) {
-        prefix = later.apply(window.apply(window_prefix));
-        break;
-      }
-      later = window.then(later);  // only lane 0's value is used
+      tile_transitions[tile] = transition;
     }
-    if (lane == 0) {
-      tile_inclusive[tile] = select_row_context(prefix, aggregate);
-      status.store(TILE_INCLUSIVE, cuda::memory_order_release);
-      bk_ctxtree[0]        = prefix;
-    }
+    bk_ctxtree[0] = start_st;  // no rows before the tile are needed, only its start state
   }
   __syncthreads();
 
-  // Walk back the transform tree with the known initial parser state
+  // Walk back the transform tree with the tile's initial parser state
   auto state          = rowctx_inverse_merge_transform(bk_ctxtree, t) & 3;
   uint32_t kept_rows = 0;
 #pragma unroll
@@ -1463,6 +1397,33 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   __shared__ typename block_reduce::TempStorage reduce_storage;
   kept_rows = block_reduce(reduce_storage).Sum(kept_rows);
   if (t == 0) { tile_kept_rows[tile] = kept_rows; }
+}
+
+/// Block size of the tile start state scan
+constexpr int start_state_block_dim = 1024;
+
+/**
+ * @brief Computes each tile's starting parser state from the tile transitions (one block).
+ */
+CUDF_KERNEL void __launch_bounds__(start_state_block_dim)
+  tile_start_states_gpu(tile_transition const* tile_transitions,
+                        uint32_t num_tiles,
+                        uint8_t* start_states)
+{
+  using block_scan = cub::BlockScan<tile_transition, start_state_block_dim>;
+  __shared__ typename block_scan::TempStorage temp_storage;
+  tile_transition carry = identity_transition;  // transition of all tiles before this chunk
+  for (uint32_t first = 0; first < num_tiles; first += start_state_block_dim) {
+    auto const tile = first + threadIdx.x;
+    auto const in   = tile < num_tiles ? tile_transitions[tile] : identity_transition;
+    tile_transition prefix;
+    tile_transition chunk;
+    block_scan(temp_storage).ExclusiveScan(in, prefix, carry, compose_transitions{}, chunk);
+    // The data starts in the NONE state
+    if (tile < num_tiles) { start_states[tile] = prefix & 3; }
+    carry = compose_transitions{}(carry, chunk);
+    __syncthreads();
+  }
 }
 
 /**
@@ -1654,39 +1615,41 @@ rmm::device_uvector<uint64_t> __host__ gather_all_row_offsets(parse_options_view
 {
   auto const tile_bytes = static_cast<size_t>(rowofs_block_bytes) * slices_per_thread;
   auto const num_tiles  = static_cast<uint32_t>(1 + (chunk_size / tile_bytes));
-  auto const mr        = cudf::get_current_device_resource_ref();
-  // Zeroed counter and statuses, followed by the aggregates, inclusive prefixes and kept row
-  // counts (with one extra zero, so that their exclusive scan ends with the total)
-  auto tile_state = cudf::detail::make_zeroed_device_uvector_async<uint64_t>(
-    2 + 4 * static_cast<size_t>(num_tiles), stream, mr);
-  auto const tile_counter   = reinterpret_cast<uint32_t*>(tile_state.data());
-  auto const tile_status    = tile_counter + 2;  // after the 64-bit counter slot
-  auto const tile_aggregate = tile_state.data() + 1 + num_tiles;
-  auto const tile_inclusive = tile_aggregate + num_tiles;
-  auto const tile_kept_rows = tile_inclusive + num_tiles;
-  static_assert(sizeof(uint32_t) * 2 == sizeof(uint64_t));
-  rmm::device_uvector<uint32_t> row_bitmaps(static_cast<size_t>(num_tiles) * rowofs_block_dim * slices_per_thread,
-                                            stream);
+  auto const mr         = cudf::get_current_device_resource_ref();
+  // Kept row counts, with one extra zero so that their exclusive scan ends with the total
+  auto tile_kept_rows_buffer = cudf::detail::make_zeroed_device_uvector_async<uint64_t>(
+    static_cast<size_t>(num_tiles) + 1, stream, mr);
+  auto const tile_kept_rows = tile_kept_rows_buffer.data();
+  rmm::device_uvector<tile_transition> tile_transitions(num_tiles, stream);
+  rmm::device_uvector<uint8_t> start_states(num_tiles, stream);
+  rmm::device_uvector<uint32_t> row_bitmaps(
+    static_cast<size_t>(num_tiles) * rowofs_block_dim * slices_per_thread, stream);
 
-  gather_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
-    data,
-    chunk_size,
-    parse_pos,
-    start_offset,
-    data_size,
-    byte_range_start,
-    options.terminator,
-    options.delimiter,
-    (options.quotechar) ? options.quotechar : 0x100,
-    (options.comment) ? options.comment : 0x100,
-    tile_counter,
-    tile_status,
-    tile_aggregate,
-    tile_inclusive,
-    blank_row_chars::from(options),
-    tile_kept_rows,
-    row_bitmaps.data());
+  auto const launch = [&](uint8_t const* tile_start_states) {
+    gather_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+      data,
+      chunk_size,
+      parse_pos,
+      start_offset,
+      data_size,
+      byte_range_start,
+      options.terminator,
+      options.delimiter,
+      (options.quotechar) ? options.quotechar : 0x100,
+      (options.comment) ? options.comment : 0x100,
+      tile_transitions.data(),
+      tile_start_states,
+      blank_row_chars::from(options),
+      tile_kept_rows,
+      row_bitmaps.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+  };
+  // Assume every tile starts outside of quotes, then redo the tiles where that was wrong
+  launch(nullptr);
+  tile_start_states_gpu<<<1, start_state_block_dim, 0, stream.get()>>>(
+    tile_transitions.data(), num_tiles, start_states.data());
   CUDF_CUDA_TRY(cudaGetLastError());
+  launch(start_states.data());
 
   // First kept row of each tile; the last entry is the total number of kept rows
   thrust::exclusive_scan(rmm::exec_policy_nosync(stream, mr),

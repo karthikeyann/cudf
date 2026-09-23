@@ -40,7 +40,12 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
   auto curr_node = trie.begin() + 1;
   for (auto curr_key = key.begin(); curr_key < key.end(); ++curr_key) {
     // Don't jump away from root node
-    if (curr_key != key.begin()) { curr_node += curr_node->children_offset; }
+    if (curr_key != key.begin()) {
+      // A node without children (e.g. the end of the only key "x" when looking up "xx") cannot
+      // match a longer key; its children offset is negative and must not be followed
+      if (curr_node->children_offset < 0) { return false; }
+      curr_node += curr_node->children_offset;
+    }
     // Search for the next character in the array of children nodes
     // Nodes are sorted - terminate search if the node is larger or equal
     while (curr_node->character != trie_terminating_character && curr_node->character < *curr_key) {

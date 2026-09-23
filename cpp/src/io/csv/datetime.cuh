@@ -44,6 +44,15 @@ __inline__ __device__ T to_non_negative_integer(char const* begin, char const* e
 }
 
 /**
+ * @brief Returns the position after a separator found in [.., end), or `end` if none was found
+ * (so that subsequent searches never start past the end of the field).
+ */
+__inline__ __device__ char const* next_after(char const* sep_pos, char const* end)
+{
+  return sep_pos < end ? sep_pos + 1 : end;
+}
+
+/**
  * @brief Extracts the Day, Month, and Year from a string.
  *
  * This function takes a string and produces a `year_month_day` representation.
@@ -55,15 +64,6 @@ __inline__ __device__ T to_non_negative_integer(char const* begin, char const* e
  * @param dayfirst Flag indicating that first field is the day
  * @return Extracted year, month and day in `cuda::std::chrono::year_month_day` format
  */
-/**
- * @brief Returns the position after a separator found in [.., end), or `end` if none was found
- * (so that subsequent searches never start past the end of the field).
- */
-__inline__ __device__ char const* next_after(char const* sep_pos, char const* end)
-{
-  return sep_pos < end ? sep_pos + 1 : end;
-}
-
 __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const* begin,
                                                                      char const* end,
                                                                      bool dayfirst)
