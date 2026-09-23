@@ -108,6 +108,145 @@ CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
   return ((index == begin + 3 || index == begin + 8) && index >= end);
 }
 
+namespace detail {
+
+/// Number of successive `divisor /= 10` steps tabulated; the last entry is the underflow to zero
+constexpr int num_decimal_divisors = 324;
+
+/**
+ * @brief The divisors 1/10, (1/10)/10, ... exactly as produced by repeated IEEE double division
+ * (generated offline, round-to-nearest with subnormals), so parsing can look them up instead of
+ * dividing: double division is very slow on GPUs with reduced FP64 throughput.
+ */
+static __device__ double const decimal_divisors[num_decimal_divisors] = {
+  0x1.999999999999ap-4, 0x1.47ae147ae147bp-7, 0x1.0624dd2f1a9fcp-10,
+  0x1.a36e2eb1c432dp-14, 0x1.4f8b588e368f1p-17, 0x1.0c6f7a0b5ed8ep-20,
+  0x1.ad7f29abcaf4ap-24, 0x1.5798ee2308c3bp-27, 0x1.12e0be826d696p-30,
+  0x1.b7cdfd9d7bdbdp-34, 0x1.5fd7fe1796497p-37, 0x1.19799812dea12p-40,
+  0x1.c25c268497683p-44, 0x1.6849b86a12b9cp-47, 0x1.203af9ee75616p-50,
+  0x1.cd2b297d889bdp-54, 0x1.70ef54646d497p-57, 0x1.2725dd1d243acp-60,
+  0x1.d83c94fb6d2adp-64, 0x1.79ca10c924224p-67, 0x1.2e3b40a0e9b50p-70,
+  0x1.e392010175ee6p-74, 0x1.82db34012b252p-77, 0x1.357c299a88ea8p-80,
+  0x1.ef2d0f5da7ddap-84, 0x1.8c240c4aecb15p-87, 0x1.3ce9a36f23c11p-90,
+  0x1.fb0f6be50601bp-94, 0x1.95a5efea6b349p-97, 0x1.4484bfeebc2a1p-100,
+  0x1.039d665896881p-103, 0x1.9f623d5a8a735p-107, 0x1.4c4e977ba1f5ep-110,
+  0x1.09d8792fb4c4bp-113, 0x1.a95a5b7f87a12p-117, 0x1.54484932d2e75p-120,
+  0x1.1039d428a8b91p-123, 0x1.b38fb9daa78e8p-127, 0x1.5c72fb1552d86p-130,
+  0x1.16c262777579ep-133, 0x1.be03d0bf225cap-137, 0x1.64cfda3281e3bp-140,
+  0x1.1d7314f534b62p-143, 0x1.c8b821885456ap-147, 0x1.6d601ad376abbp-150,
+  0x1.244ce242c5562p-153, 0x1.d3ae36d13bbd0p-157, 0x1.7624f8a762fdap-160,
+  0x1.2b50c6ec4f315p-163, 0x1.dee7a4ad4b822p-167, 0x1.7f1fb6f10934ep-170,
+  0x1.327fc58da0f72p-173, 0x1.ea6608e29b250p-177, 0x1.8851a0b548ea6p-180,
+  0x1.39dae6f76d885p-183, 0x1.f62b0b257c0d5p-187, 0x1.91bc08eac9a44p-190,
+  0x1.41633a556e1d0p-193, 0x1.011c2eaabe7dap-196, 0x1.9b604aaaca62ap-200,
+  0x1.4919d5556eb55p-203, 0x1.0747ddddf22aap-206, 0x1.a53fc9631d110p-210,
+  0x1.50ffd44f4a740p-213, 0x1.0d9976a5d529ap-216, 0x1.af5bf109550f6p-220,
+  0x1.59165a6ddda5ep-223, 0x1.1411e1f17e1e5p-226, 0x1.b9b6364f30308p-230,
+  0x1.615e91d8f35a0p-233, 0x1.1ab20e472914dp-236, 0x1.c45016d841baep-240,
+  0x1.69d9abe034958p-243, 0x1.217aefe69077ap-246, 0x1.cf2b1970e725dp-250,
+  0x1.7288e1271f517p-253, 0x1.286d80ec190dfp-256, 0x1.da48ce468e7cbp-260,
+  0x1.7b6d71d20b96fp-263, 0x1.2f8ac174d6126p-266, 0x1.e5aacf215683dp-270,
+  0x1.8488a5b445364p-273, 0x1.36d3b7c36a91dp-276, 0x1.f152bf9f10e95p-280,
+  0x1.8ddbcc7f40baap-283, 0x1.3e497065cd622p-286, 0x1.fd424d6faf036p-290,
+  0x1.97683df2f2692p-293, 0x1.45ecfe5bf520ep-296, 0x1.04bd984990e72p-299,
+  0x1.a12f5a0f4e3eap-303, 0x1.4dbf7b3f71cbbp-306, 0x1.0aff95cc5b096p-309,
+  0x1.ab328946f80f0p-313, 0x1.55c2076bf9a5ap-316, 0x1.116805effaeaep-319,
+  0x1.b5733cb32b116p-323, 0x1.5df5ca28ef412p-326, 0x1.17f7d4ed8c342p-329,
+  0x1.bff2ee48e0536p-333, 0x1.665bf1d3e6a92p-336, 0x1.1eaff4a985542p-339,
+  0x1.cab3210f3bb9dp-343, 0x1.6ef5b40c2fc7ep-346, 0x1.25915cd68c9fep-349,
+  0x1.d5b5615747663p-353, 0x1.77c44ddf6c51cp-356, 0x1.2c9d0b192374ap-359,
+  0x1.e0fb44f505876p-363, 0x1.80c903f7379f8p-366, 0x1.33d4032c2c7fap-369,
+  0x1.ec866b79e0cc3p-373, 0x1.8a0522c7e709cp-376, 0x1.3b374f06526e3p-379,
+  0x1.f8587e7083e38p-383, 0x1.9379fec06982dp-386, 0x1.42c7ff005468ap-389,
+  0x1.023998cd1053bp-392, 0x1.9d28f47b4d52bp-396, 0x1.4a8729fc3ddbcp-399,
+  0x1.086c219697e30p-402, 0x1.a71368f0f304dp-406, 0x1.5275ed8d8f371p-409,
+  0x1.0ec4be0ad8f8ep-412, 0x1.b13ac9aaf4c16p-416, 0x1.5a956e225d678p-419,
+  0x1.1544581b7dec6p-422, 0x1.bba08cf8c97a3p-426, 0x1.62e6d72d6dfb6p-429,
+  0x1.1bebdf578b2f8p-432, 0x1.c6463225ab7f3p-436, 0x1.6b6b5b5155ff6p-439,
+  0x1.22bc490dde65ep-442, 0x1.d12d41afca3cap-446, 0x1.7424348ca1ca2p-449,
+  0x1.29b69070816e8p-452, 0x1.dc574d80cf173p-456, 0x1.7d12a4670c129p-459,
+  0x1.30dbb6b8d6754p-462, 0x1.e7c5f127bd886p-466, 0x1.8637f41fcad38p-469,
+  0x1.382cc34ca242dp-472, 0x1.f37ad21436d15p-476, 0x1.8f9574dcf8a77p-479,
+  0x1.3faac3e3fa1f9p-482, 0x1.ff779fd329cc2p-486, 0x1.992c7fdc21702p-489,
+  0x1.4756ccb01ac02p-492, 0x1.05df0a267bccep-495, 0x1.a2fe76a3f947dp-499,
+  0x1.4f31f8832dd31p-502, 0x1.0c27fa028b0f4p-505, 0x1.ad0cc33744e53p-509,
+  0x1.573d68f903ea9p-512, 0x1.1297872d9cbbap-515, 0x1.b758d848fac5dp-519,
+  0x1.5f7a46a0c89e4p-522, 0x1.192e9ee706e50p-525, 0x1.c1e43171a4a1ap-529,
+  0x1.67e9c127b6e7bp-532, 0x1.1fee341fc5862p-535, 0x1.ccb0536608d6ap-539,
+  0x1.708d0f84d3deep-542, 0x1.26d73f9d764bep-545, 0x1.d7becc2f23acap-549,
+  0x1.79657025b623bp-552, 0x1.2deac01e2b4fcp-555, 0x1.e3113363787fap-559,
+  0x1.8274291c60662p-562, 0x1.3529ba7d19eb5p-565, 0x1.eea92a61c3122p-569,
+  0x1.8bba884e35a82p-572, 0x1.3c9539d82aecep-575, 0x1.fa885c8d117b0p-579,
+  0x1.9539e3a40dfc0p-582, 0x1.442e4fb671966p-585, 0x1.03583fc527ab8p-588,
+  0x1.9ef3993b72ac0p-592, 0x1.4bf6142f8ef00p-595, 0x1.0991a9bfa58cdp-598,
+  0x1.a8e90f9908e15p-602, 0x1.53eda614071aap-605, 0x1.0ff151a99f488p-608,
+  0x1.b31bb5dc320dap-612, 0x1.5c162b168e715p-615, 0x1.1678227871f44p-618,
+  0x1.bd8d03f3e986dp-622, 0x1.6470cff6546bep-625, 0x1.1d270cc510565p-628,
+  0x1.c83e7ad4e6f08p-632, 0x1.6cfec8aa525a0p-635, 0x1.23ff06eea8480p-638,
+  0x1.d331a4b10d400p-642, 0x1.75c1508da4333p-645, 0x1.2b010d3e1cf5cp-648,
+  0x1.de6815302e560p-652, 0x1.7eb9aa8cf1de6p-655, 0x1.322e220a5b185p-658,
+  0x1.e9e369aa2b5a2p-662, 0x1.87e92154ef7b5p-665, 0x1.39874ddd8c62ap-668,
+  0x1.f5a549627a376p-672, 0x1.91510781fb5f8p-675, 0x1.410d9f9b2f7fap-678,
+  0x1.00d7b2e28c662p-681, 0x1.9af2b7d0e0a36p-685, 0x1.48c22ca71a1c5p-688,
+  0x1.0701bd527b49ep-691, 0x1.a4cf9550c5430p-695, 0x1.50a6110d6a9c0p-698,
+  0x1.0d51a73deee33p-701, 0x1.aee90b964b052p-705, 0x1.58ba6fab6f375p-708,
+  0x1.13c85955f292ap-711, 0x1.b9408eefea843p-715, 0x1.610072598869cp-718,
+  0x1.1a66c1e139ee3p-721, 0x1.c3d79c9b8fe38p-725, 0x1.69794a160cb60p-728,
+  0x1.212dd4de7091ap-731, 0x1.ceafbafd80e90p-735, 0x1.72262f3133edap-738,
+  0x1.281e8c275cbe2p-741, 0x1.d9ca79d894636p-745, 0x1.7b08617a104f8p-748,
+  0x1.2f39e794d9d93p-751, 0x1.e5297287c2f52p-755, 0x1.8421286c9bf75p-758,
+  0x1.3680ed23aff91p-761, 0x1.f0ce4839198e8p-765, 0x1.8d71d360e13edp-768,
+  0x1.3df4a91a4dcbep-771, 0x1.fcbaa82a16130p-775, 0x1.96fbb9bb44dc0p-778,
+  0x1.45962e2f6a49ap-781, 0x1.047824f2bb6e2p-784, 0x1.a0c03b1df8b03p-788,
+  0x1.4d6695b193c02p-791, 0x1.0ab877c143002p-794, 0x1.aac0bf9b9e66ap-798,
+  0x1.5566ffafb1ebbp-801, 0x1.111f32f2f4bc9p-804, 0x1.b4feb7eb212dbp-808,
+  0x1.5d98932280f16p-811, 0x1.17ad428200c12p-814, 0x1.bf7b9d9cce01dp-818,
+  0x1.65fc7e170b34ap-821, 0x1.1e6398126f5d5p-824, 0x1.ca38f350b22eep-828,
+  0x1.6e93f5da28258p-831, 0x1.25432b14eceadp-834, 0x1.d53844ee47de2p-838,
+  0x1.77603725064b5p-841, 0x1.2c4cf8ea6b6f7p-844, 0x1.e07b27dd78b25p-848,
+  0x1.8062864ac6f51p-851, 0x1.338205089f2a7p-854, 0x1.ec033b40feaa5p-858,
+  0x1.899c2f673221ep-861, 0x1.3ae3591f5b4e5p-864, 0x1.f7d228322bb08p-868,
+  0x1.930e868e895a0p-871, 0x1.4272053ed4480p-874, 0x1.01f4d0ff1039ap-877,
+  0x1.9cbae7fe805c3p-881, 0x1.4a2f1ffecd169p-884, 0x1.0825b3323dabap-887,
+  0x1.a6a2b85062ac3p-891, 0x1.521bc6a6b5569p-894, 0x1.0e7c9eebc4454p-897,
+  0x1.b0c764ac6d3bap-901, 0x1.5a391d56bdc95p-904, 0x1.14fa7ddefe3aap-907,
+  0x1.bb2a62fe63910p-911, 0x1.62884f31e940dp-914, 0x1.1ba03f5b2100ap-917,
+  0x1.c5cd322b68010p-921, 0x1.6b0a8e892000dp-924, 0x1.226ed86db333ep-927,
+  0x1.d0b15a491eb96p-931, 0x1.73c115074bc78p-934, 0x1.29674405d6393p-937,
+  0x1.dbd86cd6238ebp-941, 0x1.7cad23de82d89p-944, 0x1.308a831868ad4p-947,
+  0x1.e74404f3daaedp-951, 0x1.85d003f6488bep-954, 0x1.37d99cc506d65p-957,
+  0x1.f2f5c7a1a48a2p-961, 0x1.8f2b061aea082p-964, 0x1.3f559e7bee6cep-967,
+  0x1.feef63f97d7b0p-971, 0x1.98bf832dfdfc0p-974, 0x1.46ff9c24cb300p-977,
+  0x1.059949b708f33p-980, 0x1.a28edc580e51ep-984, 0x1.4ed8b04671db2p-987,
+  0x1.0be08d0527e28p-990, 0x1.ac9a7b3b73040p-994, 0x1.56e1fc2f8f366p-997,
+  0x1.124e63593f5ebp-1000, 0x1.b6e3d22865645p-1004, 0x1.5f1ca820511d1p-1007,
+  0x1.18e3b9b374174p-1010, 0x1.c16c5c5253586p-1014, 0x1.6789e3750f79ep-1017,
+  0x1.1fa182c40c618p-1020, 0x0.730d67819e8d6p-1022, 0x0.0b8157268fdafp-1022,
+  0x0.012688b70e62bp-1022, 0x0.001d74124e3d1p-1022, 0x0.0002f201d49fbp-1022,
+  0x0.00004b6695433p-1022, 0x0.0000078a42205p-1022, 0x0.000000c1069cdp-1022,
+  0x0.000000134d761p-1022, 0x0.00000001ee256p-1022, 0x0.00000000316a2p-1022,
+  0x0.0000000004f10p-1022, 0x0.00000000007e8p-1022, 0x0.00000000000cap-1022,
+  0x0.0000000000014p-1022, 0x0.0000000000002p-1022, 0x0p+0,
+};
+
+/**
+ * @brief Returns the divisor after `index + 1` successive divisions of 1 by 10.
+ */
+CUDF_HOST_DEVICE inline double decimal_divisor(int index)
+{
+#ifdef __CUDA_ARCH__
+  return index < num_decimal_divisors ? decimal_divisors[index] : 0.0;
+#else
+  double divisor = 1;
+  for (int i = 0; i <= index && divisor != 0; ++i) {
+    divisor /= 10;
+  }
+  return divisor;
+#endif
+}
+
+}  // namespace detail
+
 /**
  * @brief Parses a character string and returns its numeric value.
  *
@@ -140,7 +279,22 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
   if (base == 16 && begin + 2 < end && *begin == '0' && *(begin + 1) == 'x') { begin += 2; }
 
   // Handle the whole part of the number
-  // auto index = begin;
+  if constexpr (cuda::std::is_same_v<T, double> && base == 10) {
+    // Accumulate leading digits as an integer: while below 10^15 (< 2^53) every step of the
+    // double computation below is exact, so the result is identical
+    uint64_t whole          = 0;
+    int num_digits          = 0;
+    constexpr int max_exact = 15;
+    while (begin < end && num_digits < max_exact) {
+      if (*begin == opts.decimal || *begin == 'e' || *begin == 'E') { break; }
+      if (*begin != opts.thousands && *begin != '+') {
+        whole = whole * 10 + decode_digit<T, as_hex>(*begin, &all_digits_valid);
+        ++num_digits;
+      }
+      ++begin;
+    }
+    value = static_cast<T>(whole);
+  }
   while (begin < end) {
     if (*begin == opts.decimal) {
       ++begin;
@@ -155,13 +309,18 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
 
   if (cuda::std::is_floating_point_v<T>) {
     // Handle fractional part of the number if necessary
-    double divisor = 1;
+    double divisor      = 1;
+    int divisor_index   = 0;
     while (begin < end) {
       if (*begin == 'e' || *begin == 'E') {
         ++begin;
         break;
       } else if (*begin != opts.thousands && *begin != '+') {
-        divisor /= base;
+        if constexpr (base == 10) {
+          divisor = detail::decimal_divisor(divisor_index++);
+        } else {
+          divisor /= base;
+        }
         value += decode_digit<T, as_hex>(*begin, &all_digits_valid) * divisor;
       }
       ++begin;

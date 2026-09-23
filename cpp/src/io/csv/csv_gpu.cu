@@ -939,58 +939,89 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     .z = 0,
     .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6)};
   int c, c_prev = (cur > start && cur <= end) ? cur[-1] : terminator;
-  // Loop through all 32 bytes and keep a bitmask of row starts for each possible input context
-  for (uint32_t pos = 0; pos < 32; pos++, cur++, c_prev = c) {
-    uint32_t ctx;
-    if (cur < end) {
-      c = cur[0];
-      if (c_prev == terminator) {
-        if (c == commentchar) {
-          // Start of a new comment row
-          ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
-        } else if (c == quotechar) {
-          // Quoted string on newrow, or quoted string ending in terminator
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
-        } else {
-          // Start of a new row unless within a quote
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
-        }
-      } else if (c == quotechar) {
-        // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
-        // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
-        // exit because it might be the first quote of a "" escape sequence. We transition to
-        // COMMENT (pending exit) and wait for the next character:
-        //   - If next char is quote: it's a "" escape, return to QUOTE
-        //   - If next char is anything else: exit confirmed, go to NONE
-        // This doesn't conflict with actual comment handling because comments are only
-        // detected at row boundaries (after newline), where COMMENT state is set with row
-        // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
-        if (c_prev == delimiter) {
-          // Quote after delimiter: start field or pending exit
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-        } else if (c_prev == quotechar) {
-          // Quote after quote: "" escape or stay NONE (Spark compatibility)
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
-        } else {
-          // Quote after regular char: pending exit or stay NONE
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
-        }
-      } else {
-        // Non-quote char: stay in current state, or exit from pending
-        ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
-      }
-    } else {
-      bool const is_last_chunk = data_end_off <= data.size();
-      if (is_last_chunk && cur <= end && cur == data_end) {
-        // Add a newline at data end (need the extra row offset to infer length of previous row)
-        ctx = make_char_context(ROW_CTX_EOF, ROW_CTX_EOF, ROW_CTX_EOF, 1, 1, 1);
-      } else {
-        // Pass-through context (beyond chunk_size or data_end)
-        ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-      }
+  // Fast path: 32 in-range characters without quote or comment characters. Then the only
+  // transitions are row starts after each terminator: rows begin at the same positions in the
+  // NONE and COMMENT (pending quote exit) contexts, which both end in NONE, and not in QUOTE.
+  bool fast_path = false;
+  if (cur + 32 <= end && (reinterpret_cast<uintptr_t>(cur) % 16) == 0) {
+    auto const v0 = reinterpret_cast<uint4 const*>(cur)[0];
+    auto const v1 = reinterpret_cast<uint4 const*>(cur)[1];
+    uint32_t const words[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+    auto const bytes4       = [](int ch) { return static_cast<uint32_t>(ch & 0xff) * 0x0101'0101u; };
+    uint32_t special        = 0;
+    uint32_t terminators    = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      if (quotechar < 0x100) { special |= __vcmpeq4(words[i], bytes4(quotechar)); }
+      if (commentchar < 0x100) { special |= __vcmpeq4(words[i], bytes4(commentchar)); }
+      // One bit per byte: gather the top bit of each 0xff byte into 4 consecutive bits
+      auto const eq = (__vcmpeq4(words[i], bytes4(terminator)) >> 7) & 0x0101'0101u;
+      terminators |= (((eq * 0x0020'4081u) >> 21) & 0xf) << (4 * i);
     }
-    // Merge with current context, keeping track of where new rows occur
-    merge_char_context(ctx_map, ctx, pos);
+    if (special == 0) {
+      fast_path          = true;
+      auto const rowmap  = (terminators << 1) | (c_prev == terminator ? 1u : 0u);
+      ctx_map.x          = rowmap;
+      ctx_map.y          = 0;
+      ctx_map.z          = rowmap;
+      ctx_map.w =
+        (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_NONE << 4) | (ROW_CTX_EOF << 6);
+    }
+  }
+  if (!fast_path) {
+    // Loop through all 32 bytes and keep a bitmask of row starts for each possible input context
+    for (uint32_t pos = 0; pos < 32; pos++, cur++, c_prev = c) {
+      uint32_t ctx;
+      if (cur < end) {
+        c = cur[0];
+        if (c_prev == terminator) {
+          if (c == commentchar) {
+            // Start of a new comment row
+            ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
+          } else if (c == quotechar) {
+            // Quoted string on newrow, or quoted string ending in terminator
+            ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+          } else {
+            // Start of a new row unless within a quote
+            ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
+          }
+        } else if (c == quotechar) {
+          // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
+          // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
+          // exit because it might be the first quote of a "" escape sequence. We transition to
+          // COMMENT (pending exit) and wait for the next character:
+          //   - If next char is quote: it's a "" escape, return to QUOTE
+          //   - If next char is anything else: exit confirmed, go to NONE
+          // This doesn't conflict with actual comment handling because comments are only
+          // detected at row boundaries (after newline), where COMMENT state is set with row
+          // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
+          if (c_prev == delimiter) {
+            // Quote after delimiter: start field or pending exit
+            ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+          } else if (c_prev == quotechar) {
+            // Quote after quote: "" escape or stay NONE (Spark compatibility)
+            ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+          } else {
+            // Quote after regular char: pending exit or stay NONE
+            ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
+          }
+        } else {
+          // Non-quote char: stay in current state, or exit from pending
+          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+        }
+      } else {
+        bool const is_last_chunk = data_end_off <= data.size();
+        if (is_last_chunk && cur <= end && cur == data_end) {
+          // Add a newline at data end (need the extra row offset to infer length of previous row)
+          ctx = make_char_context(ROW_CTX_EOF, ROW_CTX_EOF, ROW_CTX_EOF, 1, 1, 1);
+        } else {
+          // Pass-through context (beyond chunk_size or data_end)
+          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+        }
+      }
+      // Merge with current context, keeping track of where new rows occur
+      merge_char_context(ctx_map, ctx, pos);
+    }
   }
 
   // Eliminate rows that start before byte_range_start
