@@ -295,6 +295,33 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 }
 
 /**
+ * @brief Collapses escaped quote pairs (`""` -> `"`) of a quoted field in place.
+ *
+ * Pairs are matched left to right without overlap, matching a `""` -> `"` string replace.
+ *
+ * @param begin First character of the field content (after the opening quote)
+ * @param end One past the last character of the field content (before the closing quote)
+ * @param quotechar Quote character
+ * @return New end of the field content
+ */
+__device__ __forceinline__ char* unescape_doublequotes(char* begin, char* end, char quotechar)
+{
+  auto in = begin;
+  // Nothing to move until the first escaped pair
+  while (in + 1 < end && !(in[0] == quotechar && in[1] == quotechar)) {
+    ++in;
+  }
+  if (in + 1 >= end) { return end; }
+  auto out = in;
+  while (in < end) {
+    auto const c = *in;
+    *out++       = c;
+    in += (c == quotechar && in + 1 < end && in[1] == quotechar) ? 2 : 1;
+  }
+  return out;
+}
+
+/**
  * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
  *
  * Data is processed one record at a time
@@ -307,20 +334,19 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether column fields are valid
  * @param[out] valid_counts The number of valid fields in each column
- * @param[out] is_quoted_flags Per-column boolean arrays tracking which rows were quoted fields
  */
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
-                      device_span<char const> data,
+                      device_span<char> data,
                       device_span<column_parse::flags const> column_flags,
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
                       device_span<cudf::bitmask_type* const> valids,
-                      device_span<size_type> valid_counts,
-                      device_span<bool* const> is_quoted_flags)
+                      device_span<size_type> valid_counts)
 {
-  auto const raw_csv = data.data();
+  // Read-only view of the data; only quoted string fields are written to (see below)
+  char const* const raw_csv = data.data();
   // thread IDs range per block, so also need the block id.
   // this is entry into the field array - tid is an elements within the num_entries array
   auto const rec_id      = grid_1d::global_thread_id();
@@ -357,8 +383,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
         field_start = trimmed_field.first;
         field_end   = trimmed_field.second;
       }
-      bool* const is_quoted_output =
-        is_quoted_flags.empty() ? nullptr : is_quoted_flags[actual_col];
       if (is_valid) {
         // Type dispatcher does not handle STRING
         if (dtypes[actual_col].id() == cudf::type_id::STRING) {
@@ -382,8 +406,13 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
               }
             }
           }
-          // Track whether this field was quoted (for doublequote unescaping)
-          if (is_quoted_output != nullptr) { is_quoted_output[rec_id] = was_quoted; }
+          // Unescape doubled quotes ("" -> ") in place. The field bytes belong only to this
+          // (row, column), so compacting them within [field_start, end) is race-free.
+          if (was_quoted && options.doublequote) {
+            // `data` is mutable; the const view is only used for parsing
+            end = unescape_doublequotes(
+              const_cast<char*>(field_start), const_cast<char*>(end), options.quotechar);
+          }
           auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
           str_list[rec_id].first  = field_start;
           str_list[rec_id].second = end - field_start;
@@ -406,7 +435,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
         auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
         str_list[rec_id].first  = nullptr;
         str_list[rec_id].second = 0;
-        if (is_quoted_output != nullptr) { is_quoted_output[rec_id] = false; }
       }
       ++actual_col;
     }
@@ -860,14 +888,13 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
 }
 
 void decode_row_column_data(cudf::io::parse_options_view const& options,
-                            device_span<char const> data,
+                            device_span<char> data,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
-                            device_span<bool* const> is_quoted_flags,
                             cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -882,8 +909,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                                                                   dtypes,
                                                                   columns,
                                                                   valids,
-                                                                  valid_counts,
-                                                                  is_quoted_flags);
+                                                                  valid_counts);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
