@@ -27,12 +27,15 @@
 #include <rmm/exec_policy.hpp>
 
 #include <cuda/atomic>
+#include <cuda/functional>
 #include <cuda/std/algorithm>
 #include <cuda/stream>
 #include <thrust/count.h>
 #include <thrust/detail/copy.h>
 #include <thrust/remove.h>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/transform.h>
+#include <thrust/transform_reduce.h>
 
 #include <type_traits>
 
@@ -322,6 +325,47 @@ __device__ __forceinline__ char* unescape_doublequotes(char* begin, char* end, c
 }
 
 /**
+ * @brief Cooperatively copies the contiguous character span covering this block's rows into
+ * shared memory, so per-row parsing reads shared memory instead of scattered global loads.
+ *
+ * All threads of the block must call this function.
+ *
+ * @param data The entire CSV data
+ * @param row_offsets Row start offsets (one extra entry marks the end of the last row)
+ * @param smem Shared memory buffer, 16-byte aligned
+ * @param smem_size Size of the shared memory buffer in bytes
+ * @return Offset in `data` of the first staged character, or `data.size()` if the span does not
+ * fit (the caller then reads from global memory)
+ */
+__device__ size_t stage_block_rows(device_span<char const> data,
+                                   device_span<uint64_t const> row_offsets,
+                                   char* smem,
+                                   size_t smem_size)
+{
+  auto const num_rows = row_offsets.size() - 1;
+  auto const first    = static_cast<size_t>(blockIdx.x) * blockDim.x;
+  auto const last     = cuda::std::min<size_t>(first + blockDim.x, num_rows);
+  if (smem_size == 0 || first >= last) { return data.size(); }
+  auto const begin = row_offsets[first] & ~size_t{15};
+  auto const end   = row_offsets[last];
+  // The last 16-byte load may extend past `end`
+  if (end - begin + 16 > smem_size) { return data.size(); }
+
+  // 16-byte loads for complete aligned chunks inside `data`, bytes for the tail
+  auto const num_vec = (cuda::std::min<size_t>(end + 15, data.size()) - begin) / 16;
+  auto const src_vec = reinterpret_cast<uint4 const*>(data.data() + begin);
+  auto const dst_vec = reinterpret_cast<uint4*>(smem);
+  for (auto i = threadIdx.x; i < num_vec; i += blockDim.x) {
+    dst_vec[i] = src_vec[i];
+  }
+  for (auto i = begin + num_vec * 16 + threadIdx.x; i < end; i += blockDim.x) {
+    smem[i - begin] = data[i];
+  }
+  __syncthreads();
+  return begin;
+}
+
+/**
  * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
  *
  * Data is processed one record at a time
@@ -343,10 +387,23 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
                       device_span<cudf::bitmask_type* const> valids,
-                      device_span<size_type> valid_counts)
+                      device_span<size_type> valid_counts,
+                      size_t smem_size)
 {
+  extern __shared__ uint4 staged_rows[];
+  auto const smem = reinterpret_cast<char*>(staged_rows);
+
+  // Parse from the staged copy of this block's rows if it fits, from global memory otherwise
+  auto const staged_begin = stage_block_rows(data, row_offsets, smem, smem_size);
+  auto const is_staged    = staged_begin != data.size();
+  auto const base_offset  = is_staged ? staged_begin : 0;
   // Read-only view of the data; only quoted string fields are written to (see below)
-  char const* const raw_csv = data.data();
+  char const* const raw_csv = is_staged ? smem : data.data();
+  // Maps a parsing pointer back into the global data buffer
+  auto const to_global = [&](char const* ptr) {
+    return data.data() + base_offset + (ptr - raw_csv);
+  };
+
   // thread IDs range per block, so also need the block id.
   // this is entry into the field array - tid is an elements within the num_entries array
   auto const rec_id      = grid_1d::global_thread_id();
@@ -355,8 +412,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   // we can have more threads than data, make sure we are not past the end of the data
   if (rec_id_next >= row_offsets.size()) return;
 
-  auto field_start   = raw_csv + row_offsets[rec_id];
-  auto const row_end = raw_csv + row_offsets[rec_id_next];
+  auto field_start   = raw_csv + (row_offsets[rec_id] - base_offset);
+  auto const row_end = raw_csv + (row_offsets[rec_id_next] - base_offset);
 
   auto next_field = field_start;
   int col         = 0;
@@ -408,14 +465,15 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           }
           // Unescape doubled quotes ("" -> ") in place. The field bytes belong only to this
           // (row, column), so compacting them within [field_start, end) is race-free.
+          // Strings reference the global data buffer, not the staged copy
+          auto const global_start = to_global(field_start);
+          auto global_end         = to_global(end);
           if (was_quoted && options.doublequote) {
-            // `data` is mutable; the const view is only used for parsing
-            end = unescape_doublequotes(
-              const_cast<char*>(field_start), const_cast<char*>(end), options.quotechar);
+            global_end = unescape_doublequotes(global_start, global_end, options.quotechar);
           }
           auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-          str_list[rec_id].first  = field_start;
-          str_list[rec_id].second = end - field_start;
+          str_list[rec_id].first  = global_start;
+          str_list[rec_id].second = global_end - global_start;
         } else {
           if (cudf::type_dispatcher(dtypes[actual_col],
                                     ConvertFunctor{},
@@ -903,14 +961,25 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   auto const num_rows   = row_offsets.size() - 1;
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
 
-  convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(options,
-                                                                  data,
-                                                                  column_flags,
-                                                                  row_offsets,
-                                                                  dtypes,
-                                                                  columns,
-                                                                  valids,
-                                                                  valid_counts);
+  // Stage each block's rows in shared memory, sized to fit the longest block span; skip staging
+  // when that exceeds the default shared memory limit (blocks then read global memory directly)
+  constexpr size_t max_smem_size = 48 * 1024;
+  auto const max_block_span      = thrust::transform_reduce(
+    rmm::exec_policy(stream, cudf::get_current_device_resource_ref()),
+    thrust::counting_iterator<size_t>(0),
+    thrust::counting_iterator<size_t>(grid_size),
+    cuda::proclaim_return_type<size_t>([row_offsets, num_rows] __device__(size_t block) {
+      auto const first = block * csvparse_block_dim;
+      auto const last  = cuda::std::min<size_t>(first + csvparse_block_dim, num_rows);
+      return static_cast<size_t>(row_offsets[last] - (row_offsets[first] & ~uint64_t{15}));
+    }),
+    size_t{0},
+    cuda::maximum<size_t>{});
+  // Room for the final 16-byte load, which may extend past the span
+  auto const wanted_smem_size = util::round_up_safe<size_t>(max_block_span + 16, 16);
+  auto const smem_size        = wanted_smem_size <= max_smem_size ? wanted_smem_size : 0;
+  convert_csv_to_cudf<<<grid_size, block_size, smem_size, stream.get()>>>(
+    options, data, column_flags, row_offsets, dtypes, columns, valids, valid_counts, smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
