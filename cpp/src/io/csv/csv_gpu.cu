@@ -715,7 +715,9 @@ __device__ size_t stage_block_rows(device_span<char const> data,
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether column fields are valid
  * @param[out] valid_counts The number of valid fields in each column
+ * @tparam WindowedIntegers Parse integers from a register copy of the field (for unstaged rows)
  */
+template <bool WindowedIntegers>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
                       device_span<char const> data,
@@ -826,7 +828,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           str_list[rec_id].second = global_end - global_start;
         } else {
           if (cudf::type_dispatcher(dtypes[actual_col],
-                                    ConvertFunctor{},
+                                    ConvertFunctor{WindowedIntegers},
                                     field_start,
                                     field_end,
                                     columns[actual_col],
@@ -1724,17 +1726,19 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   // when that exceeds the default shared memory limit (blocks then read global memory directly)
   constexpr size_t max_smem_size = 48 * 1024;
   auto const smem_size           = staging_smem_size(data, row_offsets, max_smem_size, stream);
-  convert_csv_to_cudf<<<grid_size, block_size, smem_size, stream.get()>>>(
-    options,
-    data,
-    unescape_buffer,
-    column_flags,
-    row_offsets,
-    dtypes,
-    columns,
-    valids,
-    valid_counts,
-    smem_size);
+  // Without staging every field is read from global memory, where parsing integers from a
+  // register copy of the field saves one load per character
+  auto const kernel = smem_size == 0 ? convert_csv_to_cudf<true> : convert_csv_to_cudf<false>;
+  kernel<<<grid_size, block_size, smem_size, stream.get()>>>(options,
+                                                             data,
+                                                             unescape_buffer,
+                                                             column_flags,
+                                                             row_offsets,
+                                                             dtypes,
+                                                             columns,
+                                                             valids,
+                                                             valid_counts,
+                                                             smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

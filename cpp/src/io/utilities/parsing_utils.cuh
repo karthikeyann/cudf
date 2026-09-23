@@ -96,7 +96,8 @@ CUDF_HOST_DEVICE constexpr char to_lower(char const c)
  * @param end Pointer to the first element after the string
  * @return true if string is valid infinity, else false.
  */
-CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
+template <typename It>
+CUDF_HOST_DEVICE constexpr bool is_infinity(It begin, It end)
 {
   if (*begin == '-' || *begin == '+') begin++;
   char const* cinf = "infinity";
@@ -258,9 +259,9 @@ CUDF_HOST_DEVICE inline double decimal_divisor(int index)
  *
  * @return The parsed and converted value
  */
-template <typename T, int base = 10>
-CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
-                                                      char const* end,
+template <typename T, int base = 10, typename It = char const*>
+CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(It begin,
+                                                      It end,
                                                       parse_options_view const& opts)
 {
   T value{};
@@ -608,7 +609,88 @@ __inline__ __device__ cuda::std::pair<char const*, char const*> trim_quotes(char
   return {begin, end};
 }
 
+/**
+ * @brief Iterator over the characters of a short field held in registers as up to four aligned
+ * 8-byte words, so parsing reads each character from a register instead of issuing a load.
+ *
+ * In thread-per-row kernels the threads of a warp read different rows, so every byte load is a
+ * separate memory transaction per thread.
+ */
+struct field_window_iterator {
+  uint64_t w0, w1, w2, w3;
+  int pos;
+
+  __device__ __forceinline__ char operator*() const
+  {
+    auto const word = pos < 8 ? w0 : (pos < 16 ? w1 : (pos < 24 ? w2 : w3));
+    return static_cast<char>(word >> (8 * (pos & 7)));
+  }
+  __device__ __forceinline__ field_window_iterator& operator++()
+  {
+    ++pos;
+    return *this;
+  }
+  __device__ __forceinline__ field_window_iterator operator++(int)
+  {
+    auto const old = *this;
+    ++pos;
+    return old;
+  }
+  __device__ __forceinline__ field_window_iterator& operator+=(int n)
+  {
+    pos += n;
+    return *this;
+  }
+  __device__ __forceinline__ field_window_iterator operator+(int n) const
+  {
+    auto it = *this;
+    it.pos += n;
+    return it;
+  }
+  __device__ __forceinline__ bool operator<(field_window_iterator const& o) const
+  {
+    return pos < o.pos;
+  }
+  __device__ __forceinline__ bool operator>=(field_window_iterator const& o) const
+  {
+    return pos >= o.pos;
+  }
+  __device__ __forceinline__ bool operator==(field_window_iterator const& o) const
+  {
+    return pos == o.pos;
+  }
+};
+
+/**
+ * @brief `parse_numeric<T, base>(begin, end, opts)`, reading a field of up to 32 bytes (counted
+ * from the aligned word that contains `begin`) with at most four word loads.
+ *
+ * Only aligned words that contain a character of `[begin, end)` are loaded.
+ */
+template <typename T, int base = 10>
+__device__ __forceinline__ cuda::std::optional<T> parse_numeric_windowed(
+  char const* begin, char const* end, parse_options_view const& opts)
+{
+  auto const offset = static_cast<int>(reinterpret_cast<uintptr_t>(begin) & 7);
+  auto const length = end - begin;
+  if (length <= 0 || offset + length > 32) { return parse_numeric<T, base>(begin, end, opts); }
+  auto const words     = reinterpret_cast<uint64_t const*>(begin - offset);
+  auto const num_words = (offset + static_cast<int>(length) + 7) / 8;
+  field_window_iterator first{words[0],
+                              num_words > 1 ? words[1] : 0,
+                              num_words > 2 ? words[2] : 0,
+                              num_words > 3 ? words[3] : 0,
+                              offset};
+  auto last = first;
+  last.pos  = offset + static_cast<int>(length);
+  return parse_numeric<T, base>(first, last, opts);
+}
+
 struct ConvertFunctor {
+  /// Parse integers from registers (`parse_numeric_windowed`); pays off when the field is in
+  /// global memory, not when it is already in shared memory
+  bool windowed_integers = false;
+
   /**
    * @brief Dispatch for numeric types whose values can be convertible to
    * 0 or 1 to represent boolean false/true, based upon checking against a
@@ -627,11 +709,15 @@ struct ConvertFunctor {
                                              parse_options_view const& opts,
                                              bool as_hex = false)
   {
-    auto const value = [as_hex, &opts, begin, end]() -> cuda::std::optional<T> {
+    auto const value = [this, as_hex, &opts, begin, end]() -> cuda::std::optional<T> {
       // Check for user-specified true/false values
       auto const field_len = static_cast<size_t>(end - begin);
       if (serialized_trie_contains(opts.trie_true, {begin, field_len})) { return 1; }
       if (serialized_trie_contains(opts.trie_false, {begin, field_len})) { return 0; }
+      if (windowed_integers) {
+        return as_hex ? cudf::io::parse_numeric_windowed<T, 16>(begin, end, opts)
+                      : cudf::io::parse_numeric_windowed<T>(begin, end, opts);
+      }
       return as_hex ? cudf::io::parse_numeric<T, 16>(begin, end, opts)
                     : cudf::io::parse_numeric<T>(begin, end, opts);
     }();
