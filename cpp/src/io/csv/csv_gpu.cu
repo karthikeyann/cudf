@@ -301,6 +301,45 @@ __device__ __forceinline__ char const* seek_field_end_by_words(char const* begin
  * @param as_datetime Whether the column is parsed as datetime
  */
 /**
+ * @brief Same classification as `cudf::io::gpu::infer_integral_field_counter`, returning the
+ * histogram slot directly (no counter pointer, so no histogram object in local memory)
+ */
+__device__ __forceinline__ int integral_field_slot(char const* data_begin,
+                                                   char const* data_end,
+                                                   bool is_negative)
+{
+  static constexpr char uint64_max_abs[] = "18446744073709551615";
+  static constexpr char int64_min_abs[]  = "9223372036854775808";
+  static constexpr char int64_max_abs[]  = "9223372036854775807";
+  using cudf::io::gpu::less_equal_than;
+
+  auto digit_count = data_end - data_begin;
+  // Remove preceding zeros
+  if (digit_count >= (sizeof(int64_max_abs) - 1)) {
+    while (*data_begin == '0' && (data_begin < data_end)) {
+      data_begin++;
+    }
+  }
+  digit_count = data_end - data_begin;
+
+  if (digit_count < (sizeof(int64_max_abs) - 1)) {
+    return is_negative && (digit_count != 0) ? slot_negative_small_int : slot_positive_small_int;
+  } else if (digit_count > (sizeof(uint64_max_abs) - 1)) {
+    return slot_string;
+  } else if (digit_count == (sizeof(uint64_max_abs) - 1) && is_negative) {
+    return slot_string;
+  }
+  if (digit_count == (sizeof(int64_max_abs) - 1) && is_negative) {
+    return less_equal_than(data_begin, int64_min_abs) ? slot_negative_small_int : slot_string;
+  } else if (digit_count == (sizeof(int64_max_abs) - 1) && !is_negative) {
+    return less_equal_than(data_begin, int64_max_abs) ? slot_positive_small_int : slot_big_int;
+  } else if (digit_count == (sizeof(uint64_max_abs) - 1)) {
+    return less_equal_than(data_begin, uint64_max_abs) ? slot_big_int : slot_string;
+  }
+  return slot_string;
+}
+
+/**
  * @brief Classifies a non-empty, trimmed field from its character counts.
  *
  * @tparam Count Counter type; must be able to hold the field length
@@ -395,10 +434,7 @@ __device__ int classify_trimmed_field(parse_options_view const& opts,
     auto const is_negative = (*trimmed_field_range.first == '-');
     auto const data_begin =
       trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
-    column_type_histogram local_stats{};
-    cudf::size_type const* ptr = cudf::io::gpu::infer_integral_field_counter(
-      data_begin, data_begin + count_number, is_negative, local_stats);
-    return static_cast<int>(ptr - reinterpret_cast<cudf::size_type const*>(&local_stats));
+    return integral_field_slot(data_begin, data_begin + count_number, is_negative);
   } else if (is_floatingpoint(trimmed_field_len,
                               count_number,
                               count_decimal,
