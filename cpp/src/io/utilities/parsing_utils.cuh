@@ -672,6 +672,86 @@ struct field_window {
 };
 
 /**
+ * @brief Value of the decimal digits in the low `n` bytes of `chars` (1 <= n <= 8), the first
+ * digit in the lowest byte. The bytes must be ASCII digits.
+ */
+__device__ __forceinline__ uint64_t swar_decimal_value(uint64_t chars, int n)
+{
+  // Digit values in the high `n` bytes; the zeroed low bytes act as leading zeros
+  auto v = (chars - 0x3030'3030'3030'3030ULL) & (~uint64_t{0} >> (8 * (8 - n)));
+  v <<= 8 * (8 - n);
+  v = (v * 10 + (v >> 8)) & 0x00FF'00FF'00FF'00FFULL;    // 2-digit lanes, <= 99
+  v = (v * 100 + (v >> 16)) & 0x0000'FFFF'0000'FFFFULL;  // 4-digit lanes, <= 9999
+  return (v * 10000 + (v >> 32)) & 0xFFFF'FFFFULL;       // <= 99999999
+}
+
+/**
+ * @brief For a field `[pos, pos + len)` of the window's words that consists of 1 to 20 decimal
+ * digits with an optional leading '-', sets `value` to what `parse_numeric<T>` (T integral,
+ * base 10) computes before narrowing: the digits' value modulo 2^64, negated for '-'.
+ *
+ * `parse_numeric`'s `value * 10 + digit` steps and final `* sign` wrap modulo 2^bits, so the
+ * narrowed result is identical, provided no digit is the decimal point or thousands separator.
+ * Returns false for any other field.
+ */
+__device__ __forceinline__ bool window_plain_integer(
+  field_window const& window, int pos, int len, parse_options_view const& opts, uint64_t& value)
+{
+  auto const is_digit_char = [](char c) { return c >= '0' && c <= '9'; };
+  if (len < 1 || len > 21 || is_digit_char(opts.decimal) || is_digit_char(opts.thousands)) {
+    return false;
+  }
+  auto const word = [&](int i) {
+    return i == 0 ? window.w0 : i == 1 ? window.w1 : i == 2 ? window.w2 : i == 3 ? window.w3 : 0;
+  };
+  auto const funnel = [](uint64_t low, uint64_t high, int shift) {
+    return shift == 0 ? low : (low >> shift) | (high << (64 - shift));
+  };
+  auto const k     = pos / 8;
+  auto const shift = 8 * (pos % 8);
+  auto const w0 = word(k), w1 = word(k + 1), w2 = word(k + 2), w3 = word(k + 3);
+  auto b0 = funnel(w0, w1, shift);
+  auto b1 = funnel(w1, w2, shift);
+  auto b2 = funnel(w2, w3, shift);
+  bool const negative = static_cast<char>(b0) == '-';
+  if (negative) {
+    b0 = funnel(b0, b1, 8);
+    b1 = funnel(b1, b2, 8);
+    b2 = b2 >> 8;
+  }
+  auto const num_digits = len - negative;
+  if (num_digits < 1 || num_digits > 20) { return false; }
+  // Every byte of the digit range is in '0'..'9': high nibble 3, and adding 6 keeps it 3
+  auto const all_digits = [](uint64_t chars, int n) {
+    if (n <= 0) { return true; }
+    auto const mask = (~uint64_t{0} >> (8 * (8 - (n < 8 ? n : 8)))) & 0xF0F0'F0F0'F0F0'F0F0ULL;
+    auto const expected = 0x3030'3030'3030'3030ULL & mask;
+    return (chars & mask) == expected && ((chars + 0x0606'0606'0606'0606ULL) & mask) == expected;
+  };
+  if (not all_digits(b0, num_digits) or not all_digits(b1, num_digits - 8) or
+      not all_digits(b2, num_digits - 16)) {
+    return false;
+  }
+  auto const digits_at = [&](int d) {
+    return d < 8 ? funnel(b0, b1, 8 * d) : d < 16 ? funnel(b1, b2, 8 * (d - 8)) : b2;
+  };
+  uint64_t magnitude = 0;
+  if (num_digits <= 8) {
+    magnitude = swar_decimal_value(b0, num_digits);
+  } else if (num_digits <= 16) {
+    auto const head = num_digits - 8;
+    magnitude = swar_decimal_value(b0, head) * 100'000'000ULL + swar_decimal_value(digits_at(head), 8);
+  } else {
+    auto const head = num_digits - 16;
+    magnitude       = swar_decimal_value(b0, head) * 10'000'000'000'000'000ULL +
+                swar_decimal_value(digits_at(head), 8) * 100'000'000ULL +
+                swar_decimal_value(digits_at(head + 8), 8);
+  }
+  value = negative ? uint64_t{0} - magnitude : magnitude;
+  return true;
+}
+
+/**
  * @brief `parse_numeric<T, base>(begin, end, opts)`, reading a field of up to 32 bytes (counted
  * from the aligned word that contains `begin`) from registers.
  *

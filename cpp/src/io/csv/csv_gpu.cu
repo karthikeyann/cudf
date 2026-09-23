@@ -1226,6 +1226,53 @@ __device__ __forceinline__ cuda::std::pair<char const*, char const*> unescape_do
   return {out, out_it};
 }
 
+/**
+ * @brief ConvertFunctor's decoding of a valid, trimmed field `[begin, end)` into an integer
+ * column (any integral type but BOOL8, not hexadecimal) when it is a plain decimal integer held by
+ * the seek's word window. Returns false, and stores nothing, otherwise.
+ */
+__device__ __forceinline__ bool store_window_integer(parse_options_view const& opts,
+                                                     cudf::io::field_window const& window,
+                                                     char const* begin,
+                                                     char const* end,
+                                                     type_id type,
+                                                     void* column,
+                                                     size_type row)
+{
+  auto const is_plain_integral = type == type_id::INT8 or type == type_id::INT16 or
+                                 type == type_id::INT32 or type == type_id::INT64 or
+                                 type == type_id::UINT8 or type == type_id::UINT16 or
+                                 type == type_id::UINT32 or type == type_id::UINT64;
+  if (not is_plain_integral or window.base == nullptr or begin < window.base or
+      end > window.base + 8 * window.count) {
+    return false;
+  }
+  auto const len = static_cast<size_t>(end - begin);
+  // ConvertFunctor maps user true/false values first
+  if (opts.tries_may_hold_plain_integers and
+      (serialized_trie_contains(opts.trie_true, {begin, len}) or
+       serialized_trie_contains(opts.trie_false, {begin, len}))) {
+    return false;
+  }
+  uint64_t value = 0;
+  if (not cudf::io::window_plain_integer(
+        window, static_cast<int>(begin - window.base), static_cast<int>(len), opts, value)) {
+    return false;
+  }
+  // The low bits of the value modulo 2^64, as parse_numeric<T> produces them
+  switch (type) {
+    case type_id::INT8: static_cast<int8_t*>(column)[row] = static_cast<int8_t>(value); break;
+    case type_id::INT16: static_cast<int16_t*>(column)[row] = static_cast<int16_t>(value); break;
+    case type_id::INT32: static_cast<int32_t*>(column)[row] = static_cast<int32_t>(value); break;
+    case type_id::INT64: static_cast<int64_t*>(column)[row] = static_cast<int64_t>(value); break;
+    case type_id::UINT8: static_cast<uint8_t*>(column)[row] = static_cast<uint8_t>(value); break;
+    case type_id::UINT16: static_cast<uint16_t*>(column)[row] = static_cast<uint16_t>(value); break;
+    case type_id::UINT32: static_cast<uint32_t*>(column)[row] = static_cast<uint32_t>(value); break;
+    default: static_cast<uint64_t*>(column)[row] = value; break;
+  }
+  return true;
+}
+
 template <bool WindowedIntegers, typename WordReader>
 __device__ __forceinline__ ConvertFunctor make_convert_functor(WordReader const& words)
 {
@@ -1290,8 +1337,10 @@ __device__ size_t stage_block_rows(device_span<char const> data,
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether column fields are valid
  * @tparam WindowedIntegers Parse integers from a register copy of the field (for unstaged rows)
+ * @tparam TypedFastPaths Include the word-operation paths for plain numbers of the column types
+ * present (unstaged: integers; staged: FLOAT64), which cost registers in reads without them
  */
-template <bool WindowedIntegers>
+template <bool WindowedIntegers, bool TypedFastPaths>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
                       device_span<char const> data,
@@ -1335,8 +1384,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   // Staged rows only: the word loads need the staging slack, and in the unstaged instance the
   // extra code costs more registers than it saves
   bool const plain_ints = not WindowedIntegers and is_staged and plain_digits_parse(options);
-  bool const plain_floats =
-    plain_ints and options.decimal != 'e' and options.decimal != 'E' and options.decimal != '+';
+  bool const plain_floats = TypedFastPaths and plain_ints and options.decimal != 'e' and
+                            options.decimal != 'E' and options.decimal != '+';
   double plain_double = 0;
 
   while (col < column_flags.size() && field_start < row_end) {
@@ -1444,7 +1493,19 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           str_list[rec_id].first  = global_start;
           str_list[rec_id].second = global_end - global_start;
         } else {
-          if (cudf::type_dispatcher(dtypes[actual_col],
+          bool stored = false;
+          if constexpr (WindowedIntegers and TypedFastPaths) {
+            // Plain integers are decoded from the seek's words without a per-character loop
+            stored = not(column_flags[col] & column_parse::as_hexadecimal) and
+                     store_window_integer(options,
+                                          words.window,
+                                          field_start,
+                                          field_end,
+                                          dtypes[actual_col].id(),
+                                          columns[actual_col],
+                                          rec_id);
+          }
+          if (stored or cudf::type_dispatcher(dtypes[actual_col],
                                     make_convert_functor<WindowedIntegers>(words),
                                     field_start,
                                     field_end,
@@ -2419,6 +2480,8 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
+                            bool has_integer_columns,
+                            bool has_float64_columns,
                             std::optional<size_t> max_block_span,
                             cuda::stream_ref stream)
 {
@@ -2434,7 +2497,11 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
     staging_smem_size(data, row_offsets, max_smem_size, max_block_span, stream);
   // Without staging every field is read from global memory, where parsing integers from a
   // register copy of the field saves one load per character
-  auto const kernel = smem_size == 0 ? convert_csv_to_cudf<true> : convert_csv_to_cudf<false>;
+  // The typed fast paths only where their column types are present (they cost registers)
+  auto const kernel =
+    smem_size == 0
+      ? (has_integer_columns ? convert_csv_to_cudf<true, true> : convert_csv_to_cudf<true, false>)
+      : (has_float64_columns ? convert_csv_to_cudf<false, true> : convert_csv_to_cudf<false, false>);
   kernel<<<grid_size, block_size, smem_size, stream.get()>>>(options,
                                                              data,
                                                              unescape_buffer,

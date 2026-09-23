@@ -997,6 +997,14 @@ std::vector<column_buffer> decode_data(rmm::device_uvector<string_index_pair>& s
     d_data,
     d_valid,
     d_valid_counts,
+    std::any_of(column_types.begin(),
+                column_types.end(),
+                [](auto const& type) {
+                  return cudf::is_integral(type) and type.id() != type_id::BOOL8;
+                }),
+    std::any_of(column_types.begin(),
+                column_types.end(),
+                [](auto const& type) { return type.id() == type_id::FLOAT64; }),
     max_block_span,
     stream);
 

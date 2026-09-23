@@ -288,6 +288,8 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
+                            bool has_integer_columns,
+                            bool has_float64_columns,
                             std::optional<size_t> max_block_span,
                             cuda::stream_ref stream);
 
