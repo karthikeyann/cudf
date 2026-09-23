@@ -229,6 +229,7 @@ struct direct_word_reader {
     return *begin;
   }
   __device__ __forceinline__ char at(char const* pos) const { return *pos; }
+  __device__ __forceinline__ uint64_t word(char const* word_begin) { return load(word_begin); }
   __device__ __forceinline__ uint64_t load(char const* word_begin)
   {
     return *reinterpret_cast<uint64_t const*>(word_begin);
@@ -264,6 +265,15 @@ struct caching_word_reader {
     }
     return *pos;
   }
+  /// The aligned word at `word_begin`, from the current field's words when they hold it
+  __device__ __forceinline__ uint64_t word(char const* word_begin)
+  {
+    auto const offset = word_begin - window.base;
+    if (window.base != nullptr && offset >= 0 && offset < 8 * window.count) {
+      return offset < 8 ? window.w0 : offset < 16 ? window.w1 : offset < 24 ? window.w2 : window.w3;
+    }
+    return load(word_begin);
+  }
   /// `*begin`, read through the word cache when the word lies within `[data_begin, end)`
   __device__ __forceinline__ char first_char(char const* begin,
                                              char const* data_begin,
@@ -293,6 +303,98 @@ struct caching_word_reader {
     return cached;
   }
 };
+
+/**
+ * @brief `serialized_trie_contains(trie, {key, key_len})`, reading the key through `words.at`
+ */
+template <typename WordReader>
+__device__ __forceinline__ bool trie_contains(device_span<cudf::detail::serial_trie_node const> trie,
+                                             char const* key,
+                                             size_t key_len,
+                                             WordReader const& words)
+{
+  if (trie.empty()) { return false; }
+  if (key_len == 0) { return trie.front().is_leaf; }
+  // The root node holds the longest key length (negative if unknown)
+  auto const max_key_length = trie.front().children_offset;
+  if (max_key_length >= 0 && key_len > static_cast<size_t>(max_key_length)) { return false; }
+  auto curr_node = trie.begin() + 1;
+  for (auto curr_key = key; curr_key < key + key_len; ++curr_key) {
+    // Don't jump away from root node
+    if (curr_key != key) {
+      // A node without children cannot match a longer key
+      if (curr_node->children_offset < 0) { return false; }
+      curr_node += curr_node->children_offset;
+    }
+    auto const c = words.at(curr_key);
+    // Nodes are sorted - terminate search if the node is larger or equal
+    while (curr_node->character != cudf::detail::trie_terminating_character &&
+           curr_node->character < c) {
+      ++curr_node;
+    }
+    if (curr_node->character != c) { return false; }
+  }
+  return curr_node->is_leaf;
+}
+
+/**
+ * @brief `trim_whitespaces_quotes(begin, end, quotechar)`, reading characters through `words.at`
+ * (including the characters just outside the range that the original also reads)
+ */
+template <typename WordReader>
+__device__ __forceinline__ cuda::std::pair<char const*, char const*> trim_whitespaces_quotes_at(
+  char const* begin, char const* end, char quotechar, WordReader const& words)
+{
+  auto trim_begin = begin;
+  while (trim_begin != end && is_whitespace(words.at(trim_begin))) {
+    ++trim_begin;
+  }
+  auto trim_end = end;
+  while (trim_end != trim_begin && is_whitespace(words.at(trim_end - 1))) {
+    --trim_end;
+  }
+  auto const trimmed_begin = trim_begin + (words.at(trim_begin) == quotechar);
+  auto const trimmed_end   = trim_end - (words.at(trim_end - 1) == quotechar);
+  // A lone quote character would otherwise be skipped from both ends, leaving end < begin
+  return {trimmed_begin, cuda::std::max(trimmed_begin, trimmed_end)};
+}
+
+template <typename WordReader>
+constexpr bool is_caching_reader = cuda::std::is_same_v<WordReader, caching_word_reader>;
+
+/// `cudf::io::is_infinity(begin, end)`, reading characters through `words.at`
+template <typename WordReader>
+__device__ __forceinline__ bool is_infinity_at(char const* begin,
+                                               char const* end,
+                                               WordReader const& words)
+{
+  if (words.at(begin) == '-' || words.at(begin) == '+') begin++;
+  char const* cinf = "infinity";
+  auto index       = begin;
+  while (index < end) {
+    if (*cinf != cudf::io::to_lower(words.at(index))) break;
+    index++;
+    cinf++;
+  }
+  return ((index == begin + 3 || index == begin + 8) && index >= end);
+}
+
+/// `cudf::io::gpu::less_equal_than(data, golden)`, reading characters through `words.at`
+template <int N, typename WordReader>
+__device__ __forceinline__ bool less_equal_than_at(char const* data,
+                                                   char const (&golden)[N],
+                                                   WordReader const& words)
+{
+  if constexpr (is_caching_reader<WordReader>) {
+    for (int i = 0; i < N - 1; ++i) {
+      auto const c = words.at(data + i);
+      if (c != golden[i]) { return c <= golden[i]; }
+    }
+    return true;
+  } else {
+    return cudf::io::gpu::less_equal_than(data, golden);
+  }
+}
 
 template <typename WordReader = direct_word_reader>
 __device__ __forceinline__ char const* seek_field_end_by_words(
@@ -402,19 +504,19 @@ __device__ __forceinline__ char const* seek_field_end_by_words(
  * @brief Same classification as `cudf::io::gpu::infer_integral_field_counter`, returning the
  * histogram slot directly (no counter pointer, so no histogram object in local memory)
  */
+template <typename WordReader>
 __device__ __forceinline__ int integral_field_slot(char const* data_begin,
                                                    char const* data_end,
-                                                   bool is_negative)
+                                                   bool is_negative,
+                                                   WordReader const& words)
 {
   static constexpr char uint64_max_abs[] = "18446744073709551615";
   static constexpr char int64_min_abs[]  = "9223372036854775808";
   static constexpr char int64_max_abs[]  = "9223372036854775807";
-  using cudf::io::gpu::less_equal_than;
-
   auto digit_count = data_end - data_begin;
   // Remove preceding zeros
   if (digit_count >= (sizeof(int64_max_abs) - 1)) {
-    while (*data_begin == '0' && (data_begin < data_end)) {
+    while (words.at(data_begin) == '0' && (data_begin < data_end)) {
       data_begin++;
     }
   }
@@ -428,11 +530,11 @@ __device__ __forceinline__ int integral_field_slot(char const* data_begin,
     return slot_string;
   }
   if (digit_count == (sizeof(int64_max_abs) - 1) && is_negative) {
-    return less_equal_than(data_begin, int64_min_abs) ? slot_negative_small_int : slot_string;
+    return less_equal_than_at(data_begin, int64_min_abs, words) ? slot_negative_small_int : slot_string;
   } else if (digit_count == (sizeof(int64_max_abs) - 1) && !is_negative) {
-    return less_equal_than(data_begin, int64_max_abs) ? slot_positive_small_int : slot_big_int;
+    return less_equal_than_at(data_begin, int64_max_abs, words) ? slot_positive_small_int : slot_big_int;
   } else if (digit_count == (sizeof(uint64_max_abs) - 1)) {
-    return less_equal_than(data_begin, uint64_max_abs) ? slot_big_int : slot_string;
+    return less_equal_than_at(data_begin, uint64_max_abs, words) ? slot_big_int : slot_string;
   }
   return slot_string;
 }
@@ -442,12 +544,13 @@ __device__ __forceinline__ int integral_field_slot(char const* data_begin,
  *
  * @tparam Count Counter type; must be able to hold the field length
  */
-template <typename Count>
+template <typename Count, typename WordReader>
 __device__ int classify_trimmed_field(parse_options_view const& opts,
                                       cuda::std::pair<char const*, char const*> trimmed_field_range,
                                       bool as_datetime,
                                       device_span<char const> data,
-                                      bool scan_by_words)
+                                      bool scan_by_words,
+                                      WordReader& words)
 {
   auto const trimmed_field_len = trimmed_field_range.second - trimmed_field_range.first;
   Count count_number    = 0;
@@ -494,14 +597,14 @@ __device__ int classify_trimmed_field(parse_options_view const& opts,
   bool done           = false;
   if (!scan_by_words) {
     for (; !done && cur < trimmed_field_range.second; ++cur) {
-      done = count_char(*cur, cur);
+      done = count_char(words.at(cur), cur);
     }
   }
   while (!done && cur < trimmed_field_range.second) {
     auto const word_begin =
       reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(cur) & ~uintptr_t{7});
     if (word_begin >= data.data() && word_begin + 8 <= data_end) {
-      auto const word = *reinterpret_cast<uint64_t const*>(word_begin);
+      auto const word = words.word(word_begin);
       auto const last =
         static_cast<int>(cuda::std::min<ptrdiff_t>(8, trimmed_field_range.second - word_begin));
       for (auto i = static_cast<int>(cur - word_begin); i < last && !done; ++i) {
@@ -509,7 +612,7 @@ __device__ int classify_trimmed_field(parse_options_view const& opts,
       }
       cur = word_begin + last;
     } else {
-      done = count_char(*cur, cur);
+      done = count_char(words.at(cur), cur);
       ++cur;
     }
   }
@@ -518,7 +621,7 @@ __device__ int classify_trimmed_field(parse_options_view const& opts,
   // Off by one if they start with a minus sign
   auto const int_req_number_cnt =
     trimmed_field_len - count_thousands -
-    ((*trimmed_field_range.first == '-' || *trimmed_field_range.first == '+') &&
+    ((words.at(trimmed_field_range.first) == '-' || words.at(trimmed_field_range.first) == '+') &&
      trimmed_field_len > 1);
 
   if (as_datetime) {
@@ -529,10 +632,10 @@ __device__ int classify_trimmed_field(parse_options_view const& opts,
       return slot_string;
     }
   } else if (count_number == int_req_number_cnt) {
-    auto const is_negative = (*trimmed_field_range.first == '-');
+    auto const is_negative = (words.at(trimmed_field_range.first) == '-');
     auto const data_begin =
-      trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
-    return integral_field_slot(data_begin, data_begin + count_number, is_negative);
+      trimmed_field_range.first + (is_negative || (words.at(trimmed_field_range.first) == '+'));
+    return integral_field_slot(data_begin, data_begin + count_number, is_negative, words);
   } else if (is_floatingpoint(trimmed_field_len,
                               count_number,
                               count_decimal,
@@ -545,31 +648,53 @@ __device__ int classify_trimmed_field(parse_options_view const& opts,
   }
 }
 
-template <typename Count>
+template <typename Count, typename WordReader>
 __device__ int classify_field(parse_options_view const& opts,
                               char const* field_start,
                               char const* next_delimiter,
                               bool as_datetime,
                               device_span<char const> data,
-                              bool scan_by_words)
+                              bool scan_by_words,
+                              WordReader& words)
 {
   auto const field_len = static_cast<size_t>(next_delimiter - field_start);
-  if (serialized_trie_contains(opts.trie_na, {field_start, field_len})) {
+  // Unstaged rows read the field's characters from the words the seek already loaded
+  constexpr bool cached = is_caching_reader<WordReader>;
+  auto const contains   = [&](auto const& trie) {
+    if constexpr (cached) {
+      return trie_contains(trie, field_start, field_len, words);
+    } else {
+      return serialized_trie_contains(trie, {field_start, field_len});
+    }
+  };
+  auto const is_inf = [&] {
+    if constexpr (cached) {
+      return is_infinity_at(field_start, next_delimiter, words);
+    } else {
+      return cudf::io::is_infinity(field_start, next_delimiter);
+    }
+  };
+  if (contains(opts.trie_na)) {
     return slot_null;
-  } else if (serialized_trie_contains(opts.trie_true, {field_start, field_len}) ||
-             serialized_trie_contains(opts.trie_false, {field_start, field_len})) {
+  } else if (contains(opts.trie_true) || contains(opts.trie_false)) {
     return slot_bool;
-  } else if (cudf::io::is_infinity(field_start, next_delimiter)) {
+  } else if (is_inf()) {
     return slot_float;
   } else {
     // Modify field_start & end to ignore whitespace and quotechars
     // This could possibly result in additional empty fields
-    auto const trimmed_field_range = trim_whitespaces_quotes(field_start, next_delimiter);
-    auto const trimmed_field_len   = trimmed_field_range.second - trimmed_field_range.first;
+    auto const trimmed_field_range = [&] {
+      if constexpr (cached) {
+        return trim_whitespaces_quotes_at(field_start, next_delimiter, '\0', words);
+      } else {
+        return trim_whitespaces_quotes(field_start, next_delimiter);
+      }
+    }();
+    auto const trimmed_field_len = trimmed_field_range.second - trimmed_field_range.first;
 
     if (trimmed_field_len == 0) { return slot_string; }
     return classify_trimmed_field<Count>(
-      opts, trimmed_field_range, as_datetime, data, scan_by_words);
+      opts, trimmed_field_range, as_datetime, data, scan_by_words, words);
   }
 }
 
@@ -614,8 +739,9 @@ __device__ size_t stage_block_rows(device_span<char const> data,
 
 /**
  * @tparam Count Type of the per-field character counters; must hold the length of any field
+ * @tparam CachedWords Read fields through the words the seek loaded (for unstaged rows)
  */
-template <typename Count>
+template <typename Count, bool CachedWords>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   data_type_detection(parse_options_view const opts,
                       device_span<char const> csv_text,
@@ -674,6 +800,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   auto next_field = field_start;
   int col         = 0;
   int actual_col  = 0;
+  // Unstaged rows: reuse loaded words across fields and while classifying
+  cuda::std::conditional_t<CachedWords, caching_word_reader, direct_word_reader> words{};
 
   // Going through all the columns of a given record
   while (has_row && col < column_flags.size() && field_start < row_end) {
@@ -681,7 +809,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     // not produce empty fields (matches pandas behavior).
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, opts);
     if (field_start >= row_end) break;
-    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, opts);
+    auto next_delimiter =
+      seek_field_end_by_words(field_start, row_end, raw_csv, opts, nullptr, words);
 
     // Checking if this is a column that the user wants --- user can filter columns
     if (column_flags[col] & column_parse::inferred) {
@@ -690,7 +819,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                        next_delimiter,
                                        column_flags[col] & column_parse::as_datetime,
                                        text,
-                                       scan_by_words);
+                                       scan_by_words,
+                                       words);
       warp_aggregated_increment(counters, actual_col * histogram_slots + slot);
       // Integer fields are also decoded, in case the column is inferred as an integer column
       if (not int_values.empty() and
@@ -757,61 +887,6 @@ __device__ __forceinline__ cuda::std::pair<char const*, char const*> unescape_do
     in += (c == quotechar && in + 1 < end && in[1] == quotechar) ? 2 : 1;
   }
   return {out, out_it};
-}
-
-/**
- * @brief `serialized_trie_contains(trie, {key, key_len})`, reading the key through `words.at`
- */
-template <typename WordReader>
-__device__ __forceinline__ bool trie_contains(device_span<cudf::detail::serial_trie_node const> trie,
-                                             char const* key,
-                                             size_t key_len,
-                                             WordReader const& words)
-{
-  if (trie.empty()) { return false; }
-  if (key_len == 0) { return trie.front().is_leaf; }
-  // The root node holds the longest key length (negative if unknown)
-  auto const max_key_length = trie.front().children_offset;
-  if (max_key_length >= 0 && key_len > static_cast<size_t>(max_key_length)) { return false; }
-  auto curr_node = trie.begin() + 1;
-  for (auto curr_key = key; curr_key < key + key_len; ++curr_key) {
-    // Don't jump away from root node
-    if (curr_key != key) {
-      // A node without children cannot match a longer key
-      if (curr_node->children_offset < 0) { return false; }
-      curr_node += curr_node->children_offset;
-    }
-    auto const c = words.at(curr_key);
-    // Nodes are sorted - terminate search if the node is larger or equal
-    while (curr_node->character != cudf::detail::trie_terminating_character &&
-           curr_node->character < c) {
-      ++curr_node;
-    }
-    if (curr_node->character != c) { return false; }
-  }
-  return curr_node->is_leaf;
-}
-
-/**
- * @brief `trim_whitespaces_quotes(begin, end, quotechar)`, reading characters through `words.at`
- * (including the characters just outside the range that the original also reads)
- */
-template <typename WordReader>
-__device__ __forceinline__ cuda::std::pair<char const*, char const*> trim_whitespaces_quotes_at(
-  char const* begin, char const* end, char quotechar, WordReader const& words)
-{
-  auto trim_begin = begin;
-  while (trim_begin != end && is_whitespace(words.at(trim_begin))) {
-    ++trim_begin;
-  }
-  auto trim_end = end;
-  while (trim_end != trim_begin && is_whitespace(words.at(trim_end - 1))) {
-    --trim_end;
-  }
-  auto const trimmed_begin = trim_begin + (words.at(trim_begin) == quotechar);
-  auto const trimmed_end   = trim_end - (words.at(trim_end - 1) == quotechar);
-  // A lone quote character would otherwise be skipped from both ends, leaving end < begin
-  return {trimmed_begin, cuda::std::max(trimmed_begin, trimmed_end)};
 }
 
 template <bool WindowedIntegers, typename WordReader>
@@ -1856,7 +1931,8 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   // 32-bit character counters (fewer registers, higher occupancy) are exact unless a single field
   // can exceed INT_MAX characters, which requires a buffer larger than that
   if (data.size() <= static_cast<size_t>(cuda::std::numeric_limits<int>::max())) {
-    data_type_detection<int><<<grid_size, block_size, smem_bytes, stream.get()>>>(
+    auto const kernel = stage_size == 0 ? data_type_detection<int, true> : data_type_detection<int, false>;
+    kernel<<<grid_size, block_size, smem_bytes, stream.get()>>>(
       options,
       data,
       column_flags,
@@ -1868,7 +1944,9 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
       int_valid_counts,
       stage_size);
   } else {
-    data_type_detection<long><<<grid_size, block_size, smem_bytes, stream.get()>>>(
+    auto const kernel =
+      stage_size == 0 ? data_type_detection<long, true> : data_type_detection<long, false>;
+    kernel<<<grid_size, block_size, smem_bytes, stream.get()>>>(
       options,
       data,
       column_flags,
