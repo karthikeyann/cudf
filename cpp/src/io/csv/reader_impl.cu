@@ -244,9 +244,12 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
   bool load_whole_file,
   cuda::stream_ref stream)
 {
-  constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
+  auto const data_size = data.has_value() ? data->size() : source->size();
+  // Chunking bounds the work done before an early exit (byte range end, num_rows); when the
+  // whole file is loaded anyway, a single chunk avoids per-chunk host syncs and buffer regrowth
+  size_t const max_chunk_bytes =
+    load_whole_file ? std::max<size_t>(data_size, 1) : 64 * 1024 * 1024;  // 64MB
 
-  auto const data_size      = data.has_value() ? data->size() : source->size();
   auto const buffer_size    = std::min(max_chunk_bytes, data_size);
   auto const max_input_size = [&] {
     if (range_end == data_size) {
