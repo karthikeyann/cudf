@@ -27,6 +27,9 @@
 #include <cudf/io/detail/csv.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/logger.hpp>
+#include <cudf/null_mask.hpp>
+#include <cudf/strings/detail/utilities.hpp>
+#include <cudf/utilities/bit.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -35,10 +38,15 @@
 
 #include <rmm/exec_policy.hpp>
 
+#include <cub/block/block_reduce.cuh>
+#include <cub/device/device_memcpy.cuh>
+#include <cuda/cmath>
 #include <cuda/functional>
 #include <cuda/iterator>
 #include <cuda/stream>
 #include <thrust/host_vector.h>
+#include <thrust/transform.h>
+#include <thrust/scan.h>
 #include <thrust/tabulate.h>
 
 #include <algorithm>
@@ -658,29 +666,66 @@ void get_data_types_from_column_names(std::map<std::string, data_type> const& us
   }
 }
 
-void infer_column_types(parse_options const& parse_opts,
-                        host_span<column_parse::flags const> column_flags,
-                        device_span<char const> data,
-                        device_span<uint64_t const> row_offsets,
-                        int32_t num_records,
-                        data_type timestamp_type,
-                        host_span<data_type> column_types,
-                        cuda::stream_ref stream)
+/**
+ * @brief Values of an integer column that were already decoded during type inference
+ */
+struct predecoded_column {
+  rmm::device_buffer data;
+  rmm::device_buffer null_mask;
+  size_type null_count;
+};
+
+/**
+ * @brief Infers the types of the inferred columns.
+ *
+ * Type detection also decodes the fields it classifies as integers. Columns inferred as INT64 or
+ * UINT64 consist only of such fields (and N/A values), so their decoded values are returned, and
+ * need not be decoded again.
+ *
+ * @return Per column, the already decoded values, if any
+ */
+std::vector<std::optional<predecoded_column>> infer_column_types(
+  parse_options const& parse_opts,
+  host_span<column_parse::flags const> column_flags,
+  device_span<char const> data,
+  device_span<uint64_t const> row_offsets,
+  int32_t num_records,
+  data_type timestamp_type,
+  host_span<data_type> column_types,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
 {
+  std::vector<std::optional<predecoded_column>> predecoded(column_flags.size());
   if (num_records == 0) {
     for (auto col_idx = 0u; col_idx < column_flags.size(); ++col_idx) {
       if (column_flags[col_idx] & column_parse::inferred) {
         column_types[col_idx] = data_type(cudf::type_id::STRING);
       }
     }
-    return;
+    return predecoded;
   }
 
   auto const num_inferred_columns =
     std::count_if(column_flags.begin(), column_flags.end(), [](auto& flags) {
       return flags & column_parse::inferred;
     });
-  if (num_inferred_columns == 0) { return; }
+  if (num_inferred_columns == 0) { return predecoded; }
+
+  // Output-ready buffers for the integer values of each inferred column (allocated with `mr`, as
+  // they become column data if the column is inferred as an integer column)
+  std::vector<rmm::device_buffer> int_values;
+  std::vector<rmm::device_buffer> int_valids;
+  auto h_int_values = cudf::detail::make_host_vector<uint64_t*>(num_inferred_columns, stream);
+  auto h_int_valids = cudf::detail::make_host_vector<bitmask_type*>(num_inferred_columns, stream);
+  for (int i = 0; i < num_inferred_columns; ++i) {
+    int_values.emplace_back(num_records * sizeof(uint64_t), stream, mr);
+    int_valids.emplace_back(
+      cudf::create_null_mask(num_records, mask_state::ALL_NULL, stream, mr));
+    h_int_values[i] = static_cast<uint64_t*>(int_values.back().data());
+    h_int_valids[i] = static_cast<bitmask_type*>(int_valids.back().data());
+  }
+  auto d_int_valid_counts = cudf::detail::make_zeroed_device_uvector_async<size_type>(
+    num_inferred_columns, stream, cudf::get_current_device_resource_ref());
 
   auto const column_stats = cudf::io::csv::gpu::detect_column_types(
     parse_opts.view(),
@@ -688,8 +733,11 @@ void infer_column_types(parse_options const& parse_opts,
     make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
     row_offsets,
     num_inferred_columns,
+    make_device_uvector_async(h_int_values, stream, cudf::get_current_device_resource_ref()),
+    make_device_uvector_async(h_int_valids, stream, cudf::get_current_device_resource_ref()),
+    d_int_valid_counts,
     stream);
-  stream.sync();
+  auto const h_int_valid_counts = cudf::detail::make_host_vector(d_int_valid_counts, stream);
 
   auto inf_col_idx = 0;
   for (auto col_idx = 0u; col_idx < column_flags.size(); ++col_idx) {
@@ -716,7 +764,15 @@ void infer_column_types(parse_options const& parse_opts,
       // Integers are stored as 64-bit to conform to PANDAS
       column_types[col_idx] = data_type(cudf::type_id::UINT64);
     }
+    auto const inferred_type = column_types[col_idx].id();
+    if ((inferred_type == type_id::INT64 or inferred_type == type_id::UINT64) and
+        not(column_flags[col_idx] & column_parse::as_hexadecimal)) {
+      predecoded[col_idx] = predecoded_column{std::move(int_values[inf_col_idx - 1]),
+                                              std::move(int_valids[inf_col_idx - 1]),
+                                              num_records - h_int_valid_counts[inf_col_idx - 1]};
+    }
   }
+  return predecoded;
 }
 
 std::vector<column_buffer> decode_data(parse_options const& parse_opts,
@@ -740,11 +796,14 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     if (column_flags[col] & column_parse::enabled) {
       // Only string (pointer, length) pairs need zeroing: fields that are missing from a row must
       // read as null strings. Other data is only meaningful where the (zeroed) null mask is set.
+      // Columns decoded during type inference need no buffers.
       auto out_buffer = column_buffer(column_types[active_col], true);
-      out_buffer.create(num_records,
-                        column_types[active_col].id() == type_id::STRING,
-                        stream,
-                        mr);
+      if (not(column_flags[col] & column_parse::predecoded)) {
+        out_buffer.create(num_records,
+                          column_types[active_col].id() == type_id::STRING,
+                          stream,
+                          mr);
+      }
 
       out_buffer.name = column_names[col];
       out_buffers.emplace_back(std::move(out_buffer));
@@ -778,6 +837,12 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     decode_opts.exp10_table = exp10_table.data();
   }
 
+  // Nothing to decode if type inference already decoded every column
+  auto const all_predecoded = std::all_of(column_flags.begin(), column_flags.end(), [](auto flags) {
+    return not(flags & column_parse::enabled) or (flags & column_parse::predecoded);
+  });
+  if (all_predecoded) { return out_buffers; }
+
   cudf::io::csv::gpu::decode_row_column_data(
     decode_opts,
     data,
@@ -798,6 +863,238 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
   return out_buffers;
 }
 
+/**
+ * @brief Computes validity bitmasks, null counts and total character counts of all string columns.
+ *
+ * Grid: x covers the rows, y is the string column index.
+ */
+CUDF_KERNEL void strings_validity_and_sizes_kernel(string_index_pair const* const* columns,
+                                                   size_type num_rows,
+                                                   bitmask_type* const* null_masks,
+                                                   size_type* null_counts,
+                                                   int64_t* total_bytes)
+{
+  auto const col  = blockIdx.y;
+  auto const row  = static_cast<size_type>(blockIdx.x * blockDim.x + threadIdx.x);
+  auto const lane = threadIdx.x % cudf::detail::size_in_bits<bitmask_type>();
+
+  auto const in_range = row < num_rows;
+  auto const item     = in_range ? columns[col][row] : string_index_pair{nullptr, 0};
+  auto const is_valid = item.first != nullptr;
+  auto const valid_mask = __ballot_sync(0xffff'ffffu, is_valid);
+  // Rows are warp aligned, so each warp owns one mask word
+  if (lane == 0 && row < num_rows) {
+    null_masks[col][row / cudf::detail::size_in_bits<bitmask_type>()] = valid_mask;
+    auto const rows_in_warp = cuda::std::min<size_type>(cudf::detail::size_in_bits<bitmask_type>(), num_rows - row);
+    auto const warp_nulls   = rows_in_warp - __popc(valid_mask);
+    if (warp_nulls != 0) { atomicAdd(null_counts + col, warp_nulls); }
+  }
+
+  using block_reduce = cub::BlockReduce<int64_t, 256>;
+  __shared__ typename block_reduce::TempStorage temp_storage;
+  auto const block_bytes =
+    block_reduce(temp_storage).Sum(is_valid ? static_cast<int64_t>(item.second) : int64_t{0});
+  if (threadIdx.x == 0 && block_bytes != 0) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(total_bytes + col),
+              static_cast<unsigned long long>(block_bytes));
+  }
+}
+
+/**
+ * @brief Writes a scanned offset to the (32 or 64-bit) offsets column of its string column.
+ *
+ * Used with a tabulate output iterator; a named functor keeps the iterator copy-assignable.
+ */
+struct offsets_writer {
+  uint64_t segment_size;                      ///< Number of offsets per column
+  cuda::fast_mod_div<uint64_t> segment_div;  ///< Precomputed division by `segment_size`
+  void* const* offsets;
+  bool const* is_64;
+
+  __device__ void operator()(int64_t idx, int64_t offset) const
+  {
+    auto const col = static_cast<uint64_t>(idx) / segment_div;
+    auto const row = static_cast<uint64_t>(idx) - col * segment_size;
+    if (is_64[col]) {
+      static_cast<int64_t*>(offsets[col])[row] = offset;
+    } else {
+      static_cast<int32_t*>(offsets[col])[row] = static_cast<int32_t>(offset);
+    }
+  }
+};
+
+/**
+ * @brief Creates the output string columns from decoded (pointer, length) pairs.
+ *
+ * All string columns are built together, with a fixed number of kernels and a single host
+ * synchronization, instead of one `make_strings_column` call per column.
+ */
+std::vector<std::unique_ptr<column>> make_strings_columns(
+  host_span<column_buffer* const> buffers,
+  size_type num_rows,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
+{
+  auto const num_columns = buffers.size();
+  if (num_columns == 0) { return {}; }
+
+  // Validity masks, null counts and chars sizes
+  std::vector<rmm::device_buffer> null_masks;
+  auto h_columns = cudf::detail::make_host_vector<string_index_pair const*>(num_columns, stream);
+  auto h_masks   = cudf::detail::make_host_vector<bitmask_type*>(num_columns, stream);
+  for (size_t c = 0; c < num_columns; ++c) {
+    h_columns[c] = static_cast<string_index_pair const*>(buffers[c]->data());
+    null_masks.emplace_back(
+      cudf::create_null_mask(num_rows, mask_state::UNINITIALIZED, stream, mr));
+    h_masks[c] = static_cast<bitmask_type*>(null_masks.back().data());
+  }
+  auto const d_columns =
+    cudf::detail::make_device_uvector_async(h_columns, stream, cudf::get_current_device_resource_ref());
+  auto const d_masks =
+    cudf::detail::make_device_uvector_async(h_masks, stream, cudf::get_current_device_resource_ref());
+  // Null counts (as int64) followed by chars sizes
+  auto d_counts = cudf::detail::make_zeroed_device_uvector_async<int64_t>(
+    2 * num_columns, stream, cudf::get_current_device_resource_ref());
+  auto d_null_counts = rmm::device_uvector<size_type>(num_columns, stream);
+  CUDF_CUDA_TRY(cudaMemsetAsync(
+    d_null_counts.data(), 0, num_columns * sizeof(size_type), stream.get()));
+
+  constexpr int block_size         = 256;
+  constexpr size_t max_grid_columns = 65535;  // grid y dimension limit
+  for (size_t first = 0; first < num_columns; first += max_grid_columns) {
+    dim3 const grid(cudf::util::div_rounding_up_safe<size_type>(num_rows, block_size),
+                    std::min(max_grid_columns, num_columns - first));
+    strings_validity_and_sizes_kernel<<<grid, block_size, 0, stream.get()>>>(
+      d_columns.data() + first,
+      num_rows,
+      d_masks.data() + first,
+      d_null_counts.data() + first,
+      d_counts.data() + num_columns + first);
+  }
+  CUDF_CUDA_TRY(cudaGetLastError());
+  thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                    d_null_counts.begin(),
+                    d_null_counts.end(),
+                    d_counts.begin(),
+                    cuda::proclaim_return_type<int64_t>(
+                      [] __device__(size_type count) { return static_cast<int64_t>(count); }));
+  auto const h_counts = cudf::detail::make_host_vector(d_counts, stream);
+
+  // Offsets columns (32 or 64-bit, depending on each column's size) and chars buffers
+  std::vector<std::unique_ptr<column>> offsets_columns;
+  std::vector<rmm::device_uvector<char>> chars;
+  auto h_offsets = cudf::detail::make_host_vector<void*>(num_columns, stream);
+  auto h_is_64   = cudf::detail::make_host_vector<bool>(num_columns, stream);
+  auto h_chars   = cudf::detail::make_host_vector<char*>(num_columns, stream);
+  auto const threshold = cudf::strings::detail::get_offset64_threshold();
+  for (size_t c = 0; c < num_columns; ++c) {
+    auto const bytes = h_counts[num_columns + c];
+    CUDF_EXPECTS(cudf::strings::detail::is_large_strings_enabled() || (bytes < threshold),
+                 "Size of output exceeds the column size limit",
+                 std::overflow_error);
+    h_is_64[c] = bytes >= threshold;
+    offsets_columns.emplace_back(make_numeric_column(data_type{h_is_64[c] ? type_id::INT64 : type_id::INT32},
+                                                     num_rows + 1,
+                                                     mask_state::UNALLOCATED,
+                                                     stream,
+                                                     mr));
+    h_offsets[c] = offsets_columns.back()->mutable_view().head();
+    chars.emplace_back(bytes, stream, mr);
+    h_chars[c] = chars.back().data();
+  }
+  auto const d_offsets =
+    cudf::detail::make_device_uvector_async(h_offsets, stream, cudf::get_current_device_resource_ref());
+  auto const d_is_64 =
+    cudf::detail::make_device_uvector_async(h_is_64, stream, cudf::get_current_device_resource_ref());
+  auto const d_chars =
+    cudf::detail::make_device_uvector_async(h_chars, stream, cudf::get_current_device_resource_ref());
+
+  // Offsets of all columns in one segmented scan (one segment of num_rows + 1 per column)
+  // Index math uses precomputed divisions: 64-bit `/` and `%` per element are expensive
+  auto const segment_size = static_cast<uint64_t>(num_rows) + 1;
+  auto const segment_div  = cuda::fast_mod_div<uint64_t>{segment_size};
+  auto const num_offsets  = static_cast<int64_t>(segment_size * num_columns);
+  auto const keys         = cuda::transform_iterator(
+    cuda::counting_iterator<int64_t>{0},
+    cuda::proclaim_return_type<uint64_t>([segment_div] __device__(int64_t idx) {
+      return static_cast<uint64_t>(idx) / segment_div;
+    }));
+  auto const sizes = cuda::transform_iterator(
+    cuda::counting_iterator<int64_t>{0},
+    cuda::proclaim_return_type<int64_t>(
+      [segment_size, segment_div, columns = d_columns.data()] __device__(int64_t idx) -> int64_t {
+        auto const col = static_cast<uint64_t>(idx) / segment_div;
+        auto const row = static_cast<uint64_t>(idx) - col * segment_size;
+        if (row == segment_size - 1) { return 0; }
+        auto const item = columns[col][row];
+        return item.first != nullptr ? item.second : 0;
+      }));
+  auto const offsets_out = cuda::make_tabulate_output_iterator(
+    offsets_writer{segment_size, segment_div, d_offsets.data(), d_is_64.data()});
+  thrust::exclusive_scan_by_key(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                                keys,
+                                keys + num_offsets,
+                                sizes,
+                                offsets_out);
+
+  // Chars of all columns in one batched copy
+  auto const num_strings = static_cast<int64_t>(num_rows) * static_cast<int64_t>(num_columns);
+  auto const rows       = static_cast<uint64_t>(num_rows);
+  auto const rows_div   = cuda::fast_mod_div<uint64_t>{rows};
+  auto const item_at    = [rows, rows_div, columns = d_columns.data()] __device__(int64_t idx) {
+    auto const col = static_cast<uint64_t>(idx) / rows_div;
+    return columns[col][static_cast<uint64_t>(idx) - col * rows];
+  };
+  auto const src_ptrs = cuda::transform_iterator(
+    cuda::counting_iterator<int64_t>{0},
+    cuda::proclaim_return_type<void*>([item_at] __device__(int64_t idx) {
+      // cub requires non-const source pointers; the source is only read
+      return reinterpret_cast<void*>(const_cast<char*>(item_at(idx).first));
+    }));
+  auto const src_sizes = cuda::transform_iterator(
+    cuda::counting_iterator<int64_t>{0},
+    cuda::proclaim_return_type<size_type>([item_at] __device__(int64_t idx) {
+      auto const item = item_at(idx);
+      return item.first != nullptr ? item.second : 0;
+    }));
+  auto const dst_ptrs = cuda::transform_iterator(
+    cuda::counting_iterator<int64_t>{0},
+    cuda::proclaim_return_type<void*>([rows,
+                                       rows_div,
+                                       offsets = d_offsets.data(),
+                                       is_64   = d_is_64.data(),
+                                       chars   = d_chars.data()] __device__(int64_t idx) {
+      auto const col    = static_cast<uint64_t>(idx) / rows_div;
+      auto const row    = static_cast<uint64_t>(idx) - col * rows;
+      auto const offset = is_64[col] ? static_cast<int64_t const*>(offsets[col])[row]
+                                     : static_cast<int64_t>(static_cast<int32_t const*>(offsets[col])[row]);
+      return static_cast<void*>(chars[col] + offset);
+    }));
+  size_t temp_storage_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(
+    nullptr, temp_storage_bytes, src_ptrs, dst_ptrs, src_sizes, num_strings, stream.get()));
+  rmm::device_buffer d_temp_storage(temp_storage_bytes, stream);
+  CUDF_CUDA_TRY(cub::DeviceMemcpy::Batched(d_temp_storage.data(),
+                                           temp_storage_bytes,
+                                           src_ptrs,
+                                           dst_ptrs,
+                                           src_sizes,
+                                           num_strings,
+                                           stream.get()));
+
+  std::vector<std::unique_ptr<column>> out;
+  for (size_t c = 0; c < num_columns; ++c) {
+    auto const null_count = static_cast<size_type>(h_counts[c]);
+    out.emplace_back(make_strings_column(
+      num_rows,
+      std::move(offsets_columns[c]),
+      chars[c].release(),
+      null_count,
+      null_count > 0 ? std::move(null_masks[c]) : rmm::device_buffer{0, stream, mr}));
+  }
+  return out;
+}
+
 cudf::detail::host_vector<data_type> determine_column_types(
   csv_reader_options const& reader_opts,
   parse_options const& parse_opts,
@@ -807,7 +1104,9 @@ cudf::detail::host_vector<data_type> determine_column_types(
   int32_t num_records,
   host_span<column_parse::flags> column_flags,
   cudf::size_type num_active_columns,
-  cuda::stream_ref stream)
+  std::vector<std::optional<predecoded_column>>& predecoded_active_columns,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr)
 {
   std::vector<data_type> column_types(column_flags.size());
 
@@ -821,14 +1120,22 @@ cudf::detail::host_vector<data_type> determine_column_types(
                }},
              reader_opts.get_dtypes());
 
-  infer_column_types(parse_opts,
-                     column_flags,
-                     data,
-                     row_offsets,
-                     num_records,
-                     reader_opts.get_timestamp_type(),
-                     column_types,
-                     stream);
+  auto predecoded = infer_column_types(parse_opts,
+                                       column_flags,
+                                       data,
+                                       row_offsets,
+                                       num_records,
+                                       reader_opts.get_timestamp_type(),
+                                       column_types,
+                                       stream,
+                                       mr);
+  // Mark the columns that need no decoding, and collect their values for the active columns
+  predecoded_active_columns.clear();
+  for (size_t col = 0; col < column_flags.size(); ++col) {
+    if (not(column_flags[col] & column_parse::enabled)) { continue; }
+    if (predecoded[col].has_value()) { column_flags[col] |= column_parse::predecoded; }
+    predecoded_active_columns.emplace_back(std::move(predecoded[col]));
+  }
 
   // compact column_types to only include active columns
   auto active_col_types =
@@ -1023,6 +1330,7 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 
   // Exclude the end-of-data row from number of rows with actual data
   auto const num_records  = std::max(row_offsets.size(), 1ul) - 1;
+  std::vector<std::optional<predecoded_column>> predecoded_columns;
   auto const column_types = determine_column_types(reader_opts,
                                                    parse_opts,
                                                    column_names,
@@ -1031,7 +1339,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
                                                    num_records,
                                                    column_flags,
                                                    num_active_columns,
-                                                   stream);
+                                                   predecoded_columns,
+                                                   stream,
+                                                   mr);
 
   auto metadata    = table_metadata{};
   auto out_columns = std::vector<std::unique_ptr<cudf::column>>();
@@ -1059,24 +1369,24 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       stream,
       mr);
 
-    // Build all string columns in one batch (one stream sync instead of several per column)
-    std::vector<size_t> string_col_indices;
-    std::vector<device_span<string_index_pair const>> string_col_pairs;
-    for (size_t i = 0; i < out_buffers.size(); ++i) {
-      if (out_buffers[i].type.id() == type_id::STRING) {
-        string_col_indices.push_back(i);
-        string_col_pairs.emplace_back(*out_buffers[i]._strings);
-      }
+    // Build all string columns together: a fixed number of kernels and one host sync
+    std::vector<column_buffer*> string_buffers;
+    for (auto& buffer : out_buffers) {
+      if (buffer.type.id() == type_id::STRING) { string_buffers.push_back(&buffer); }
     }
-    auto string_columns = cudf::make_strings_column_batch(string_col_pairs, stream, mr);
-
-    out_columns.resize(out_buffers.size());
-    for (size_t i = 0; i < string_col_indices.size(); ++i) {
-      out_columns[string_col_indices[i]] = std::move(string_columns[i]);
-    }
-    for (size_t i = 0; i < out_buffers.size(); ++i) {
-      if (!out_columns[i]) {
-        out_columns[i] = make_column(out_buffers[i], nullptr, std::nullopt, stream);
+    auto string_columns = make_strings_columns(string_buffers, num_records, stream, mr);
+    for (size_t i = 0, str_idx = 0; i < out_buffers.size(); ++i) {
+      if (predecoded_columns[i].has_value()) {
+        auto& values = *predecoded_columns[i];
+        out_columns.emplace_back(std::make_unique<column>(out_buffers[i].type,
+                                                          num_records,
+                                                          std::move(values.data),
+                                                          std::move(values.null_mask),
+                                                          values.null_count));
+      } else {
+        out_columns.emplace_back(out_buffers[i].type.id() == type_id::STRING
+                                   ? std::move(string_columns[str_idx++])
+                                   : make_column(out_buffers[i], nullptr, std::nullopt, stream));
       }
     }
 

@@ -166,6 +166,12 @@ constexpr int slot_float    = offsetof(column_type_histogram, float_count) / siz
 constexpr int slot_datetime = offsetof(column_type_histogram, datetime_count) / sizeof(cudf::size_type);
 constexpr int slot_string   = offsetof(column_type_histogram, string_count) / sizeof(cudf::size_type);
 constexpr int slot_bool     = offsetof(column_type_histogram, bool_count) / sizeof(cudf::size_type);
+constexpr int slot_negative_small_int =
+  offsetof(column_type_histogram, negative_small_int_count) / sizeof(cudf::size_type);
+constexpr int slot_positive_small_int =
+  offsetof(column_type_histogram, positive_small_int_count) / sizeof(cudf::size_type);
+constexpr int slot_big_int =
+  offsetof(column_type_histogram, big_int_count) / sizeof(cudf::size_type);
 
 /**
  * @brief Adds one to counter `idx` of a counter array, aggregating across the lanes of the warp
@@ -273,10 +279,124 @@ __device__ __forceinline__ char const* seek_field_end_by_words(char const* begin
  * @param next_delimiter Pointer to the character that ends the field (see `seek_field_end`)
  * @param as_datetime Whether the column is parsed as datetime
  */
+/**
+ * @brief Classifies a non-empty, trimmed field from its character counts.
+ *
+ * @tparam Count Counter type; must be able to hold the field length
+ */
+template <typename Count>
+__device__ int classify_trimmed_field(parse_options_view const& opts,
+                                      cuda::std::pair<char const*, char const*> trimmed_field_range,
+                                      bool as_datetime,
+                                      device_span<char const> data,
+                                      bool scan_by_words)
+{
+  auto const trimmed_field_len = trimmed_field_range.second - trimmed_field_range.first;
+  Count count_number    = 0;
+  Count count_decimal   = 0;
+  Count count_thousands = 0;
+  Count count_slash     = 0;
+  Count count_dash      = 0;
+  Count count_plus      = 0;
+  Count count_colon     = 0;
+  Count count_string    = 0;
+  Count count_exponent  = 0;
+
+  // Counts one character; returns true once the field can only be a string (any other
+  // character; datetime columns accept up to 10 of them)
+  auto const count_char = [&](char c, char const* cur) {
+    if (is_digit(c)) {
+      count_number++;
+    } else if (c == opts.decimal) {
+      count_decimal++;
+    } else if (c == opts.thousands) {
+      count_thousands++;
+    } else {
+      // Looking for unique characters that will help identify column types.
+      switch (c) {
+        case '-': count_dash++; break;
+        case '+': count_plus++; break;
+        case '/': count_slash++; break;
+        case ':': count_colon++; break;
+        case 'e':
+        case 'E':
+          if (cur > trimmed_field_range.first && cur < trimmed_field_range.second - 1)
+            count_exponent++;
+          break;
+        default: count_string++; break;
+      }
+    }
+    return count_string > (as_datetime ? 10 : 0);
+  };
+  // Fields of long rows are scanned in aligned 8-byte words (never outside `data`), bytewise
+  // at the edges: with one thread per row, long rows do not stay L1-resident and bytewise
+  // reads then cost one memory transaction each. Short rows are cheaper to read bytewise.
+  auto const data_end = data.data() + data.size();
+  auto cur            = trimmed_field_range.first;
+  bool done           = false;
+  if (!scan_by_words) {
+    for (; !done && cur < trimmed_field_range.second; ++cur) {
+      done = count_char(*cur, cur);
+    }
+  }
+  while (!done && cur < trimmed_field_range.second) {
+    auto const word_begin =
+      reinterpret_cast<char const*>(reinterpret_cast<uintptr_t>(cur) & ~uintptr_t{7});
+    if (word_begin >= data.data() && word_begin + 8 <= data_end) {
+      auto const word = *reinterpret_cast<uint64_t const*>(word_begin);
+      auto const last =
+        static_cast<int>(cuda::std::min<ptrdiff_t>(8, trimmed_field_range.second - word_begin));
+      for (auto i = static_cast<int>(cur - word_begin); i < last && !done; ++i) {
+        done = count_char(static_cast<char>(word >> (8 * i)), word_begin + i);
+      }
+      cur = word_begin + last;
+    } else {
+      done = count_char(*cur, cur);
+      ++cur;
+    }
+  }
+
+  // Integers have to have the length of the string
+  // Off by one if they start with a minus sign
+  auto const int_req_number_cnt =
+    trimmed_field_len - count_thousands -
+    ((*trimmed_field_range.first == '-' || *trimmed_field_range.first == '+') &&
+     trimmed_field_len > 1);
+
+  if (as_datetime) {
+    // PANDAS uses `object` dtype if the date is unparseable
+    if (is_datetime(count_string, count_decimal, count_colon, count_dash, count_slash)) {
+      return slot_datetime;
+    } else {
+      return slot_string;
+    }
+  } else if (count_number == int_req_number_cnt) {
+    auto const is_negative = (*trimmed_field_range.first == '-');
+    auto const data_begin =
+      trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
+    column_type_histogram local_stats{};
+    cudf::size_type const* ptr = cudf::io::gpu::infer_integral_field_counter(
+      data_begin, data_begin + count_number, is_negative, local_stats);
+    return static_cast<int>(ptr - reinterpret_cast<cudf::size_type const*>(&local_stats));
+  } else if (is_floatingpoint(trimmed_field_len,
+                              count_number,
+                              count_decimal,
+                              count_thousands,
+                              count_dash + count_plus,
+                              count_exponent)) {
+    return slot_float;
+  } else {
+    return slot_string;
+  }
+}
+
+template <typename Count>
 __device__ int classify_field(parse_options_view const& opts,
                               char const* field_start,
                               char const* next_delimiter,
-                              bool as_datetime)
+                              bool as_datetime,
+                              device_span<char const> data,
+                              bool scan_by_words)
 {
   auto const field_len = static_cast<size_t>(next_delimiter - field_start);
   if (serialized_trie_contains(opts.trie_na, {field_start, field_len})) {
@@ -287,98 +407,65 @@ __device__ int classify_field(parse_options_view const& opts,
   } else if (cudf::io::is_infinity(field_start, next_delimiter)) {
     return slot_float;
   } else {
-    long count_number    = 0;
-    long count_decimal   = 0;
-    long count_thousands = 0;
-    long count_slash     = 0;
-    long count_dash      = 0;
-    long count_plus      = 0;
-    long count_colon     = 0;
-    long count_string    = 0;
-    long count_exponent  = 0;
-
     // Modify field_start & end to ignore whitespace and quotechars
     // This could possibly result in additional empty fields
     auto const trimmed_field_range = trim_whitespaces_quotes(field_start, next_delimiter);
     auto const trimmed_field_len   = trimmed_field_range.second - trimmed_field_range.first;
 
-    if (trimmed_field_len == 0) {
-      return slot_string;
-    } else {
-                for (auto cur = trimmed_field_range.first; cur < trimmed_field_range.second; ++cur) {
-        if (is_digit(*cur)) {
-          count_number++;
-          continue;
-        }
-        if (*cur == opts.decimal) {
-          count_decimal++;
-          continue;
-        }
-        if (*cur == opts.thousands) {
-          count_thousands++;
-          continue;
-        }
-        // Looking for unique characters that will help identify column types.
-        switch (*cur) {
-          case '-': count_dash++; break;
-          case '+': count_plus++; break;
-          case '/': count_slash++; break;
-          case ':': count_colon++; break;
-          case 'e':
-          case 'E':
-            if (cur > trimmed_field_range.first && cur < trimmed_field_range.second - 1)
-              count_exponent++;
-            break;
-          default: count_string++; break;
-        }
-        // Any other character means the field can only be a string, unless the column is
-        // parsed as datetime (which accepts up to 10 such characters)
-        if (count_string > (as_datetime ? 10 : 0)) { break; }
-      }
-
-      // Integers have to have the length of the string
-      // Off by one if they start with a minus sign
-      auto const int_req_number_cnt =
-        trimmed_field_len - count_thousands -
-        ((*trimmed_field_range.first == '-' || *trimmed_field_range.first == '+') &&
-         trimmed_field_len > 1);
-
-      if (as_datetime) {
-        // PANDAS uses `object` dtype if the date is unparseable
-        if (is_datetime(count_string, count_decimal, count_colon, count_dash, count_slash)) {
-          return slot_datetime;
-        } else {
-          return slot_string;
-        }
-      } else if (count_number == int_req_number_cnt) {
-        auto const is_negative = (*trimmed_field_range.first == '-');
-        auto const data_begin =
-          trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
-        column_type_histogram local_stats{};
-        cudf::size_type const* ptr = cudf::io::gpu::infer_integral_field_counter(
-          data_begin, data_begin + count_number, is_negative, local_stats);
-        return static_cast<int>(ptr - reinterpret_cast<cudf::size_type const*>(&local_stats));
-      } else if (is_floatingpoint(trimmed_field_len,
-                                  count_number,
-                                  count_decimal,
-                                  count_thousands,
-                                  count_dash + count_plus,
-                                  count_exponent)) {
-        return slot_float;
-      } else {
-        return slot_string;
-      }
-    }
+    if (trimmed_field_len == 0) { return slot_string; }
+    return classify_trimmed_field<Count>(
+      opts, trimmed_field_range, as_datetime, data, scan_by_words);
   }
 }
 
+/**
+ * @brief Decodes an integer-classified field exactly as `convert_csv_to_cudf` would decode it into
+ * an INT64 or UINT64 column, and records the value and its validity.
+ *
+ * Mirrors the conversion of a field that is not an N/A value: trim whitespace and quotes, map
+ * user-specified true/false values to 1/0, otherwise parse as a decimal integer. Parsing as
+ * uint64_t yields the same bits as parsing as int64_t for every value representable in the
+ * column's final (INT64 or UINT64) type.
+ */
+__device__ __forceinline__ void predecode_integer_field(parse_options_view const& opts,
+                                                        char const* field_start,
+                                                        char const* field_end,
+                                                        uint64_t* values,
+                                                        cudf::bitmask_type* valid_mask,
+                                                        size_type* valid_count,
+                                                        int column,
+                                                        size_type rec_id)
+{
+  auto const trimmed   = trim_whitespaces_quotes(field_start, field_end, opts.quotechar);
+  auto const field_len = static_cast<size_t>(trimmed.second - trimmed.first);
+  cuda::std::optional<uint64_t> value;
+  if (serialized_trie_contains(opts.trie_true, {trimmed.first, field_len})) {
+    value = 1;
+  } else if (serialized_trie_contains(opts.trie_false, {trimmed.first, field_len})) {
+    value = 0;
+  } else {
+    value = cudf::io::parse_numeric<uint64_t>(trimmed.first, trimmed.second, opts);
+  }
+  if (value.has_value()) {
+    values[rec_id] = *value;
+    set_valid_warp_aggregated(valid_mask, valid_count, column, rec_id);
+  }
+}
+
+/**
+ * @tparam Count Type of the per-field character counters; must hold the length of any field
+ */
+template <typename Count>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   data_type_detection(parse_options_view const opts,
                       device_span<char const> csv_text,
                       device_span<column_parse::flags const> const column_flags,
                       device_span<uint64_t const> const row_offsets,
                       device_span<column_type_histogram> d_column_data,
-                      bool use_shared_histogram)
+                      bool use_shared_histogram,
+                      device_span<uint64_t* const> int_values,
+                      device_span<cudf::bitmask_type* const> int_valids,
+                      device_span<size_type> int_valid_counts)
 {
   // Per-block histogram in shared memory (when it fits); flushed to global memory at the end
   extern __shared__ cudf::size_type s_counters[];
@@ -406,6 +493,10 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   auto field_start   = raw_csv + (has_row ? row_offsets[rec_id] : 0);
   auto const row_end = raw_csv + (has_row ? row_offsets[rec_id_next] : 0);
 
+  // Rows longer than this are not expected to stay L1-resident (see classify_field)
+  constexpr ptrdiff_t min_word_scan_row_len = 128;
+  bool const scan_by_words                  = row_end - field_start > min_word_scan_row_len;
+
   auto next_field = field_start;
   int col         = 0;
   int actual_col  = 0;
@@ -420,9 +511,27 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 
     // Checking if this is a column that the user wants --- user can filter columns
     if (column_flags[col] & column_parse::inferred) {
-      auto const slot = classify_field(
-        opts, field_start, next_delimiter, column_flags[col] & column_parse::as_datetime);
+      auto const slot = classify_field<Count>(opts,
+                                       field_start,
+                                       next_delimiter,
+                                       column_flags[col] & column_parse::as_datetime,
+                                       csv_text,
+                                       scan_by_words);
       warp_aggregated_increment(counters, actual_col * histogram_slots + slot);
+      // Integer fields are also decoded, in case the column is inferred as an integer column
+      if (not int_values.empty() and
+          (slot == slot_negative_small_int or slot == slot_positive_small_int or
+           slot == slot_big_int) and
+          not(column_flags[col] & column_parse::as_hexadecimal)) {
+        predecode_integer_field(opts,
+                                field_start,
+                                next_delimiter,
+                                int_values[actual_col],
+                                int_valids[actual_col],
+                                &int_valid_counts[actual_col],
+                                actual_col,
+                                static_cast<size_type>(rec_id));
+      }
       actual_col++;
     }
     next_field  = next_delimiter + 1;
@@ -579,7 +688,10 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     next_field          = field_start;
     auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, options);
 
-    if (column_flags[col] & column_parse::enabled) {
+    if (column_flags[col] & column_parse::predecoded) {
+      // Already decoded during type inference
+      ++actual_col;
+    } else if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
       auto const is_valid = !serialized_trie_contains(
         options.trie_na, {field_start, static_cast<size_t>(next_delimiter - field_start)});
@@ -1399,6 +1511,9 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   device_span<column_parse::flags const> const column_flags,
   device_span<uint64_t const> const row_starts,
   size_t const num_active_columns,
+  device_span<uint64_t* const> int_values,
+  device_span<cudf::bitmask_type* const> int_valids,
+  device_span<size_type> int_valid_counts,
   cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -1412,8 +1527,31 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   auto const histogram_bytes      = num_active_columns * sizeof(column_type_histogram);
   bool const use_shared_histogram = histogram_bytes <= 32 * 1024;
   auto const smem_bytes           = use_shared_histogram ? histogram_bytes : 0;
-  data_type_detection<<<grid_size, block_size, smem_bytes, stream.get()>>>(
-    options, data, column_flags, row_starts, d_stats, use_shared_histogram);
+  // 32-bit character counters (fewer registers, higher occupancy) are exact unless a single field
+  // can exceed INT_MAX characters, which requires a buffer larger than that
+  if (data.size() <= static_cast<size_t>(cuda::std::numeric_limits<int>::max())) {
+    data_type_detection<int><<<grid_size, block_size, smem_bytes, stream.get()>>>(
+      options,
+      data,
+      column_flags,
+      row_starts,
+      d_stats,
+      use_shared_histogram,
+      int_values,
+      int_valids,
+      int_valid_counts);
+  } else {
+    data_type_detection<long><<<grid_size, block_size, smem_bytes, stream.get()>>>(
+      options,
+      data,
+      column_flags,
+      row_starts,
+      d_stats,
+      use_shared_histogram,
+      int_values,
+      int_valids,
+      int_valid_counts);
+  }
   CUDF_CUDA_TRY(cudaGetLastError());
 
   return cudf::detail::make_host_vector(d_stats, stream);

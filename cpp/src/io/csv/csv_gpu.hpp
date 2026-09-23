@@ -185,6 +185,10 @@ device_span<uint64_t> remove_blank_rows(cudf::io::parse_options_view const& opti
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] num_active_columns Number of active columns
+ * @param[out] int_values Per inferred column, values of the fields classified as integers, decoded
+ * as for an INT64/UINT64 column; empty to skip decoding
+ * @param[out] int_valids Per inferred column, zero-initialized validity masks of `int_values`
+ * @param[out] int_valid_counts Per inferred column, zero-initialized number of valid `int_values`
  * @param[in] stream CUDA stream to use
  *
  * @return stats Histogram of each dtypes' occurrence for each column
@@ -195,6 +199,9 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   device_span<column_parse::flags const> column_flags,
   device_span<uint64_t const> row_offsets,
   size_t const num_active_columns,
+  device_span<uint64_t* const> int_values,
+  device_span<cudf::bitmask_type* const> int_valids,
+  device_span<size_type> int_valid_counts,
   cuda::stream_ref stream);
 
 /**

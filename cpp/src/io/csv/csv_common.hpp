@@ -23,6 +23,7 @@ enum : uint8_t {
   as_default     = 4,   ///< no special decoding
   as_hexadecimal = 8,   ///< decode with base-16
   as_datetime    = 16,  ///< decode as date and/or time
+  predecoded     = 32,  ///< values were already decoded (during type inference); skip decoding
 };
 using flags = uint8_t;
 
