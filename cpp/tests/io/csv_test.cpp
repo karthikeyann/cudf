@@ -31,6 +31,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda/iterator>
 #include <thrust/execution_policy.h>
@@ -3497,8 +3498,8 @@ TEST_F(CsvReaderTest, EscapedQuotePairsByteRanges)
 
 TEST_F(CsvReaderTest, EscapedQuotePairsDeviceSourceUnchanged)
 {
-  // The reader unescapes its own copy of the data, never the caller's buffer. The reader copies
-  // device inputs today; this guards against future zero-copy paths writing the caller's buffer.
+  // The reader parses device buffers in place, and unescapes the quoted strings into memory of its
+  // own, never into the caller's buffer
   std::string const buffer = "a,b\n1,\"x\"\"y\"\n2,\"\"\"\"\"\"\n";
   auto const stream        = cudf::get_default_stream();
   auto const d_buffer =
@@ -4615,21 +4616,41 @@ struct rows_of_lengths {
    */
   void expect_read(int header = -1, char comment = '\0') const
   {
-    auto const table = expected();
-    auto const read  = [&](bool infer_types) {
-      auto opts = host_buffer_options(text).header(header).comment(comment).build();
-      if (not infer_types) {
-        opts.set_dtypes({dtype<int64_t>(),
-                         dtype<double>(),
-                         dtype<cudf::string_view>(),
-                         dtype<cudf::string_view>()});
-      }
-      return cudf::io::read_csv(opts).tbl;
-    };
+    auto const table  = expected();
+    auto const source = cudf::io::source_info{cudf::host_span<std::byte const>{
+      reinterpret_cast<std::byte const*>(text.data()), text.size()}};
     with_each_row_staging_policy([&] {
-      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table.view(), read(false)->view());
-      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table.view(), read(true)->view());
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table.view(),
+                                         read(source, false, header, comment)->view());
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table.view(), read(source, true, header, comment)->view());
     });
+  }
+
+  /**
+   * @brief Reads the rows from `source`, with explicit or inferred column types.
+   *
+   * @param source Source that holds `text`
+   * @param infer_types Whether to infer the column types
+   * @param header Index of the header row (-1 for none)
+   * @param comment Comment character
+   */
+  [[nodiscard]] static std::unique_ptr<cudf::table> read(cudf::io::source_info const& source,
+                                                         bool infer_types,
+                                                         int header   = -1,
+                                                         char comment = '\0')
+  {
+    auto opts = cudf::io::csv_reader_options::builder(source)
+                  .compression(cudf::io::compression_type::NONE)
+                  .header(header)
+                  .comment(comment)
+                  .build();
+    if (not infer_types) {
+      opts.set_dtypes({dtype<int64_t>(),
+                       dtype<double>(),
+                       dtype<cudf::string_view>(),
+                       dtype<cudf::string_view>()});
+    }
+    return cudf::io::read_csv(opts).tbl;
   }
 };
 
@@ -4758,6 +4779,461 @@ TEST_F(CsvReaderTest, EmptyEdgeFieldsOfBlocks)
       CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int64_t>(values.begin(), values.end()),
                                           inferred.tbl->view().column(1));
     });
+  }
+}
+
+TEST_F(CsvReaderTest, InferredZeroIntegerAtEndOfData)
+{
+  // Type inference skips the leading zeros of integers of 19 digits or more. An integer made of
+  // zeros only must not be read past its end, which can be the end of the data. Under
+  // compute-sanitizer with exact allocations (--rmm_mode=cuda), such a read is detected when the
+  // rows are parsed in global memory (not staged in shared memory).
+  with_each_row_staging_policy([] {
+    for (size_t const num_zeros : {19, 20, 21, 32}) {
+      SCOPED_TRACE(std::to_string(num_zeros) + " zeros");
+      auto const text   = "s,n\na,1\nb," + std::string(num_zeros, '0');
+      auto const result = cudf::io::read_csv(host_buffer_options(text).build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int64_t>{1, 0},
+                                          result.tbl->view().column(1));
+    }
+  });
+}
+
+namespace {
+/**
+ * @brief A document with a UTF-8 BOM, a quoted header name, a comment line and a blank line,
+ * escaped quotes at the start, in the middle and at the end of quoted strings, a quoted delimiter
+ * and terminator, a CRLF row, empty and quoted empty fields, and no final terminator.
+ */
+std::string const in_place_document =
+  "\xEF\xBB\xBF\"id\",text,value\n"
+  "# comment \"with\" \"\"quotes\"\"\n"
+  "1,\"a\"\"b\",1.5\n"
+  "2,\"\"\"\",2.5\n"
+  "\n"
+  "3,\"x,\ny\"\"\",3.5\r\n"
+  "4,plain,\n"
+  "5,\"\",0.5\n"
+  "6,\"\"\"q\",7";
+
+/**
+ * @brief Returns a device copy of `text` at `offset` in a buffer that ends where `text` ends, so
+ * that a read past the end of the text is a read past the end of the allocation. The bytes before
+ * the text are quote characters.
+ */
+rmm::device_uvector<char> device_copy_at_offset(std::string const& text, size_t offset)
+{
+  auto const padded = std::string(offset, '"') + text;
+  return cudf::detail::make_device_uvector(
+    cudf::host_span<char const>{padded.data(), padded.size()},
+    cudf::get_default_stream(),
+    cudf::get_current_device_resource_ref());
+}
+
+/// Checks that a buffer returned by `device_copy_at_offset(text, offset)` is unchanged
+void expect_device_copy_unchanged(rmm::device_uvector<char> const& d_buffer,
+                                  std::string const& text,
+                                  size_t offset)
+{
+  auto const h_buffer = cudf::detail::make_std_vector(d_buffer, cudf::get_default_stream());
+  EXPECT_EQ(std::string(h_buffer.begin(), h_buffer.end()), std::string(offset, '"') + text);
+}
+
+/// Checks that two reads have the same columns and column names
+void expect_same_read(cudf::io::table_with_metadata const& expected,
+                      cudf::io::table_with_metadata const& actual)
+{
+  CUDF_TEST_EXPECT_TABLES_EQUAL(expected.tbl->view(), actual.tbl->view());
+  ASSERT_EQ(expected.metadata.schema_info.size(), actual.metadata.schema_info.size());
+  for (size_t i = 0; i < expected.metadata.schema_info.size(); ++i) {
+    EXPECT_EQ(expected.metadata.schema_info[i].name, actual.metadata.schema_info[i].name);
+  }
+}
+}  // namespace
+
+TEST_F(CsvReaderTest, UnalignedDeviceBuffers)
+{
+  // Device buffers at every alignment, which the reader parses in place, read the same as the host
+  // buffer, with rows staged in shared memory (which sees their alignment) and not staged, and are
+  // not modified (quoted strings are unescaped into memory of the reader)
+  std::vector<size_t> row_lengths;
+  for (size_t i = 0; i < 300; ++i) {
+    row_lengths.push_back(24 + i % 17);
+  }
+  rows_of_lengths const rows{row_lengths};
+  auto const stream = cudf::get_default_stream();
+  with_each_row_staging_policy([&] {
+    for (size_t offset = 0; offset < 16; ++offset) {
+      SCOPED_TRACE("offset " + std::to_string(offset));
+      auto const d_buffer = device_copy_at_offset(rows.text, offset);
+      auto const source   = cudf::io::source_info{cudf::device_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(d_buffer.data() + offset), rows.text.size()}};
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(rows.expected().view(),
+                                         rows_of_lengths::read(source, false)->view());
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(rows.expected().view(),
+                                         rows_of_lengths::read(source, true)->view());
+      auto const h_after = cudf::detail::make_std_vector(d_buffer, stream);
+      EXPECT_EQ(std::string(h_after.begin(), h_after.end()), std::string(offset, '"') + rows.text);
+    }
+  });
+}
+
+namespace {
+// Source that supports device reads, and returns device buffers that are not aligned. Its device
+// reads that return a buffer return a view of its device memory, which it reports as zero-copy
+// reads if `zero_copy` is set. It prefers device reads if `prefers_device_reads` is set. Counts the
+// device reads of each kind.
+class unaligned_device_source : public cudf::io::datasource {
+ public:
+  explicit unaligned_device_source(std::string const& data,
+                                   bool zero_copy            = false,
+                                   bool prefers_device_reads = true)
+    : _host{data},
+      _zero_copy{zero_copy},
+      _prefers_device_reads{prefers_device_reads},
+      _device(data.size() + unaligned_offset,
+              cudf::get_default_stream(),
+              cudf::get_current_device_resource_ref())
+  {
+    cudf::detail::cuda_memcpy(
+      cudf::device_span<char>{_device.data() + unaligned_offset, data.size()},
+      cudf::host_span<char const>{data.data(), data.size()},
+      cudf::get_default_stream());
+  }
+
+  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
+  {
+    size = std::min(size, _host.size() - offset);
+    return buffer::create(std::vector<char>(_host.begin() + offset, _host.begin() + offset + size));
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    size = std::min(size, _host.size() - offset);
+    std::memcpy(dst, _host.data() + offset, size);
+    return size;
+  }
+
+  [[nodiscard]] bool supports_device_read() const override { return true; }
+
+  [[nodiscard]] bool is_device_read_preferred(size_t) const override
+  {
+    return _prefers_device_reads;
+  }
+
+  [[nodiscard]] bool supports_zero_copy_device_read() const override { return _zero_copy; }
+
+  std::unique_ptr<buffer> device_read(size_t offset, size_t size, cuda::stream_ref) override
+  {
+    ++num_view_reads;
+    size = std::min(size, _host.size() - offset);
+    return std::make_unique<non_owning_buffer>(device_data() + offset, size);
+  }
+
+  size_t device_read(size_t offset, size_t size, uint8_t* dst, cuda::stream_ref stream) override
+  {
+    ++num_copy_reads;
+    size = std::min(size, _host.size() - offset);
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(dst, device_data() + offset, size, cudaMemcpyDefault, stream.get()));
+    return size;
+  }
+
+  [[nodiscard]] size_t size() const override { return _host.size(); }
+
+  /// Number of device reads that returned a view of the source's memory
+  int num_view_reads = 0;
+  /// Number of device reads that copied the data
+  int num_copy_reads = 0;
+
+  /// Returns the data in device memory, as the source holds it
+  [[nodiscard]] std::string device_contents() const
+  {
+    auto const h_data = cudf::detail::make_std_vector(
+      cudf::device_span<char const>{_device.data() + unaligned_offset, _host.size()},
+      cudf::get_default_stream());
+    return {h_data.begin(), h_data.end()};
+  }
+
+ private:
+  static constexpr size_t unaligned_offset = 3;
+
+  [[nodiscard]] uint8_t const* device_data() const
+  {
+    return reinterpret_cast<uint8_t const*>(_device.data() + unaligned_offset);
+  }
+
+  std::string const& _host;
+  bool _zero_copy;
+  bool _prefers_device_reads;
+  rmm::device_uvector<char> _device;
+};
+}  // namespace
+
+TEST_F(CsvReaderTest, UnalignedDeviceSource)
+{
+  // A user source whose device data is not aligned reads the same as a host buffer, with rows
+  // staged in shared memory and not staged, and its data is not modified. The reader parses the
+  // data in place if the source reports zero-copy device reads, whether or not it prefers device
+  // reads (a view involves no read), and otherwise reads it into memory of its own, with device
+  // reads if the source prefers them.
+  std::vector<size_t> row_lengths;
+  for (size_t i = 0; i < 300; ++i) {
+    row_lengths.push_back(24 + i % 17);
+  }
+  rows_of_lengths const rows{row_lengths};
+  with_each_row_staging_policy([&] {
+    for (bool const zero_copy : {false, true}) {
+      for (bool const prefers_device_reads : {false, true}) {
+        SCOPED_TRACE(std::string{zero_copy ? "zero-copy" : "copy"} +
+                     (prefers_device_reads ? ", prefers device reads" : ""));
+        unaligned_device_source source{rows.text, zero_copy, prefers_device_reads};
+        CUDF_TEST_EXPECT_TABLES_EQUIVALENT(
+          rows.expected().view(),
+          rows_of_lengths::read(cudf::io::source_info{&source}, false)->view());
+        CUDF_TEST_EXPECT_TABLES_EQUIVALENT(
+          rows.expected().view(),
+          rows_of_lengths::read(cudf::io::source_info{&source}, true)->view());
+        EXPECT_EQ(source.device_contents(), rows.text);
+        EXPECT_EQ(source.num_view_reads, zero_copy ? 2 : 0);
+        EXPECT_EQ(source.num_copy_reads, not zero_copy and prefers_device_reads ? 2 : 0);
+      }
+    }
+  });
+
+  // With row selection, the data is read in chunks, which are always copied
+  for (bool const zero_copy : {false, true}) {
+    SCOPED_TRACE(zero_copy ? "zero-copy, row selection" : "copy, row selection");
+    unaligned_device_source source{rows.text, zero_copy};
+    auto const selected =
+      cudf::io::read_csv(cudf::io::csv_reader_options::builder(cudf::io::source_info{&source})
+                           .compression(cudf::io::compression_type::NONE)
+                           .header(-1)
+                           .nrows(100)
+                           .build());
+    EXPECT_EQ(selected.tbl->num_rows(), 100);
+    EXPECT_EQ(source.num_view_reads, 0);
+    EXPECT_EQ(source.device_contents(), rows.text);
+  }
+}
+
+TEST_F(CsvReaderTest, DeviceBuffersReadInPlace)
+{
+  // The reader parses device buffers in place. Reading at every alignment, with and without type
+  // inference, unescaping and quoting, gives the same result as reading a host buffer, and does not
+  // modify the buffer. The buffers end where the data ends, so that reads past the end of the data
+  // are detected by compute-sanitizer with exact allocations (--rmm_mode=cuda) when the rows are
+  // not staged in shared memory.
+  auto const configure = [](cudf::io::csv_reader_options& opts, int variant) {
+    opts.set_comment('#');
+    if (variant != 1) {
+      opts.set_dtypes({dtype<int32_t>(), dtype<cudf::string_view>(), dtype<double>()});
+    }
+    if (variant == 2) { opts.enable_doublequote(false); }
+    if (variant == 3) { opts.set_quoting(cudf::io::quote_style::NONE); }
+  };
+  auto const read = [&](cudf::io::source_info const& source, int variant) {
+    auto opts = cudf::io::csv_reader_options::builder(source)
+                  .compression(cudf::io::compression_type::NONE)
+                  .build();
+    configure(opts, variant);
+    return cudf::io::read_csv(opts);
+  };
+  auto const host_source = [](std::string const& text) {
+    return cudf::io::source_info{cudf::host_span<std::byte const>{
+      reinterpret_cast<std::byte const*>(text.data()), text.size()}};
+  };
+
+  auto const expected = read(host_source(in_place_document), 0);
+  EXPECT_EQ(expected.metadata.schema_info[0].name, "id");
+  auto const expected_texts = cudf::test::strings_column_wrapper(
+    {"a\"b", "\"", "x,\ny\"", "plain", "", "\"q"}, {true, true, true, true, false, true});
+  auto const expected_values =
+    column_wrapper<double>({1.5, 2.5, 3.5, 0., 0.5, 7.}, {true, true, true, false, true, true});
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int32_t>{1, 2, 3, 4, 5, 6},
+                                      expected.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_texts, expected.tbl->view().column(1));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_values, expected.tbl->view().column(2));
+
+  auto const& text  = in_place_document;
+  auto const stream = cudf::get_default_stream();
+  with_each_row_staging_policy([&] {
+    for (int variant = 0; variant < 4; ++variant) {
+      SCOPED_TRACE("variant " + std::to_string(variant));
+      auto const expected_read = read(host_source(text), variant);
+      for (size_t offset = 0; offset < 16; ++offset) {
+        SCOPED_TRACE("offset " + std::to_string(offset));
+        auto const d_buffer = device_copy_at_offset(text, offset);
+        auto const source   = cudf::io::source_info{cudf::device_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}};
+        expect_same_read(expected_read, read(source, variant));
+        auto const h_after = cudf::detail::make_std_vector(d_buffer, stream);
+        EXPECT_EQ(std::string(h_after.begin(), h_after.end()), std::string(offset, '"') + text);
+      }
+    }
+  });
+
+  // Files are copied to device memory, and read the same
+  auto const filepath = temp_env->get_temp_filepath("DeviceBuffersReadInPlace.csv");
+  std::ofstream(filepath, std::ios::binary) << text;
+  for (int variant = 0; variant < 4; ++variant) {
+    SCOPED_TRACE("file, variant " + std::to_string(variant));
+    expect_same_read(read(host_source(text), variant),
+                     read(cudf::io::source_info{filepath}, variant));
+  }
+}
+
+TEST_F(CsvReaderTest, SmallDeviceBuffersReadInPlace)
+{
+  // Empty inputs, inputs with only a BOM or a header, and single fields that end at the end of the
+  // buffer, some of them quoted with escaped quotes, read from device buffers of their exact size
+  // the same as from host buffers
+  std::vector<std::string> const inputs{"",
+                                        "\xEF\xBB\xBF",
+                                        "\xEF\xBB\xBF\n",
+                                        "a",
+                                        "a,b",
+                                        "a,b\n",
+                                        std::string{"\xEF\xBB\xBF"} + "a,b\n",
+                                        "a\n1",
+                                        "a\n\"\"",
+                                        "a\n\"\"\"\"",
+                                        "a\n\"x\"\"y\"",
+                                        "a\n\"x\"\"\"",
+                                        "\"\"\"\"",
+                                        "a,b\n1,\"\"\"\"\"\"\n"};
+  for (auto const& text : inputs) {
+    for (int const header : {0, -1}) {
+      SCOPED_TRACE("input \"" + text + "\", header " + std::to_string(header));
+      auto const read = [&](cudf::io::source_info const& source) {
+        return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                                    .compression(cudf::io::compression_type::NONE)
+                                    .header(header)
+                                    .build());
+      };
+      auto const expected = read(cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(text.data()), text.size()}});
+      for (size_t offset : {0, 5}) {
+        auto const d_buffer = device_copy_at_offset(text, offset);
+        expect_same_read(
+          expected,
+          read(cudf::io::source_info{cudf::device_span<std::byte const>{
+            reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}}));
+        expect_device_copy_unchanged(d_buffer, text, offset);
+      }
+    }
+  }
+}
+
+TEST_F(CsvReaderTest, DeviceBufferWithOtherQuoteCharacter)
+{
+  // With another quote character, its pairs are unescaped and '"' characters are regular ones. The
+  // only escaped pair of the data is a pair of the quote character.
+  std::string const text = "s\n'a''b'\n'\"x\"'\nq\"r\n'c'\n";
+  auto const expected    = cudf::test::strings_column_wrapper({"a'b", "\"x\"", "q\"r", "c"});
+  for (size_t const offset : {0, 3}) {
+    SCOPED_TRACE("offset " + std::to_string(offset));
+    auto const d_buffer = device_copy_at_offset(text, offset);
+    auto const result   = cudf::io::read_csv(
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::device_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .quotechar('\'')
+        .build());
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected, result.tbl->view().column(0));
+    auto const h_after = cudf::detail::make_std_vector(d_buffer, cudf::get_default_stream());
+    EXPECT_EQ(std::string(h_after.begin(), h_after.end()), std::string(offset, '"') + text);
+  }
+}
+
+TEST_F(CsvReaderTest, EscapedQuotesAtSliceBoundariesOfDeviceBuffers)
+{
+  // Parsing a device buffer in place, the reader only allocates memory for unescaped strings if the
+  // row gathering found two consecutive quote characters. The only escaped quote pair of each input
+  // starts at a position around the boundaries of the 32-character slices and 32KB tiles that the
+  // row gathering processes, in aligned data (loaded in 16-byte words) and unaligned data (loaded
+  // one character at a time).
+  for (size_t const pair_position :
+       {6ul, 30ul, 31ul, 32ul, 47ul, 63ul, 64ul, 32767ul, 32768ul, 32799ul, 65535ul}) {
+    // A header, a row of filler characters, the field "x""y" whose pair is at the position, and a
+    // long enough row for the slices after the pair to be loaded in words
+    auto const filler = std::string(pair_position - 5, 'a');
+    auto const last   = std::string(100, 'b');
+    auto const text   = "s\n" + filler + "\n\"x\"\"y\"\n" + last + "\n";
+    ASSERT_EQ(text.substr(pair_position, 2), "\"\"");
+    auto const expected = cudf::test::strings_column_wrapper({filler, "x\"y", last});
+    for (size_t const offset : {0, 3}) {
+      SCOPED_TRACE("pair at " + std::to_string(pair_position) + ", offset " +
+                   std::to_string(offset));
+      auto const d_buffer = device_copy_at_offset(text, offset);
+      auto const result   = cudf::io::read_csv(
+        cudf::io::csv_reader_options::builder(
+          cudf::io::source_info{cudf::device_span<std::byte const>{
+            reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}})
+          .compression(cudf::io::compression_type::NONE)
+          .dtypes({dtype<cudf::string_view>()})
+          .build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected, result.tbl->view().column(0));
+      expect_device_copy_unchanged(d_buffer, text, offset);
+    }
+  }
+}
+
+TEST_F(CsvReaderTest, DeviceBufferPairsOutsideOfRowQuotes)
+{
+  // With whitespace around quotes, a field that starts with whitespace is still unescaped, although
+  // the row gathering does not consider it quoted (its quote does not follow a delimiter). Its
+  // pair must still count as consecutive quote characters.
+  std::string const text = "a,b\n1, \"x\"\"y\" \n2,z\n";
+  for (size_t const offset : {0, 3}) {
+    SCOPED_TRACE("offset " + std::to_string(offset));
+    auto const d_buffer = device_copy_at_offset(text, offset);
+    auto const result   = cudf::io::read_csv(
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::device_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .detect_whitespace_around_quotes(true)
+        .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()})
+        .build());
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::strings_column_wrapper({"x\"y", "z"}),
+                                        result.tbl->view().column(1));
+    expect_device_copy_unchanged(d_buffer, text, offset);
+  }
+}
+
+TEST_F(CsvReaderTest, UnescapeMemoryOfDeviceBuffers)
+{
+  // Parsing a device buffer in place, the reader allocates memory of the size of the data for the
+  // unescaped strings only if the data has two consecutive quote characters. Only a short string
+  // column is read, so that the other memory used is about a quarter of the size of the data.
+  for (bool const escaped : {false, true}) {
+    SCOPED_TRACE(escaped ? "escaped quotes" : "no escaped quotes");
+    std::string text = "s,filler\n";
+    for (int i = 0; i < 10'000; ++i) {
+      text +=
+        (escaped ? "\"q\"\"" : "\"q") + std::to_string(i) + "\"," + std::string(200, 'f') + "\n";
+    }
+    auto const d_buffer = device_copy_at_offset(text, 0);
+    auto const source   = cudf::io::source_info{cudf::device_span<std::byte const>{
+      reinterpret_cast<std::byte const*>(d_buffer.data()), text.size()}};
+
+    rmm::mr::statistics_resource_adaptor statistics{cudf::get_current_device_resource_ref()};
+    auto const result = [&] {
+      cudf::test::scoped_current_device_resource const scope{statistics};
+      return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                                  .compression(cudf::io::compression_type::NONE)
+                                  .use_cols_indexes({0})
+                                  .build());
+    }();
+    EXPECT_EQ(result.tbl->num_rows(), 10'000);
+    auto const peak = static_cast<size_t>(statistics.get_bytes_counter().peak);
+    if (escaped) {
+      EXPECT_GE(peak, text.size());
+    } else {
+      EXPECT_LT(peak, text.size());
+    }
   }
 }
 

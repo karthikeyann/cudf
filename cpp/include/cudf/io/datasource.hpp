@@ -124,6 +124,12 @@ class datasource {
   /**
    * @brief Creates a source from a device memory buffer.
    *
+   * The source does not copy or own the buffer, and its device reads that return a buffer return
+   * views of it (see `supports_zero_copy_device_read`): readers may process the buffer in place.
+   * The buffer must hold the data when a read starts, and must not be modified or freed until the
+   * read is complete, including the work it enqueues on its stream. (The device work of a read is
+   * stream-ordered, but the host reads of the source copy the data on a stream of their own.)
+   *
    * @param buffer Device buffer object
    * @return Constructed datasource object
    */
@@ -237,9 +243,35 @@ class datasource {
   }
 
   /**
+   * @brief Whether device reads that return a buffer return a view of data that is already in
+   * device memory, without copying it.
+   *
+   * Only applies if `supports_device_read()` returns true, and only to
+   * `device_read(offset, size, stream)`; the reads into a preallocated buffer always copy. If this
+   * function returns true, the buffer returned by `device_read(offset, size, stream)`:
+   * - points to device memory that holds the requested data in stream order on `stream`, so that
+   *   work enqueued on `stream` after the call sees the data, and
+   * - stays valid, and its data unmodified, until the buffer is destroyed and the work that the
+   *   reader enqueued on `stream` to process it is complete.
+   *
+   * Readers can then process the data in place, whatever `is_device_read_preferred` returns, since
+   * no read takes place. They must not modify it, and may read it several times. The memory must
+   * therefore be device memory, not host memory that the device can access (such as pinned host
+   * memory, or managed memory resident on the host): sources of such memory should return false,
+   * so that readers copy the data to the device once.
+   *
+   * Data source implementations whose device reads copy the data don't need to override this
+   * function.
+   *
+   * @return bool Whether `device_read(offset, size, stream)` returns a view of the source data
+   */
+  [[nodiscard]] virtual bool supports_zero_copy_device_read() const { return false; }
+
+  /**
    * @brief Returns a device buffer with a subset of data from the source.
    *
-   * For optimal performance, should only be called when `is_device_read_preferred` returns `true`.
+   * For optimal performance, should only be called when `is_device_read_preferred` returns `true`,
+   * or when `supports_zero_copy_device_read` returns `true`.
    * Data source implementations that don't support direct device reads don't need to override this
    * function.
    *
