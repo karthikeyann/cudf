@@ -16,6 +16,7 @@
 #include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
+#include <cudf/copying.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/io/detail/codec.hpp>
@@ -31,6 +32,7 @@
 
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <type_traits>
 
@@ -2356,6 +2358,44 @@ TEST_F(JsonReaderTest, ValueValidation)
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), b_column);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(2), c_column);
   }
+}
+
+TEST_F(JsonReaderTest, TimestampsWithIncompleteTimeOfDay)
+{
+  auto const read_timestamps = [](std::string const& data) {
+    cudf::io::json_reader_options const in_options =
+      cudf::io::json_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+        .lines(true)
+        .dtypes(
+          std::map<std::string, data_type>{{"a", data_type{type_id::TIMESTAMP_MILLISECONDS}}});
+    return cudf::io::read_json(in_options);
+  };
+
+  // Each value but the last lacks separators or digits in the time of day. The last row is
+  // well-formed and holds the separators that a parser reading past the end of the preceding
+  // values would find.
+  auto const result = read_timestamps(
+    "{\"a\": \"2024-01-01T10\"}\n"
+    "{\"a\": \"2024-01-01 \"}\n"
+    "{\"a\": \"2024-01-01T11:30:00.500\"}\n");
+  using namespace cuda::std::chrono_literals;
+  auto constexpr midnight = 1704067200000ms;  // 2024-01-01T00:00:00
+  auto const expected     = timestamp_ms_wrapper{
+    (midnight + 10h).count(), midnight.count(), (midnight + 11h + 30min + 500ms).count()};
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected, result.tbl->get_column(0));
+
+  // A time of day without a date has no date separators; the value parsed from it must not depend
+  // on the values that follow
+  auto const time_only_first = read_timestamps(
+    "{\"a\": \"10:30\"}\n"
+    "{\"a\": \"2001-02-03\"}\n");
+  auto const time_only_second = read_timestamps(
+    "{\"a\": \"10:30\"}\n"
+    "{\"a\": \"1999-12-31T23:59\"}\n");
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::slice(time_only_first.tbl->get_column(0), {0, 1}).front(),
+                                 cudf::slice(time_only_second.tbl->get_column(0), {0, 1}).front());
 }
 
 TEST_F(JsonReaderTest, MixedTypes)

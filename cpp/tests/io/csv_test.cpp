@@ -2964,6 +2964,74 @@ TEST_F(CsvReaderTest, CommentLinesWithQuotedStrings)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result.tbl->view().column(1), expected_col1);
 }
 
+TEST_F(CsvReaderTest, TimestampsWithIncompleteTimeOfDay)
+{
+  // Each time of day but the last lacks separators or digits. The last row is well-formed and
+  // holds the separators that a parser reading past the end of the preceding fields would find.
+  std::string const buffer =
+    "2024-01-01T10\n"
+    "2024-01-01T10PM\n"
+    "2024-01-01T\n"
+    "2024-01-01 M\n"
+    "2024-01-01T11:30:00.500\n";
+
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes({data_type{type_id::TIMESTAMP_MILLISECONDS}})
+      .header(-1);
+  auto const result = cudf::io::read_csv(in_opts);
+
+  using namespace cuda::std::chrono_literals;
+  auto constexpr midnight = 1704067200000ms;  // 2024-01-01T00:00:00
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{cudf::timestamp_ms{midnight + 10h},
+                                    cudf::timestamp_ms{midnight + 22h},
+                                    cudf::timestamp_ms{midnight},
+                                    cudf::timestamp_ms{midnight},
+                                    cudf::timestamp_ms{midnight + 11h + 30min + 500ms}},
+    result.tbl->view().column(0));
+}
+
+TEST_F(CsvReaderTest, TimestampsWithIncompleteDate)
+{
+  // Each date but the last lacks a separator between its components; the missing components parse
+  // as zero. The last row holds the separators that a parser reading past the end of the preceding
+  // fields would find.
+  std::string const buffer = "2024T10:00\n12T10:00\n12/5T10:00\n2001-02-03\n";
+  auto const read_dates    = [&](bool dayfirst) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes({data_type{type_id::TIMESTAMP_MILLISECONDS}})
+        .dayfirst(dayfirst)
+        .header(-1);
+    return cudf::io::read_csv(in_opts);
+  };
+
+  // Converts the components as the reader does, including components that are out of range
+  auto const date = [](int y, unsigned m, unsigned d) {
+    using namespace cuda::std::chrono;
+    return cudf::timestamp_ms{sys_days{year_month_day{year{y}, month{m}, day{d}}}};
+  };
+  using namespace cuda::std::chrono_literals;
+
+  // A year of four digits comes first; otherwise the month (the day with dayfirst) comes first
+  // and the year comes last
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{
+      date(2024, 0, 1) + 10h, date(0, 12, 1) + 10h, date(5, 12, 1) + 10h, date(2001, 2, 3)},
+    read_dates(false).tbl->view().column(0));
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{
+      date(2024, 0, 1) + 10h, date(0, 0, 12) + 10h, date(0, 5, 12) + 10h, date(2001, 2, 3)},
+    read_dates(true).tbl->view().column(0));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {
