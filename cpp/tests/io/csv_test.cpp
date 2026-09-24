@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "io_test_utils.hpp"
+
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
@@ -5385,6 +5387,48 @@ TEST_F(CsvReaderTest, FloatingPointSyntaxEdgeCases)
   auto const expected = std::vector<std::optional<double>>{
     1.0, -1.0, 0.5, 1.0, 1.0, 1.0, 7.0, -0.0, -0.0, 0.0, infinity, infinity, std::nullopt};
   expect_bitwise_equal(expected, read_fields(fields, dtype<double>()).tbl->get_column(0));
+}
+
+TEST_F(CsvReaderTest, FixedLayoutIsoTimestamps)
+{
+  // Timestamps with the layout `YYYY-MM-DD[T ]HH:MM:SS[Z|.fraction]` are parsed without searching
+  // for their separators. Each must parse as the same string with '/' as date separator, which
+  // takes the general parsing. So must near misses of the layout, which take it too.
+  std::string buffer;
+  for (auto const& field : cudf::test::iso_8601_timestamp_test_strings()) {
+    buffer += field + '|' + cudf::test::with_slash_date_separators(field) + '\n';
+  }
+  auto const source = cudf::io::source_info{cudf::host_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}};
+
+  for (auto const type : {type_id::TIMESTAMP_DAYS,
+                          type_id::TIMESTAMP_SECONDS,
+                          type_id::TIMESTAMP_MILLISECONDS,
+                          type_id::TIMESTAMP_MICROSECONDS,
+                          type_id::TIMESTAMP_NANOSECONDS}) {
+    for (bool const dayfirst : {false, true}) {
+      auto const result =
+        cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                             .compression(cudf::io::compression_type::NONE)
+                             .dtypes(std::vector<data_type>{data_type{type}, data_type{type}})
+                             .delimiter('|')
+                             .dayfirst(dayfirst)
+                             .header(-1)
+                             .build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), result.tbl->get_column(0));
+    }
+  }
+
+  // Pins the current behavior, which the fast path keeps: the digits of the fraction are parsed as
+  // a number of milliseconds whatever their count, so ".5" is 5 ms and not 500 ms
+  auto const result = read_fields({"2024-02-29T13:45:59.123", "2024-02-29 13:45:59.5"},
+                                  data_type{type_id::TIMESTAMP_MILLISECONDS});
+  using namespace cuda::std::chrono_literals;
+  auto constexpr leap_day = 1709164800000ms;  // 2024-02-29T00:00:00
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{cudf::timestamp_ms{leap_day + 13h + 45min + 59s + 123ms},
+                                    cudf::timestamp_ms{leap_day + 13h + 45min + 59s + 5ms}},
+    result.tbl->get_column(0));
 }
 
 namespace {

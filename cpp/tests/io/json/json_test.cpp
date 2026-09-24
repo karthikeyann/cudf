@@ -2451,6 +2451,32 @@ TEST_F(JsonReaderTest, TimestampsWithIncompleteTimeOfDay)
                                  cudf::slice(time_only_second.tbl->get_column(0), {0, 1}).front());
 }
 
+TEST_F(JsonReaderTest, FixedLayoutIsoTimestamps)
+{
+  // Timestamps with the layout `YYYY-MM-DD[T ]HH:MM:SS[Z|.fraction]` are parsed without searching
+  // for their separators. Each must parse as the same string with '/' as date separator, which
+  // takes the general parsing. So must near misses of the layout, which take it too.
+  std::string data;
+  for (auto const& value : cudf::test::iso_8601_timestamp_test_strings()) {
+    data += "{\"a\": \"" + value + "\", \"b\": \"" + cudf::test::with_slash_date_separators(value) +
+            "\"}\n";
+  }
+
+  for (auto const type : {type_id::TIMESTAMP_SECONDS, type_id::TIMESTAMP_NANOSECONDS}) {
+    for (bool const dayfirst : {false, true}) {
+      cudf::io::json_reader_options const in_options =
+        cudf::io::json_reader_options::builder(
+          cudf::io::source_info{cudf::host_span<std::byte const>{
+            reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+          .lines(true)
+          .dayfirst(dayfirst)
+          .dtypes(std::map<std::string, data_type>{{"a", data_type{type}}, {"b", data_type{type}}});
+      auto const result = cudf::io::read_json(in_options);
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), result.tbl->get_column(0));
+    }
+  }
+}
+
 TEST_F(JsonReaderTest, NaValuesDoNotMatchLongerValues)
 {
   // The values that are not null extend an NA value with characters that occur in the NA values
