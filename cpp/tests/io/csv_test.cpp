@@ -2964,6 +2964,327 @@ TEST_F(CsvReaderTest, CommentLinesWithQuotedStrings)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(result.tbl->view().column(1), expected_col1);
 }
 
+TEST_F(CsvReaderTest, TimestampsWithIncompleteTimeOfDay)
+{
+  // Each time of day but the last lacks separators or digits. The last row is well-formed and
+  // holds the separators that a parser reading past the end of the preceding fields would find.
+  std::string const buffer =
+    "2024-01-01T10\n"
+    "2024-01-01T10PM\n"
+    "2024-01-01T\n"
+    "2024-01-01 M\n"
+    "2024-01-01T11:30:00.500\n";
+
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes({data_type{type_id::TIMESTAMP_MILLISECONDS}})
+      .header(-1);
+  auto const result = cudf::io::read_csv(in_opts);
+
+  using namespace cuda::std::chrono_literals;
+  auto constexpr midnight = 1704067200000ms;  // 2024-01-01T00:00:00
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{cudf::timestamp_ms{midnight + 10h},
+                                    cudf::timestamp_ms{midnight + 22h},
+                                    cudf::timestamp_ms{midnight},
+                                    cudf::timestamp_ms{midnight},
+                                    cudf::timestamp_ms{midnight + 11h + 30min + 500ms}},
+    result.tbl->view().column(0));
+}
+
+TEST_F(CsvReaderTest, TimestampsWithIncompleteDate)
+{
+  // Each date but the last lacks a separator between its components; the missing components parse
+  // as zero. The last row holds the separators that a parser reading past the end of the preceding
+  // fields would find.
+  std::string const buffer = "2024T10:00\n12T10:00\n12/5T10:00\n2001-02-03\n";
+  auto const read_dates    = [&](bool dayfirst) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes({data_type{type_id::TIMESTAMP_MILLISECONDS}})
+        .dayfirst(dayfirst)
+        .header(-1);
+    return cudf::io::read_csv(in_opts);
+  };
+
+  // Converts the components as the reader does, including components that are out of range
+  auto const date = [](int y, unsigned m, unsigned d) {
+    using namespace cuda::std::chrono;
+    return cudf::timestamp_ms{sys_days{year_month_day{year{y}, month{m}, day{d}}}};
+  };
+  using namespace cuda::std::chrono_literals;
+
+  // A year of four digits comes first; otherwise the month (the day with dayfirst) comes first
+  // and the year comes last
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{
+      date(2024, 0, 1) + 10h, date(0, 12, 1) + 10h, date(5, 12, 1) + 10h, date(2001, 2, 3)},
+    read_dates(false).tbl->view().column(0));
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{
+      date(2024, 0, 1) + 10h, date(0, 0, 12) + 10h, date(0, 5, 12) + 10h, date(2001, 2, 3)},
+    read_dates(true).tbl->view().column(0));
+}
+
+TEST_F(CsvReaderTest, DurationsAtEndOfInput)
+{
+  // Each duration ends where the input ends, so the parser must not look at the character after
+  // the last component. Run under compute-sanitizer with exact allocations (--rmm_mode=cuda) to
+  // detect such reads.
+  auto const read_last_duration = [](std::string const& buffer) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes({data_type{type_id::DURATION_MILLISECONDS}})
+        .header(-1);
+    return cudf::io::read_csv(in_opts);
+  };
+
+  using namespace cuda::std::chrono_literals;
+  auto const expect_duration = [&](std::string const& buffer, cudf::duration_ms expected) {
+    SCOPED_TRACE(buffer);
+    expect_column_data_equal(std::vector<cudf::duration_ms>{expected},
+                             read_last_duration(buffer).tbl->view().column(0));
+  };
+  expect_duration("1 days", cudf::duration_ms{24h});
+  expect_duration("1 days +", cudf::duration_ms{24h});
+  expect_duration("00:00:01", cudf::duration_ms{1s});
+  expect_duration("1 days 00:00:01", cudf::duration_ms{24h + 1s});
+  expect_duration("1 days 00:00:01.", cudf::duration_ms{24h + 1s});
+}
+
+TEST_F(CsvReaderTest, NaValuesDoNotMatchLongerFields)
+{
+  // The fields that are not null extend an NA value with characters that occur in the NA values
+  std::string const buffer = "NA\nNAA\nNA/A\nNAULL\n#NA\n#NAA\nN/A\n";
+
+  cudf::io::csv_reader_options const default_na_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes({dtype<cudf::string_view>()})
+      .header(-1);
+  auto const default_na_result   = cudf::io::read_csv(default_na_opts);
+  auto const default_na_expected = cudf::test::strings_column_wrapper(
+    {"", "NAA", "NA/A", "NAULL", "", "#NAA", ""}, {false, true, true, true, false, true, false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(default_na_expected, default_na_result.tbl->view().column(0));
+
+  std::string const custom_buffer = "a\nb\naa\nab\nba\nbb\n";
+  cudf::io::csv_reader_options const custom_na_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(custom_buffer.data()), custom_buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes({dtype<cudf::string_view>()})
+      .header(-1)
+      .keep_default_na(false)
+      .na_values({"a", "b"});
+  auto const custom_na_result   = cudf::io::read_csv(custom_na_opts);
+  auto const custom_na_expected = cudf::test::strings_column_wrapper(
+    {"", "", "aa", "ab", "ba", "bb"}, {false, false, true, true, true, true});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(custom_na_expected, custom_na_result.tbl->view().column(0));
+}
+
+TEST_F(CsvReaderTest, NonAsciiNaAndBooleanValues)
+{
+  // "é" and "í" are two-byte UTF-8 sequences whose bytes are negative as signed char
+  std::string const buffer = "a,sí\né,no\nb,no\néé,sí\naé,no\n";
+
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes(std::vector<data_type>{dtype<cudf::string_view>(), dtype<bool>()})
+      .header(-1)
+      .keep_default_na(false)
+      .na_values({"a", "é"})
+      .true_values({"sí"})
+      .false_values({"no"});
+  auto const result = cudf::io::read_csv(in_opts);
+
+  auto const expected_strings =
+    cudf::test::strings_column_wrapper({"", "", "b", "éé", "aé"}, {false, false, true, true, true});
+  auto const expected_bools =
+    cudf::test::fixed_width_column_wrapper<bool>({true, false, false, true, false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_strings, result.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bools, result.tbl->view().column(1));
+}
+
+TEST_F(CsvReaderTest, LoneQuoteField)
+{
+  // A quote character that opens a quoted field at the end of the input is not a quoted string;
+  // the field keeps the quote character
+  auto const read_last_field = [](std::string const& buffer, bool detect_whitespace_around_quotes) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()})
+        .detect_whitespace_around_quotes(detect_whitespace_around_quotes);
+    return cudf::io::read_csv(in_opts);
+  };
+
+  auto const expected_ints = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2});
+  {
+    auto const result = read_last_field("a,b\n1,x\n2,\"", false);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_ints, result.tbl->view().column(0));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"x", "\""}),
+                                   result.tbl->view().column(1));
+  }
+  {
+    // Whitespace is only removed around quoted strings
+    auto const result = read_last_field("a,b\n1,x\n2, \"", true);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_ints, result.tbl->view().column(0));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"x", " \""}),
+                                   result.tbl->view().column(1));
+  }
+}
+
+TEST_F(CsvReaderTest, LoneQuoteNonStringField)
+{
+  // With the enclosing quote stripped, a lone quote at the end of the input is an empty field, like
+  // an empty quoted field. Parsing it must not read the byte after the input; run under
+  // compute-sanitizer with exact allocations (--rmm_mode=cuda) to detect such reads.
+  std::string const buffer = "\"\"\n\"";
+  for (auto const type :
+       {type_id::INT32, type_id::FLOAT64, type_id::BOOL8, type_id::DURATION_SECONDS}) {
+    SCOPED_TRACE(static_cast<int>(type));
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes({data_type{type}})
+        .header(-1)
+        .na_filter(false);
+    auto const result = cudf::io::read_csv(in_opts);
+    auto const column = result.tbl->view().column(0);
+    ASSERT_EQ(column.size(), 2);
+    EXPECT_EQ(column.null_count(), 0);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::slice(column, {0, 1}).front(),
+                                   cudf::slice(column, {1, 2}).front());
+  }
+}
+
+TEST_F(CsvReaderTest, EmptyFirstField)
+{
+  // The first field of the input is empty, so the byte before it is outside the input. Parsing it
+  // must not read that byte; run under compute-sanitizer with exact allocations (--rmm_mode=cuda)
+  // to detect such reads.
+  std::string const buffer = ",1\n2,3\n";
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<int32_t>()})
+      .header(-1)
+      .na_filter(false);
+  auto const result = cudf::io::read_csv(in_opts);
+
+  // Without NA filtering, an empty numeric field parses as zero
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int32_t>({0, 2}),
+                                      result.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int32_t>({1, 3}),
+                                      result.tbl->view().column(1));
+}
+
+TEST_F(CsvReaderTest, UseColsIndexesOutOfRange)
+{
+  auto const read_use_cols = [](std::string const& buffer,
+                                std::vector<int> indexes,
+                                std::vector<std::string> names = {},
+                                std::size_t range_offset       = 0,
+                                std::size_t range_size         = 0,
+                                int header                     = -1) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .header(header)
+        .names(std::move(names))
+        .use_cols_indexes(std::move(indexes))
+        .byte_range_offset(range_offset)
+        .byte_range_size(range_size);
+    return cudf::io::read_csv(in_opts);
+  };
+  auto const column_names = [](cudf::io::table_with_metadata const& result) {
+    std::vector<std::string> names;
+    for (auto const& info : result.metadata.schema_info) {
+      names.push_back(info.name);
+    }
+    return names;
+  };
+
+  // Selecting a column that is not in the input is an error
+  std::string const buffer = "1,2,3,4,5,6\n7,8,9,10,11,12\n";
+  EXPECT_THROW(read_use_cols(buffer, {0, 6}), std::out_of_range);
+  EXPECT_THROW(read_use_cols(buffer, {-1}), std::out_of_range);
+  EXPECT_THROW(read_use_cols("", {-1}), std::out_of_range);
+  // The header names the columns of the input, even without data rows
+  EXPECT_THROW(read_use_cols("a,b,c\n", {5}, {}, 0, 0, 0), std::out_of_range);
+
+  // Without rows or names, the columns are unknown and none is selected
+  EXPECT_EQ(read_use_cols("", {0}).tbl->num_columns(), 0);
+  // The byte range [14, 22) contains no row start
+  auto const range_offset = 14;
+  auto const range_size   = 8;
+  EXPECT_EQ(read_use_cols(buffer, {2, 5}, {}, range_offset, range_size).tbl->num_columns(), 0);
+
+  // Without rows, as many names as selected columns name the selected columns
+  for (auto const& indexes : std::vector<std::vector<int>>{{2, 5}, {0, 5}, {1, 5}, {0, 1}}) {
+    auto const result = read_use_cols(buffer, indexes, {"x", "y"}, range_offset, range_size);
+    EXPECT_EQ(result.tbl->num_rows(), 0);
+    EXPECT_EQ(column_names(result), (std::vector<std::string>{"x", "y"}));
+  }
+  EXPECT_EQ(column_names(read_use_cols("", {1, 5}, {"x", "y"})),
+            (std::vector<std::string>{"x", "y"}));
+  // Other names name all columns, and an index must match one of them
+  std::vector<std::string> const six_names{"a", "b", "c", "d", "e", "f"};
+  auto const all_names = read_use_cols(buffer, {2, 5}, six_names, range_offset, range_size);
+  EXPECT_EQ(all_names.tbl->num_rows(), 0);
+  EXPECT_EQ(column_names(all_names), (std::vector<std::string>{"c", "f"}));
+  EXPECT_THROW(read_use_cols(buffer, {2, 6}, six_names, range_offset, range_size),
+               std::out_of_range);
+  EXPECT_THROW(read_use_cols(buffer, {2, 5}, {"a", "b", "c"}, range_offset, range_size),
+               std::out_of_range);
+}
+
+TEST_F(CsvReaderTest, ParseDatesAndHexIndexesOutOfRange)
+{
+  // Like column names that match no column, parse_dates and parse_hex indexes that match no column
+  // are ignored; the other indexes still apply
+  std::string const buffer = "ff,1\n10,2\n";
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .header(-1)
+      .dtypes(std::vector<data_type>{dtype<int64_t>(), dtype<int64_t>()})
+      .parse_dates(std::vector<int>{-1, 3})
+      .parse_hex(std::vector<int>{-2, 0, 7});
+  auto const result = cudf::io::read_csv(in_opts);
+
+  ASSERT_EQ(result.tbl->num_columns(), 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int64_t>({255, 16}),
+                                      result.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int64_t>({1, 2}),
+                                      result.tbl->view().column(1));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

@@ -365,8 +365,11 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           auto end        = next_delimiter;
           bool was_quoted = false;
           if (not options.keepquotes) {
+            // A quoted string needs an opening and a closing quote; a field consisting of a single
+            // quote character (an unterminated quote at the end of the input) is kept as is
             if (not options.detect_whitespace_around_quotes) {
-              if ((*field_start == options.quotechar) && (*(end - 1) == options.quotechar)) {
+              if (end - field_start >= 2 && (*field_start == options.quotechar) &&
+                  (*(end - 1) == options.quotechar)) {
                 ++field_start;
                 --end;
                 was_quoted = true;
@@ -374,7 +377,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
             } else {
               // If the string is quoted, whitespace around the quotes get removed as well
               auto const trimmed_field = trim_whitespaces(field_start, end);
-              if ((*trimmed_field.first == options.quotechar) &&
+              if (trimmed_field.second - trimmed_field.first >= 2 &&
+                  (*trimmed_field.first == options.quotechar) &&
                   (*(trimmed_field.second - 1) == options.quotechar)) {
                 field_start = trimmed_field.first + 1;
                 end         = trimmed_field.second - 1;

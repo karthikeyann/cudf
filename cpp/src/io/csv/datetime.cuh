@@ -44,6 +44,22 @@ __inline__ __device__ T to_non_negative_integer(char const* begin, char const* e
 }
 
 /**
+ * @brief Returns the position that follows a separator found by searching a range ending at `end`.
+ *
+ * A search that finds no separator returns `end`; the position after it would lie outside the
+ * range, so `end` is returned instead. Every range that starts after a separator (to search for the
+ * next separator, or to parse the next component) is thus non-inverted and within the field.
+ *
+ * @param sep_pos Result of the separator search: the separator position, or `end` if not found
+ * @param end Pointer to the first element after the searched range
+ * @return Pointer to the first element after the separator, or `end` if no separator was found
+ */
+__inline__ __device__ char const* next_after(char const* sep_pos, char const* end)
+{
+  return sep_pos < end ? sep_pos + 1 : end;
+}
+
+/**
  * @brief Extracts the Day, Month, and Year from a string.
  *
  * This function takes a string and produces a `year_month_day` representation.
@@ -79,7 +95,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     y = year{to_non_negative_integer<int32_t>(begin, sep_pos)};  //  year is signed
 
     // Month
-    auto s2 = sep_pos + 1;
+    auto s2 = next_after(sep_pos, end);
     sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
     if (sep_pos == end) {
@@ -89,7 +105,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
 
     } else {
       m = month{to_non_negative_integer<uint32_t>(s2, sep_pos)};
-      d = day{to_non_negative_integer<uint32_t>((sep_pos + 1), end)};
+      d = day{to_non_negative_integer<uint32_t>(next_after(sep_pos, end), end)};
     }
 
   } else {
@@ -97,16 +113,16 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     if (dayfirst) {
       d = day{to_non_negative_integer<uint32_t>(begin, sep_pos)};
 
-      auto s2 = sep_pos + 1;
+      auto s2 = next_after(sep_pos, end);
       sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
       m = month{to_non_negative_integer<uint32_t>(s2, sep_pos)};
-      y = year{to_non_negative_integer<int32_t>((sep_pos + 1), end)};
+      y = year{to_non_negative_integer<int32_t>(next_after(sep_pos, end), end)};
 
     } else {
       m = month{to_non_negative_integer<uint32_t>(begin, sep_pos)};
 
-      auto s2 = sep_pos + 1;
+      auto s2 = next_after(sep_pos, end);
       sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
       if (sep_pos == end) {
@@ -116,7 +132,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
 
       } else {
         d = day{to_non_negative_integer<uint32_t>(s2, sep_pos)};
-        y = year{to_non_negative_integer<int32_t>((sep_pos + 1), end)};
+        y = year{to_non_negative_integer<int32_t>(next_after(sep_pos, end), end)};
       }
     }
   }
@@ -143,17 +159,16 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
 {
   constexpr char sep = ':';
 
-  // Adjust for AM/PM and any whitespace before
+  // Adjust for AM/PM and any whitespace before. The field can be shorter than the suffix (e.g. a
+  // lone "M"), so the checks never look before `begin`.
   duration_h d_h{0};
-  auto last = end - 1;
-  if (*last == 'M' || *last == 'm') {
-    if (*(last - 1) == 'P' || *(last - 1) == 'p') { d_h = duration_h{12}; }
-    last = last - 2;
-    while (*last == ' ') {
-      --last;
+  if (end > begin && (end[-1] == 'M' || end[-1] == 'm')) {
+    if (end - begin >= 2 && (end[-2] == 'P' || end[-2] == 'p')) { d_h = duration_h{12}; }
+    end = (end - begin >= 2) ? end - 2 : begin;
+    while (end > begin && end[-1] == ' ') {
+      --end;
     }
   }
-  end = last + 1;
 
   // Find hour-minute separator
   auto const hm_sep = thrust::find(thrust::seq, begin, end, sep);
@@ -165,11 +180,12 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
   duration_ms d_ms{0};
 
   // Find minute-second separator (if present)
-  auto const ms_sep = thrust::find(thrust::seq, hm_sep + 1, end, sep);
+  auto const minutes_begin = next_after(hm_sep, end);
+  auto const ms_sep        = thrust::find(thrust::seq, minutes_begin, end, sep);
   if (ms_sep == end) {
-    d_m = duration_m{to_non_negative_integer<int32_t>(hm_sep + 1, end)};
+    d_m = duration_m{to_non_negative_integer<int32_t>(minutes_begin, end)};
   } else {
-    d_m = duration_m{to_non_negative_integer<int32_t>(hm_sep + 1, ms_sep)};
+    d_m = duration_m{to_non_negative_integer<int32_t>(minutes_begin, ms_sep)};
 
     // Find second-millisecond separator (if present)
     auto const sms_sep = thrust::find(thrust::seq, ms_sep + 1, end, '.');
@@ -257,7 +273,7 @@ __inline__ __device__ timestamp_type to_timestamp(char const* begin, char const*
 template <typename T>
 __inline__ __device__ T parse_integer(char const** begin, char const* end)
 {
-  bool const is_negative = (**begin == '-');
+  bool const is_negative = (*begin < end && **begin == '-');
   T value                = 0;
 
   auto cur = *begin + is_negative;
@@ -288,7 +304,7 @@ __inline__ __device__ T parse_integer(char const** begin, char const* end)
 template <typename T>
 __inline__ __device__ T parse_optional_integer(char const** begin, char const* end, char delimiter)
 {
-  if (**begin != delimiter) { return 0; }
+  if (*begin >= end || **begin != delimiter) { return 0; }
 
   ++(*begin);
   return parse_integer<T>(begin, end);
@@ -357,7 +373,7 @@ __inline__ __device__ duration_type to_duration(char const* begin, char const* e
   auto const after_days_sep     = skip_if_starts_with(cur, end, "days");
   auto const has_days_seperator = (after_days_sep != cur);
   cur                           = skip_spaces(after_days_sep, end);
-  cur += (*cur == '+');
+  cur += (cur < end && *cur == '+');
 
   duration_D d_d{0};
   duration_h d_h{0};
@@ -376,7 +392,7 @@ __inline__ __device__ duration_type to_duration(char const* begin, char const* e
 
   if constexpr (std::is_same_v<duration_type, cudf::duration_s>) { return output_d; }
 
-  auto const d_ns = (*cur != '.') ? duration_ns{0} : [&]() {
+  auto const d_ns = (cur >= end || *cur != '.') ? duration_ns{0} : [&]() {
     auto const start_subsecond     = ++cur;
     auto const unscaled_subseconds = parse_integer<int64_t>(&cur, end);
     auto const scale               = min(9L, cur - start_subsecond) - 9;

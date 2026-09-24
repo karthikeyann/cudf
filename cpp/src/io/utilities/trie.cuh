@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2018-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2018-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -37,10 +37,17 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
   auto curr_node = trie.begin() + 1;
   for (auto curr_key = key.begin(); curr_key < key.end(); ++curr_key) {
     // Don't jump away from root node
-    if (curr_key != key.begin()) { curr_node += curr_node->children_offset; }
+    if (curr_key != key.begin()) {
+      // A node without children has a negative offset: no key continues past it. Following the
+      // offset would resume the search at an unrelated node and could report a false match.
+      if (curr_node->children_offset < 0) { return false; }
+      curr_node += curr_node->children_offset;
+    }
     // Search for the next character in the array of children nodes
-    // Nodes are sorted - terminate search if the node is larger or equal
-    while (curr_node->character != trie_terminating_character && curr_node->character < *curr_key) {
+    // Nodes are sorted as unsigned bytes - terminate search if the node is larger or equal
+    auto const key_char = static_cast<unsigned char>(*curr_key);
+    while (curr_node->character != trie_terminating_character &&
+           static_cast<unsigned char>(curr_node->character) < key_char) {
       ++curr_node;
     }
     // Could not find the next character, done with the search
