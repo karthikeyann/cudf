@@ -4618,6 +4618,102 @@ TEST_F(CsvReaderTest, NaValuesOfLargeTries)
   });
 }
 
+TEST_F(CsvReaderTest, NullMasksOfManyColumns)
+{
+  // Columns of each decoded type, with string columns among them. The null masks of the other
+  // columns are zeroed together before decoding, entirely: the bits past the last row stay unset.
+  constexpr int num_columns = 100;
+  constexpr int num_rows    = 70;
+  auto const column_types   = std::vector<data_type>{
+    dtype<int64_t>(), dtype<double>(), dtype<cudf::string_view>(), dtype<bool>(), dtype<int32_t>()};
+  auto const is_valid = [](int row, int col) { return (row + col) % 7 != 0; };
+
+  std::string buffer;
+  for (int row = 0; row < num_rows; ++row) {
+    for (int col = 0; col < num_columns; ++col) {
+      if (col != 0) { buffer += ','; }
+      if (not is_valid(row, col)) {
+        buffer += "NA";
+        continue;
+      }
+      switch (col % column_types.size()) {
+        case 0: buffer += std::to_string(row * 1000 + col); break;
+        case 1: buffer += std::to_string(row) + ".25"; break;
+        case 2: buffer += "s" + std::to_string(row); break;
+        case 3: buffer += row % 2 == 0 ? "true" : "false"; break;
+        default: buffer += std::to_string(-row); break;
+      }
+    }
+    buffer += '\n';
+  }
+
+  std::vector<data_type> dtypes;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (int col = 0; col < num_columns; ++col) {
+    auto const valid = cudf::detail::make_counting_transform_iterator(
+      0, [&, col](int row) { return is_valid(row, col); });
+    dtypes.push_back(column_types[col % column_types.size()]);
+    switch (col % column_types.size()) {
+      case 0: {
+        auto const values = cudf::detail::make_counting_transform_iterator(
+          0, [col](int row) { return int64_t{row} * 1000 + col; });
+        columns.push_back(column_wrapper<int64_t>(values, values + num_rows, valid).release());
+        break;
+      }
+      case 1: {
+        auto const values =
+          cudf::detail::make_counting_transform_iterator(0, [](int row) { return row + 0.25; });
+        columns.push_back(column_wrapper<double>(values, values + num_rows, valid).release());
+        break;
+      }
+      case 2: {
+        auto const values = cudf::detail::make_counting_transform_iterator(
+          0, [](int row) { return "s" + std::to_string(row); });
+        columns.push_back(
+          cudf::test::strings_column_wrapper(values, values + num_rows, valid).release());
+        break;
+      }
+      case 3: {
+        auto const values =
+          cudf::detail::make_counting_transform_iterator(0, [](int row) { return row % 2 == 0; });
+        columns.push_back(column_wrapper<bool>(values, values + num_rows, valid).release());
+        break;
+      }
+      default: {
+        auto const values =
+          cudf::detail::make_counting_transform_iterator(0, [](int row) { return -row; });
+        columns.push_back(column_wrapper<int32_t>(values, values + num_rows, valid).release());
+        break;
+      }
+    }
+  }
+  auto const expected = cudf::table{std::move(columns)};
+
+  with_each_row_staging_policy([&] {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(buffer).header(-1).dtypes(dtypes).build());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+    constexpr auto word_bits = cudf::detail::size_in_bits<cudf::bitmask_type>();
+    auto const mask_words =
+      cudf::bitmask_allocation_size_bytes(num_rows) / sizeof(cudf::bitmask_type);
+    for (int col = 0; col < num_columns; ++col) {
+      if (dtypes[col].id() == cudf::type_id::STRING) { continue; }
+      auto const mask = cudf::detail::make_std_vector(
+        cudf::device_span<cudf::bitmask_type const>{result.tbl->view().column(col).null_mask(),
+                                                    mask_words},
+        cudf::get_default_stream());
+      for (auto word = static_cast<size_t>(num_rows / word_bits); word < mask.size(); ++word) {
+        // The bits of the rows in the word
+        auto const first_row = static_cast<int>(word * word_bits);
+        auto const row_bits  = first_row >= num_rows
+                                 ? cudf::bitmask_type{0}
+                                 : (cudf::bitmask_type{1} << (num_rows - first_row)) - 1;
+        EXPECT_EQ(mask[word] & ~row_bits, 0u) << "column " << col << ", word " << word;
+      }
+    }
+  });
+}
+
 TEST_F(CsvReaderTest, TypeInferenceOfShortRows)
 {
   // Rows of fields of 1 to 3 characters, with the counts of each block in shared memory (up to 32

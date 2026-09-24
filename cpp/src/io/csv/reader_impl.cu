@@ -16,6 +16,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/batched_memset.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -796,19 +797,27 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
   std::vector<column_buffer> out_buffers;
   out_buffers.reserve(column_types.size());
 
+  // The null masks of the non-string columns, all zeroed with a single batched memset
+  std::vector<device_span<bitmask_type>> null_masks;
+  auto const mask_words = bitmask_allocation_size_bytes(num_records) / sizeof(bitmask_type);
   for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
     if (column_flags[col] & column_parse::enabled) {
       // Only the string (pointer, length) pairs need zeroing, for the fields missing from short
       // rows; the decode kernel writes the other data wherever it is valid (see
-      // decode_row_column_data)
+      // decode_row_column_data). String columns get their null masks when they are built from the
+      // pairs, so their buffers have none.
       auto const is_string = column_types[active_col].id() == type_id::STRING;
-      auto out_buffer      = column_buffer(column_types[active_col], true);
-      out_buffer.create(num_records, is_string, stream, mr);
+      auto out_buffer      = column_buffer(column_types[active_col], not is_string);
+      out_buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, is_string, stream, mr);
+      if (not is_string) { null_masks.emplace_back(out_buffer.null_mask(), mask_words); }
 
       out_buffer.name = column_names[col];
       out_buffers.emplace_back(std::move(out_buffer));
       active_col++;
     }
+  }
+  if (not null_masks.empty()) {
+    cudf::detail::batched_memset<bitmask_type>(null_masks, bitmask_type{0}, stream);
   }
 
   auto h_data  = cudf::detail::make_host_vector<void*>(num_active_columns, stream);
