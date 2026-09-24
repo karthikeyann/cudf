@@ -754,21 +754,22 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
  *
  * Pairs are matched left to right without overlap, so the result is the same as replacing every
  * occurrence of the two-character string with the one-character string (`""""` becomes `""`).
- * `out` must hold a copy of the content, or be the content itself: the characters before the
- * first pair are not written, and the write position never passes the read position, which makes
- * the in-place update safe. Content without escaped pairs is not written. Characters of `out` past
- * the returned length are left in an unspecified state.
+ * Content without escaped pairs is not written. `out` may already hold the content: it may be the
+ * content itself (the write position never passes the read position, which makes the in-place
+ * update safe), or the location that a staged copy of the content was copied from. The characters
+ * before the first pair are then not written. Characters of `out` past the returned length are
+ * left in an unspecified state.
  *
  * @param content First character of the content (after the opening quote)
  * @param length Number of characters in the content (excluding the closing quote)
- * @param out Copy of the content, or the content itself, that receives the unescaped content
+ * @param out Output location of the unescaped content
+ * @param out_holds_content Whether `out` holds the content (or is the content itself)
  * @param quotechar Quote character
- * @return Length of the unescaped content
+ * @return Length of the unescaped content, which is `length` if and only if the content has no
+ * escaped pairs (and was not written)
  */
-__device__ __forceinline__ size_t unescape_doublequotes(char const* content,
-                                                        size_t length,
-                                                        char* out,
-                                                        char quotechar)
+__device__ __forceinline__ size_t unescape_doublequotes(
+  char const* content, size_t length, char* out, bool out_holds_content, char quotechar)
 {
   auto const end = content + length;
   auto in        = content;
@@ -778,7 +779,11 @@ __device__ __forceinline__ size_t unescape_doublequotes(char const* content,
   if (in + 1 >= end) { return length; }
 
   auto const out_begin = out;
-  out += in - content;
+  if (out_holds_content) {
+    out += in - content;
+  } else {
+    out = cuda::std::copy(content, in, out);
+  }
   while (in < end) {
     auto const c = *in;
     *out++       = c;
@@ -801,9 +806,12 @@ __device__ __forceinline__ size_t unescape_doublequotes(char const* content,
  * staged rows can use all of the default limit; the `RowsAroundStagingLimit` test relies on this,
  * and must be updated if static shared memory is added.
  *
- * When `options.doublequote` is set, the escaped quote pairs of quoted string fields are collapsed
- * in place in `data`, and the string pairs point to the unescaped content in `data` (never to a
- * staged copy). This relies on three invariants:
+ * String pairs point into `data`, never into a staged copy. When `options.doublequote` is set, the
+ * escaped quote pairs of each quoted string field are collapsed into `unescape_buffer`, at the
+ * offset of the field in `data`, and the field's string pair points there instead. Each field is
+ * written by the thread of its row only, so this is race-free when `unescape_buffer` is scratch
+ * memory. When the reader owns `data`, `unescape_buffer` is `data` itself, and the fields are
+ * unescaped in place, which relies on three invariants:
  * - All bytes used for row `i` lie within its byte range `[row_offsets[i], row_offsets[i + 1])`,
  *   and the ranges of different rows do not overlap, so each byte is used by one thread only.
  *   Loads that cover bytes outside the row, such as the word loads of `seek_field_end_by_words`,
@@ -815,8 +823,14 @@ __device__ __forceinline__ size_t unescape_doublequotes(char const* content,
  *   of the field are still those of the copy.
  * No other code reads `data` after this kernel, except to copy the strings it describes.
  *
+ * `data` is never written otherwise, and no character outside of the rows is read, so `data` may
+ * be the caller's buffer.
+ *
  * @param[in] options A set of parsing options
- * @param[in,out] data The entire CSV data to read; quoted string fields are unescaped in place
+ * @param[in] data The entire CSV data to read
+ * @param[out] unescape_buffer Memory of the size of `data` that receives the unescaped quoted
+ * string fields; may be `data` itself, and may be empty if `options.doublequote` is not set or no
+ * column is a string column
  * @param[in] column_flags Per-column parsing behavior flags
  * @param[in] row_offsets The start the CSV data of interest
  * @param[in] dtypes The data type of the column
@@ -827,7 +841,8 @@ __device__ __forceinline__ size_t unescape_doublequotes(char const* content,
 template <bool stage_rows>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
-                      device_span<char> data,
+                      device_span<char const> data,
+                      device_span<char> unescape_buffer,
                       device_span<column_parse::flags const> column_flags,
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
@@ -836,7 +851,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       size_t staging_size)
 {
   extern __shared__ uint4 staging_buffer[];
-  // Fields are parsed through a read-only view; only string unescaping writes to `data`
   auto const chars = [&] {
     if constexpr (stage_rows) {
       return stage_block_rows(
@@ -909,16 +923,29 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
               }
             }
           }
-          // The string is the field's content in `data`
-          auto const content = data.data() + chars.offset_of(field_start);
-          // A quoted field has both of its quotes, so the content length is not negative
+          // The string is the field's content in `data`, or its unescaped content in
+          // `unescape_buffer`, at the same offset. A quoted field has both of its quotes, so the
+          // content length is not negative.
+          auto const offset = chars.offset_of(field_start);
+          char const* str   = data.data() + offset;
+          size_t length     = end - field_start;
           if (was_quoted && options.doublequote) {
-            end = field_start +
-                  unescape_doublequotes(field_start, end - field_start, content, options.quotechar);
+            // In place, `unescape_buffer` is `data`, which holds the content
+            auto const unescaped = unescape_buffer.data() + offset;
+            auto const unescaped_length =
+              unescape_doublequotes(field_start,
+                                    length,
+                                    unescaped,
+                                    unescape_buffer.data() == data.data(),
+                                    options.quotechar);
+            if (unescaped_length != length) {
+              str    = unescaped;
+              length = unescaped_length;
+            }
           }
           auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-          str_list[rec_id].first  = content;
-          str_list[rec_id].second = end - field_start;
+          str_list[rec_id].first  = str;
+          str_list[rec_id].second = length;
         } else {
           if (cudf::type_dispatcher(dtypes[actual_col],
                                     ConvertFunctor{},
@@ -1785,7 +1812,8 @@ void compute_row_staging_size(device_span<uint64_t const> row_offsets,
 }
 
 void decode_row_column_data(cudf::io::parse_options_view const& options,
-                            device_span<char> data,
+                            device_span<char const> data,
+                            device_span<char> unescape_buffer,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
@@ -1804,7 +1832,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   auto const kernel    = stage_rows ? convert_csv_to_cudf<true> : convert_csv_to_cudf<false>;
   auto const smem_size = stage_rows ? staging_size : 0;
   kernel<<<grid_size, block_size, smem_size, stream.get()>>>(
-    options, data, column_flags, row_offsets, dtypes, columns, valids, smem_size);
+    options, data, unescape_buffer, column_flags, row_offsets, dtypes, columns, valids, smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

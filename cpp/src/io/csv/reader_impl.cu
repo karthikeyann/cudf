@@ -254,13 +254,53 @@ void read_source_to_device(datasource* source,
 }
 
 /**
+ * @brief Returns a view of a range of the source in device memory, if the source holds it there.
+ *
+ * The data of sources whose device reads return views of their memory (see
+ * `datasource::supports_zero_copy_device_read`) can be parsed where it is, without a copy. This
+ * does not depend on whether the source prefers device reads: a view involves no read.
+ *
+ * @param source The source to read from
+ * @param offset Position of the range in the source
+ * @param size Size of the range
+ * @param stream CUDA stream of the read
+ * @return The view, or nullptr if the range must be copied (or is empty, which needs no read)
+ */
+std::unique_ptr<datasource::buffer> view_source_on_device(datasource* source,
+                                                          size_t offset,
+                                                          size_t size,
+                                                          cuda::stream_ref stream)
+{
+  if (size == 0 or not source->supports_device_read() or
+      not source->supports_zero_copy_device_read()) {
+    return nullptr;
+  }
+  auto view = source->device_read(offset, size, stream);
+  CUDF_EXPECTS(view->size() == size, "Unexpected end of the CSV source data");
+  return view;
+}
+
+/**
  * @brief Input data in device memory, and the rows of it to read.
+ *
+ * The data is either a copy owned by the reader, or a view of the source's device memory, which the
+ * reader must not modify.
  */
 struct data_and_row_offsets {
-  rmm::device_uvector<char> data;
+  /// Copy of the input data, unless it is viewed in the source
+  rmm::device_uvector<char> owned_data;
+  /// View of the input data in the source's device memory, if it is not copied
+  std::unique_ptr<datasource::buffer> source_data;
   selected_rows_offsets row_offsets;
   /// Shared memory size with which the decoding kernels stage the rows of each block
   size_t row_staging_size = 0;
+
+  /// Returns the input data
+  [[nodiscard]] device_span<char const> data() const
+  {
+    if (source_data == nullptr) { return owned_data; }
+    return {reinterpret_cast<char const*>(source_data->data()), source_data->size()};
+  }
 };
 
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
@@ -334,12 +374,25 @@ data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* sour
   };
 
   rmm::device_uvector<char> d_data{0, stream};
+  std::unique_ptr<datasource::buffer> source_data;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
   if (load_whole_file) {
-    // Without row selection, the whole file is loaded and its rows gathered in a single pass
-    d_data.resize(max_input_size - input_pos, stream);
-    load_input(byte_range_offset + input_pos, d_data);
-    all_row_offsets = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(), d_data, stream);
+    // Without row selection, the whole file is loaded and its rows gathered in a single pass. The
+    // data of device sources that allow it is parsed where the source holds it, without a copy.
+    auto const read_offset = byte_range_offset + input_pos;
+    auto const read_size   = max_input_size - input_pos;
+    if (not data.has_value()) {
+      source_data = view_source_on_device(source, read_offset, read_size, stream);
+    }
+    if (source_data == nullptr) {
+      d_data.resize(read_size, stream);
+      load_input(read_offset, d_data);
+    }
+    auto const input =
+      source_data == nullptr
+        ? device_span<char const>{d_data}
+        : device_span<char const>{reinterpret_cast<char const*>(source_data->data()), read_size};
+    all_row_offsets = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(), input, stream);
   } else {
     // Reading in chunks bounds the work done before reaching the end of the byte range or the
     // requested number of rows
@@ -515,7 +568,7 @@ data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* sour
       }
     }
   }
-  return {std::move(d_data), std::move(row_offsets), row_staging_size};
+  return {std::move(d_data), std::move(source_data), std::move(row_offsets), row_staging_size};
 }
 
 data_and_row_offsets select_data_and_row_offsets(cudf::io::datasource* source,
@@ -542,7 +595,7 @@ data_and_row_offsets select_data_and_row_offsets(cudf::io::datasource* source,
                "byte_range offset with header not supported");
 
   if (source->is_empty()) {
-    return {rmm::device_uvector<char>{0, stream}, selected_rows_offsets{stream}};
+    return {rmm::device_uvector<char>{0, stream}, nullptr, selected_rows_offsets{stream}};
   }
 
   std::optional<host_span<char const>> h_data;
@@ -711,13 +764,15 @@ void infer_column_types(parse_options const& parse_opts,
 /**
  * @brief Decodes the selected rows into column buffers.
  *
- * Quoted string fields are unescaped in place in `data` (see `decode_row_column_data`), so the
- * returned string buffers reference `data` and are only valid while it is alive and unmodified.
+ * Quoted string fields with escaped quotes are unescaped into `unescape_buffer`, which may be
+ * `data` itself (see `decode_row_column_data`), so the returned string buffers reference both, and
+ * are only valid while they are alive and unmodified.
  */
 std::vector<column_buffer> decode_data(parse_options const& parse_opts,
                                        host_span<column_parse::flags const> column_flags,
                                        std::vector<std::string> const& column_names,
-                                       device_span<char> data,
+                                       device_span<char const> data,
+                                       device_span<char> unescape_buffer,
                                        device_span<uint64_t const> row_offsets,
                                        size_t row_staging_size,
                                        host_span<data_type const> column_types,
@@ -757,6 +812,7 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
   cudf::io::csv::gpu::decode_row_column_data(
     parse_opts.view(),
     data,
+    unescape_buffer,
     make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
     row_offsets,
     make_device_uvector_async(column_types, stream, cudf::get_current_device_resource_ref()),
@@ -835,11 +891,10 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 {
   std::vector<char> header;
 
-  // The reader owns a copy of the data, which decoding modifies (quoted strings are unescaped)
   auto data_row_offsets =
     select_data_and_row_offsets(source, reader_opts, header, parse_opts, stream);
 
-  auto& data              = data_row_offsets.data;
+  auto const data         = data_row_offsets.data();
   auto const& row_offsets = data_row_offsets.row_offsets;
 
   auto const unique_use_cols_indexes = std::set(reader_opts.get_use_cols_indexes().cbegin(),
@@ -1049,11 +1104,26 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   auto out_columns = std::vector<std::unique_ptr<cudf::column>>();
   out_columns.reserve(column_types.size());
   if (num_records != 0) {
+    // Quoted string fields with escaped quotes are unescaped in place in the reader's copy of the
+    // data, or into scratch memory when the data is the source's, which must not be modified
+    rmm::device_uvector<char> unescape_scratch{0, stream};
+    auto const unescape_buffer = [&]() -> device_span<char> {
+      if (data_row_offsets.source_data == nullptr) { return data_row_offsets.owned_data; }
+      auto const has_string_columns =
+        std::any_of(column_types.begin(), column_types.end(), [](auto const& type) {
+          return type.id() == type_id::STRING;
+        });
+      if (parse_opts.doublequote and has_string_columns) {
+        unescape_scratch.resize(data.size(), stream);
+      }
+      return unescape_scratch;
+    }();
     auto out_buffers = decode_data(  //
       parse_opts,
       column_flags,
       column_names,
       data,
+      unescape_buffer,
       row_offsets,
       data_row_offsets.row_staging_size,
       column_types,

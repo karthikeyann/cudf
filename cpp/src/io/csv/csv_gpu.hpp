@@ -244,14 +244,19 @@ std::vector<column_type_histogram> detect_column_types(
 /**
  * @brief Launches kernel for decoding row-column data
  *
- * String columns are output as (pointer, length) pairs that point into `data`. When
- * `options.doublequote` is set, escaped quote pairs in quoted string fields are collapsed in place
- * in `data`, so the pairs describe the unescaped strings. `data` must therefore be owned by the
- * reader (never a caller's buffer), and decoding must be its last use other than building the
- * string columns from the pairs.
+ * String columns are output as (pointer, length) pairs that point into `data`, except for the
+ * quoted fields with escaped quote pairs when `options.doublequote` is set: the pairs are
+ * collapsed into `unescape_buffer`, at the offsets of the fields in `data`, and the (pointer,
+ * length) pairs describe the unescaped strings there. `unescape_buffer` is either scratch memory or
+ * `data` itself, in which case the fields are unescaped in place. It must be owned by the reader
+ * (never a caller's buffer), and when it is `data`, decoding must be the last use of `data` other
+ * than building the string columns from the pairs.
  *
  * @param[in] options Options that control individual field data conversion
- * @param[in,out] data The row-column data; quoted string fields are unescaped in place
+ * @param[in] data The row-column data
+ * @param[out] unescape_buffer Memory of the size of `data` that receives the unescaped quoted
+ * string fields, at the offsets of the fields in `data`; may be `data` itself, and may be empty if
+ * `options.doublequote` is not set or no column is a string column
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] dtypes List of dtype corresponding to each column
@@ -265,7 +270,8 @@ std::vector<column_type_histogram> detect_column_types(
  * @param[in] stream CUDA stream to use
  */
 void decode_row_column_data(cudf::io::parse_options_view const& options,
-                            device_span<char> data,
+                            device_span<char const> data,
+                            device_span<char> unescape_buffer,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
