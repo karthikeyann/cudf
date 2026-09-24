@@ -24,7 +24,11 @@
 #include <thrust/host_vector.h>
 
 #include <cstddef>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <numeric>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -440,6 +444,149 @@ TEST(HostDeviceSpanTest, CanGetFromDevice)
 
   message.device_to_host(cudf::get_default_stream());
   expect_match("world hello", cudf::detail::hostdevice_span<char>(message));
+}
+
+namespace {
+using arrays_type = cudf::detail::hostdevice_arrays<char, double, int16_t, char const*>;
+
+template <typename T>
+bool is_aligned(T const* ptr)
+{
+  return reinterpret_cast<std::uintptr_t>(ptr) % alignof(T) == 0;
+}
+
+/// Checks that each array is aligned and follows the previous one without overlapping it
+template <typename T, typename... Rest>
+void expect_aligned_and_ordered(std::byte const* host_end,
+                                std::byte const* device_end,
+                                cudf::detail::hostdevice_span<T> first,
+                                cudf::detail::hostdevice_span<Rest>... rest)
+{
+  EXPECT_TRUE(is_aligned(first.host_ptr()));
+  EXPECT_TRUE(is_aligned(first.device_ptr()));
+  EXPECT_GE(reinterpret_cast<std::byte const*>(first.host_ptr()), host_end);
+  EXPECT_GE(reinterpret_cast<std::byte const*>(first.device_ptr()), device_end);
+  if constexpr (sizeof...(Rest) > 0) {
+    expect_aligned_and_ordered(reinterpret_cast<std::byte const*>(first.host_end()),
+                               reinterpret_cast<std::byte const*>(first.device_end()),
+                               rest...);
+  }
+}
+
+/**
+ * @brief Sets the integrated memory optimization policy (the
+ * `LIBCUDF_INTEGRATED_MEMORY_OPTIMIZATION` environment variable, read when a `hostdevice_vector` is
+ * created) for the lifetime of the object, and then restores the previous one.
+ */
+class integrated_memory_optimization_setter {
+ public:
+  explicit integrated_memory_optimization_setter(char const* policy)
+  {
+    if (auto const* previous = std::getenv(variable); previous != nullptr) { _previous = previous; }
+    setenv(variable, policy, 1);
+  }
+  integrated_memory_optimization_setter(integrated_memory_optimization_setter const&) = delete;
+  integrated_memory_optimization_setter& operator=(integrated_memory_optimization_setter const&) =
+    delete;
+  ~integrated_memory_optimization_setter()
+  {
+    if (_previous.has_value()) {
+      setenv(variable, _previous->c_str(), 1);
+    } else {
+      unsetenv(variable);
+    }
+  }
+
+ private:
+  static constexpr char const* variable = "LIBCUDF_INTEGRATED_MEMORY_OPTIMIZATION";
+  std::optional<std::string> _previous;
+};
+
+CUDF_KERNEL void negate_kernel(device_span<double> doubles, device_span<int16_t> shorts)
+{
+  for (auto& value : doubles) {
+    value = -value;
+  }
+  for (auto& value : shorts) {
+    value = -value;
+  }
+}
+}  // namespace
+
+TEST(HostDeviceArraysTest, ArraysAreAlignedAndDisjoint)
+{
+  // Sizes that leave the end of each array unaligned for the next one
+  auto arrays = arrays_type({3, 5, 7, 2}, cudf::get_default_stream());
+  auto const [chars, doubles, shorts, pointers] = arrays.spans();
+  EXPECT_EQ(chars.size(), 3);
+  EXPECT_EQ(doubles.size(), 5);
+  EXPECT_EQ(shorts.size(), 7);
+  EXPECT_EQ(pointers.size(), 2);
+  expect_aligned_and_ordered(reinterpret_cast<std::byte const*>(chars.host_ptr()),
+                             reinterpret_cast<std::byte const*>(chars.device_ptr()),
+                             chars,
+                             doubles,
+                             shorts,
+                             pointers);
+}
+
+TEST(HostDeviceArraysTest, CopiesBetweenHostAndDevice)
+{
+  // With the integrated memory optimization, the device accesses the host copy of the arrays, and
+  // the copies between them are skipped
+  for (auto const* single_copy : {"OFF", "ON"}) {
+    SCOPED_TRACE(std::string{"integrated memory optimization "} + single_copy);
+    integrated_memory_optimization_setter const setter{single_copy};
+    auto const stream                             = cudf::get_default_stream();
+    auto arrays                                   = arrays_type({3, 5, 7, 2}, stream);
+    auto const [chars, doubles, shorts, pointers] = arrays.spans();
+    std::string const text                        = "abc";
+    std::copy(text.begin(), text.end(), chars.host_begin());
+    std::iota(doubles.host_begin(), doubles.host_end(), 0.5);
+    std::iota(shorts.host_begin(), shorts.host_end(), int16_t{-3});
+    pointers[0] = text.data();
+    pointers[1] = nullptr;
+    arrays.host_to_device_async(stream);
+
+    // All arrays are copied to the device
+    EXPECT_EQ(cudf::detail::make_std_vector(device_span<char const>{chars}, stream),
+              std::vector<char>(text.begin(), text.end()));
+    EXPECT_EQ(cudf::detail::make_std_vector(device_span<double const>{doubles}, stream),
+              std::vector<double>({0.5, 1.5, 2.5, 3.5, 4.5}));
+    EXPECT_EQ(cudf::detail::make_std_vector(device_span<int16_t const>{shorts}, stream),
+              std::vector<int16_t>({-3, -2, -1, 0, 1, 2, 3}));
+    EXPECT_EQ(cudf::detail::make_std_vector(device_span<char const* const>{pointers}, stream),
+              std::vector<char const*>({text.data(), nullptr}));
+
+    // All arrays are copied back
+    negate_kernel<<<1, 1, 0, stream.get()>>>(doubles, shorts);
+    arrays.device_to_host(stream);
+    EXPECT_EQ(std::vector<double>(doubles.host_begin(), doubles.host_end()),
+              std::vector<double>({-0.5, -1.5, -2.5, -3.5, -4.5}));
+    EXPECT_EQ(std::vector<int16_t>(shorts.host_begin(), shorts.host_end()),
+              std::vector<int16_t>({3, 2, 1, 0, -1, -2, -3}));
+    EXPECT_EQ(std::string(chars.host_begin(), chars.host_end()), text);
+  }
+}
+
+TEST(HostDeviceArraysTest, EmptyArrays)
+{
+  auto arrays = arrays_type({0, 2, 0, 0}, cudf::get_default_stream());
+  auto const [chars, doubles, shorts, pointers] = arrays.spans();
+  EXPECT_TRUE(chars.is_empty());
+  EXPECT_EQ(doubles.size(), 2);
+  EXPECT_TRUE(shorts.is_empty());
+  EXPECT_TRUE(pointers.is_empty());
+  EXPECT_TRUE(is_aligned(doubles.host_ptr()));
+  EXPECT_TRUE(is_aligned(doubles.device_ptr()));
+  arrays.host_to_device_async(cudf::get_default_stream());
+
+  // No storage at all
+  auto no_arrays = cudf::detail::hostdevice_arrays<int, double>({0, 0}, cudf::get_default_stream());
+  auto const [ints, no_doubles] = no_arrays.spans();
+  EXPECT_TRUE(ints.is_empty());
+  EXPECT_TRUE(no_doubles.is_empty());
+  no_arrays.host_to_device_async(cudf::get_default_stream());
 }
 
 CUDF_TEST_PROGRAM_MAIN()
