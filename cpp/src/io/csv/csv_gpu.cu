@@ -32,6 +32,7 @@
 #include <thrust/count.h>
 #include <thrust/detail/copy.h>
 #include <thrust/remove.h>
+#include <thrust/scan.h>
 #include <thrust/transform.h>
 
 #include <type_traits>
@@ -969,6 +970,196 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   }
 }
 
+/**
+ * @brief Slices per thread in single-pass row gathering.
+ *
+ * Determines the tile size (32KB). Larger tiles need less per-tile work (block scans, transitions,
+ * row counts) but make the repair of a mis-speculated tile more expensive; with 1, 2 and 4 slices
+ * per thread, the total row gathering time of 2 is within 3% of the best on the CSV reader
+ * benchmarks with 0% to 100% quoted fields.
+ */
+constexpr uint32_t tile_slices_per_thread = 2;
+/// Slices per tile, the data processed by one thread block in single-pass row gathering
+constexpr uint32_t tile_slices = rowofs_block_dim * tile_slices_per_thread;
+/// Characters per tile (32KB)
+constexpr size_t tile_chars = static_cast<size_t>(tile_slices) * slice_chars;
+
+/**
+ * @brief Parser state transition function of a range of characters: the output state for each
+ * input state, 2 bits per input state in the order NONE, QUOTE, COMMENT, EOF.
+ */
+using state_transition = uint8_t;
+
+/// Transition of an empty range
+constexpr state_transition identity_transition =
+  ROW_CTX_NONE | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6);
+
+/**
+ * @brief Composes the transitions of two consecutive ranges (associative, not commutative).
+ */
+struct compose_transitions {
+  __device__ state_transition operator()(state_transition first, state_transition second) const
+  {
+    state_transition result = 0;
+#pragma unroll
+    for (uint32_t state = 0; state < 4; ++state) {
+      auto const mid = (first >> (2 * state)) & 3;
+      result |= ((second >> (2 * mid)) & 3) << (2 * state);
+    }
+    return result;
+  }
+};
+
+/**
+ * @brief Returns the output state of `transition` for the input state `state`.
+ */
+__device__ __forceinline__ uint32_t apply_transition(state_transition transition, uint32_t state)
+{
+  return (transition >> (2 * state)) & 3;
+}
+
+/**
+ * @brief Computes the row start bitmaps of a tile's slices, given the parser state at the start of
+ * the tile.
+ *
+ * Each thread computes the row contexts of its consecutive slices for every input state. A block
+ * scan over the threads' state transitions gives each thread its input state, which selects the
+ * row start bitmaps of its slices.
+ *
+ * @param data Character data
+ * @param chars Characters that determine where rows start
+ * @param tile Index of the tile
+ * @param start_state Parser state at the start of the tile
+ * @param[out] row_bitmaps Row start bitmap of every slice
+ * @param[out] tile_row_counts Number of rows that start in each tile
+ * @return The state transition of the tile, in thread 0
+ */
+__device__ state_transition gather_tile_row_bitmaps(device_span<char const> data,
+                                                    row_parse_chars const& chars,
+                                                    size_t tile,
+                                                    uint32_t start_state,
+                                                    uint32_t* row_bitmaps,
+                                                    uint64_t* tile_row_counts)
+{
+  using block_scan   = cub::BlockScan<state_transition, rowofs_block_dim>;
+  using block_reduce = cub::BlockReduce<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+  __shared__ typename block_reduce::TempStorage reduce_storage;
+
+  auto const t           = threadIdx.x;
+  auto const first_slice = (tile * rowofs_block_dim + t) * tile_slices_per_thread;
+  auto const end         = data.data() + data.size();
+
+  uint4 ctx_maps[tile_slices_per_thread];
+  auto thread_transition = identity_transition;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    auto const slice = data.data() + (first_slice + j) * slice_chars;
+    int const c_prev = (slice > data.data() && slice <= end) ? slice[-1] : chars.terminator;
+    ctx_maps[j]      = slice_row_contexts(slice, end, true, c_prev, chars);
+    thread_transition =
+      compose_transitions{}(thread_transition, static_cast<state_transition>(ctx_maps[j].w));
+  }
+
+  // Input state of the thread: the tile's start state through the transitions of earlier threads
+  state_transition prefix;
+  state_transition tile_transition;
+  block_scan(scan_storage)
+    .ExclusiveScan(
+      thread_transition, prefix, identity_transition, compose_transitions{}, tile_transition);
+  auto state = apply_transition(prefix, start_state);
+
+  uint32_t num_rows = 0;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    auto const rowmap            = select_rowmap(ctx_maps[j], state);
+    row_bitmaps[first_slice + j] = rowmap;
+    num_rows += __popc(rowmap);
+    state = apply_transition(static_cast<state_transition>(ctx_maps[j].w), state);
+  }
+  num_rows = block_reduce(reduce_storage).Sum(num_rows);
+  if (t == 0) { tile_row_counts[tile] = num_rows; }
+  return tile_transition;
+}
+
+/**
+ * @brief Single-pass row gathering, speculative pass: gathers the row start bitmaps of every tile
+ * assuming that it starts in the NONE state, and records the state transition of every tile.
+ *
+ * A tile starts in another state if a quoted field spans its start or ends right before it, so
+ * the assumption fails for roughly the proportion of quoted characters in the data.
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  gather_speculative_row_bitmaps_gpu(device_span<char const> data,
+                                     row_parse_chars chars,
+                                     uint32_t* row_bitmaps,
+                                     uint64_t* tile_row_counts,
+                                     state_transition* tile_transitions)
+{
+  auto const tile = static_cast<size_t>(blockIdx.x);
+  auto const transition =
+    gather_tile_row_bitmaps(data, chars, tile, ROW_CTX_NONE, row_bitmaps, tile_row_counts);
+  if (threadIdx.x == 0) { tile_transitions[tile] = transition; }
+}
+
+/**
+ * @brief Single-pass row gathering, repair pass: gathers the row start bitmaps of a tile again if
+ * it does not start in the NONE state assumed by the speculative pass.
+ *
+ * @param tile_start_transitions Transition from the start of the data to the start of each tile
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  repair_row_bitmaps_gpu(device_span<char const> data,
+                         row_parse_chars chars,
+                         device_span<state_transition const> tile_start_transitions,
+                         uint32_t* row_bitmaps,
+                         uint64_t* tile_row_counts)
+{
+  auto const tile = static_cast<size_t>(blockIdx.x);
+  // The data starts in the NONE state
+  auto const start_state = apply_transition(tile_start_transitions[tile], ROW_CTX_NONE);
+  if (start_state == ROW_CTX_NONE) { return; }
+  gather_tile_row_bitmaps(data, chars, tile, start_state, row_bitmaps, tile_row_counts);
+}
+
+/**
+ * @brief Single-pass row gathering, output pass: converts the row start bitmaps of each tile into
+ * row offsets.
+ *
+ * @param row_bitmaps Row start bitmap of every slice
+ * @param tile_first_rows Index of the first row of each tile
+ * @param[out] offsets Offsets of all rows
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  row_bitmaps_to_offsets_gpu(uint32_t const* row_bitmaps,
+                             uint64_t const* tile_first_rows,
+                             device_span<uint64_t> offsets)
+{
+  using block_scan = cub::BlockScan<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+
+  auto const tile        = static_cast<size_t>(blockIdx.x);
+  auto const first_slice = (tile * rowofs_block_dim + threadIdx.x) * tile_slices_per_thread;
+  uint32_t rowmaps[tile_slices_per_thread];
+  uint32_t num_rows = 0;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    rowmaps[j] = row_bitmaps[first_slice + j];
+    num_rows += __popc(rowmaps[j]);
+  }
+  uint32_t first_row_in_tile;
+  block_scan(scan_storage).ExclusiveSum(num_rows, first_row_in_tile);
+
+  auto row = tile_first_rows[tile] + first_row_in_tile;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    auto const slice_pos = (first_slice + j) * slice_chars;
+    for (auto rowmap = rowmaps[j]; rowmap != 0; rowmap &= rowmap - 1) {
+      offsets[row++] = slice_pos + __ffs(rowmap) - 1;
+    }
+  }
+}
+
 size_t __host__ count_blank_rows(cudf::io::parse_options_view const& opts,
                                  device_span<char const> data,
                                  device_span<uint64_t const> row_offsets,
@@ -1047,6 +1238,51 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(
     options, data, column_flags, row_offsets, dtypes, columns, valids, valid_counts);
   CUDF_CUDA_TRY(cudaGetLastError());
+}
+
+rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& options,
+                                                     device_span<char const> data,
+                                                     cuda::stream_ref stream)
+{
+  // The last tile holds the row that ends the data, at data.size()
+  auto const num_tiles = data.size() / tile_chars + 1;
+  auto const chars     = row_parse_chars::from(options);
+
+  rmm::device_uvector<uint32_t> row_bitmaps(num_tiles * tile_slices, stream);
+  // One more entry than tiles, so that the exclusive scan of the row counts ends with the total
+  rmm::device_uvector<uint64_t> tile_rows(num_tiles + 1, stream);
+  tile_rows.set_element_to_zero_async(num_tiles, stream);
+  rmm::device_uvector<state_transition> tile_transitions(num_tiles, stream);
+
+  gather_speculative_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    data, chars, row_bitmaps.data(), tile_rows.data(), tile_transitions.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+
+  // Transition from the start of the data to the start of each tile
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                         tile_transitions.begin(),
+                         tile_transitions.end(),
+                         tile_transitions.begin(),
+                         identity_transition,
+                         compose_transitions{});
+
+  // Every tile is processed at most once more, so the total work is at most twice that of a single
+  // pass even if the speculation fails for every tile
+  repair_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    data, chars, tile_transitions, row_bitmaps.data(), tile_rows.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+
+  // First row of each tile, followed by the total number of rows
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                         tile_rows.begin(),
+                         tile_rows.end(),
+                         tile_rows.begin());
+  rmm::device_uvector<uint64_t> offsets(tile_rows.element(num_tiles, stream), stream);
+
+  row_bitmaps_to_offsets_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    row_bitmaps.data(), tile_rows.data(), offsets);
+  CUDF_CUDA_TRY(cudaGetLastError());
+  return offsets;
 }
 
 uint32_t __host__ gather_row_offsets(parse_options_view const& options,

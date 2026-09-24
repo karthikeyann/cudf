@@ -10,6 +10,8 @@
 #include <cudf/detail/utilities/host_vector.hpp>
 #include <cudf/types.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <cuda/stream>
 
 using cudf::device_span;
@@ -150,6 +152,25 @@ uint32_t gather_row_offsets(cudf::io::parse_options_view const& options,
                             size_t byte_range_end,
                             size_t skip_rows,
                             cuda::stream_ref stream);
+
+/**
+ * @brief Gathers the offsets of all rows in the given data in a single pass.
+ *
+ * Produces the same row offsets as the two phases of `gather_row_offsets` over the whole data as a
+ * single chunk, with no byte range and no rows to skip, but without a round trip to the host
+ * between the phases. The data is split into tiles that are processed in parallel, each assuming
+ * that it starts outside of quotes; the tiles where that assumption is wrong are then processed
+ * again with their actual starting state, so each tile is processed at most twice.
+ *
+ * @param options Options that control parsing of individual fields
+ * @param data Character data; the first row starts at the beginning
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ *
+ * @return Offsets of the rows in `data`, followed by `data.size()`
+ */
+rmm::device_uvector<uint64_t> gather_all_row_offsets(cudf::io::parse_options_view const& options,
+                                                     device_span<char const> data,
+                                                     cuda::stream_ref stream);
 
 /**
  * Count the number of blank rows in the given row offset array

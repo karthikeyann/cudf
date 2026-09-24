@@ -37,6 +37,7 @@
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <random>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -3734,11 +3735,12 @@ class csv_document {
  public:
   csv_document(char delimiter, char terminator) : _delimiter{delimiter}, _terminator{terminator} {}
 
-  // Appends a row whose string field is written as `field` and reads as `value`
-  void add_row(std::string const& field, std::string const& value)
+  // Appends a row whose string field is written as `field` and reads as `value`; the last field is
+  // quoted if `quote_last`
+  void add_row(std::string const& field, std::string const& value, bool quote_last = false)
   {
     auto const id = static_cast<int32_t>(_ids.size());
-    _text += row_text(id, field);
+    _text += row_text(id, field, quote_last);
     _ids.push_back(id);
     _strings.push_back(value);
     _values.push_back(id + 0.5);
@@ -3793,10 +3795,13 @@ class csv_document {
   }
 
  private:
-  [[nodiscard]] std::string row_text(size_t id, std::string const& field) const
+  [[nodiscard]] std::string row_text(size_t id,
+                                     std::string const& field,
+                                     bool quote_last = false) const
   {
-    auto const text = std::to_string(id);
-    return text + _delimiter + field + _delimiter + text + ".5" + _terminator;
+    auto const text  = std::to_string(id);
+    auto const value = quote_last ? "\"" + text + ".5\"" : text + ".5";
+    return text + _delimiter + field + _delimiter + value + _terminator;
   }
 
   char _delimiter;
@@ -3807,8 +3812,8 @@ class csv_document {
   std::vector<double> _values;
 };
 
-// Reads all rows of the document as a whole file, and also through the chunked row selection path
-// (nrows), and expects both to hold the document's rows
+// Reads all rows of the document as a whole file, which gathers its rows in a single pass, and
+// also through the chunked row selection path (nrows), and expects both to hold the document's rows
 void expect_document_rows(csv_document const& doc, char comment = '\0')
 {
   auto opts         = doc.options().comment(comment).build();
@@ -3855,9 +3860,10 @@ TEST_F(CsvReaderTest, RowBoundariesAcrossBlocks)
 {
   // A probe with quoted fields that hold terminators (also after '\r'), delimiters and escaped
   // quotes, and a comment line is repeated so that it crosses the first four boundaries of the
-  // 16KB blocks of the row gathering. Each character of the probe is placed in turn at the
-  // boundaries, so that every parser state occurs at the start of a block and every character at
-  // each position of a 32-character slice.
+  // 16KB blocks of the chunked row gathering, two of which are boundaries of the 32KB tiles of the
+  // single-pass row gathering. Each character of the probe is placed in turn at the boundaries, so
+  // that every parser state occurs at the start of a block and every character at each position of
+  // a 32-character slice.
   constexpr size_t block_size = 16 * 1024;
   constexpr size_t num_blocks = 4;
   for (auto const [delimiter, terminator] :
@@ -3886,6 +3892,138 @@ TEST_F(CsvReaderTest, RowBoundariesAcrossBlocks)
       doc.add_row("last");
       expect_document_rows(doc, '#');
     }
+  }
+}
+
+TEST_F(CsvReaderTest, QuotedFieldsSpanningTiles)
+{
+  // Every 32KB tile of the single-pass row gathering but the first starts inside a quoted field,
+  // so the parser state assumed for these tiles is wrong. There are more tiles than the device runs
+  // blocks at once.
+  constexpr size_t tile_size = 32 * 1024;
+  constexpr size_t num_tiles = 1100;
+  auto const text            = std::string(tile_size - 64, 'q') + "\n\"";
+  csv_document doc{',', '\n'};
+  doc.pad_to(100);
+  for (size_t tile = 1; tile < num_tiles; ++tile) {
+    // The row starts 100 characters before the tile and ends after its start
+    doc.add_row("\"" + std::string(tile_size - 64, 'q') + "\n\"\"\"", text);
+    doc.pad_to(tile * tile_size + 100);
+  }
+  expect_document_rows(doc);
+
+  // A single quoted field spans many tiles
+  constexpr size_t num_spanned_tiles = 40;
+  csv_document single{',', '\n'};
+  auto const long_text = std::string(num_spanned_tiles * tile_size, 'q') + "\n";
+  single.add_row("\"" + long_text + "\"", long_text);
+  expect_document_rows(single);
+}
+
+TEST_F(CsvReaderTest, TileStartStates)
+{
+  // Places each character of short probes in turn at the start of a 32KB tile of the single-pass
+  // row gathering, one probe position per tile, so that tiles start in each parser state: inside a
+  // quoted field, right after a closing quote (before a delimiter, a terminator, or the second
+  // quote of an escaped quote), and in a comment line. Terminators after the escaped quotes make
+  // the rows depend on the start state.
+  constexpr size_t tile_size = 32 * 1024;
+  csv_document doc{',', '\n'};
+  auto const add_probe = [&](int probe) {
+    switch (probe) {
+      case 0: doc.add_row("\"q\"", "q"); break;
+      case 1: doc.add_row("\"a\"\"\nb\"", "a\"\nb"); break;
+      case 2: doc.add_row("\"\"\"a\nb\"", "\"a\nb"); break;
+      case 3: doc.add_row("\"a\nb\"", "a\nb", true); break;
+      default: doc.add_line("#comment"); break;
+    }
+  };
+  constexpr int num_probes        = 5;
+  constexpr size_t max_probe_size = 32;
+  size_t tile                     = 1;
+  for (int probe = 0; probe < num_probes; ++probe) {
+    for (size_t shift = 1; shift <= max_probe_size; ++shift, ++tile) {
+      doc.pad_to(tile * tile_size - shift);
+      add_probe(probe);
+    }
+  }
+  doc.add_row("last");
+  expect_document_rows(doc, '#');
+}
+
+namespace {
+// Random document of quoted fields, escaped quotes, comment and blank lines, over several tiles
+std::string random_multi_tile_document(
+  std::mt19937& rng, char delimiter, char terminator, char quotechar, char comment)
+{
+  constexpr size_t tile_size = 32 * 1024;
+  auto const rnd             = [&](size_t n) { return static_cast<size_t>(rng() % n); };
+  auto const size            = tile_size / 2 + rnd(5 * tile_size);
+  std::string const specials{
+    delimiter, terminator, quotechar, '\r', comment != '\0' ? comment : '#'};
+  std::string text;
+  while (text.size() < size) {
+    switch (rnd(10)) {
+      case 0: text += terminator; break;  // blank line
+      case 1:
+        text += std::string{comment != '\0' ? comment : '#', quotechar} + "x" + terminator;
+        break;
+      case 2: text += std::string{'\r', terminator}; break;
+      default:
+        for (size_t field = 0, num_fields = 1 + rnd(4); field < num_fields; ++field) {
+          if (field > 0) { text += delimiter; }
+          auto const quoted = rnd(3) == 0;
+          if (quoted) { text += quotechar; }
+          // Mostly short fields, and some that span tiles
+          auto const length = rnd(20) == 0 ? rnd(2 * tile_size) : rnd(12);
+          for (size_t i = 0; i < length; ++i) {
+            text += rnd(5) == 0 ? specials[rnd(specials.size())] : static_cast<char>('a' + rnd(26));
+          }
+          if (quoted) { text += quotechar; }
+        }
+        text += terminator;
+    }
+  }
+  // The data ends anywhere, and sometimes on a tile boundary
+  text.resize(rnd(4) == 0 ? text.size() / tile_size * tile_size : size);
+  return text;
+}
+}  // namespace
+
+TEST_F(CsvReaderTest, RandomDocumentsWholeFileAndChunked)
+{
+  // Whole-file reads, which gather rows in a single pass, and row selection reads, which gather
+  // them in chunks, find the same rows in random multi-tile documents
+  std::mt19937 rng{12345};
+  for (int i = 0; i < 40; ++i) {
+    auto const terminator = std::string{"\n\n\r;"}[rng() % 4];
+    auto const quotechar  = rng() % 4 == 0 ? '\'' : '"';
+    auto const delimiter  = rng() % 4 == 0 ? '\t' : ',';
+    auto const comment    = std::string{'\0', '#', quotechar, delimiter}[rng() % 4];
+    auto const quoting =
+      rng() % 8 == 0 ? cudf::io::quote_style::NONE : cudf::io::quote_style::MINIMAL;
+    auto const doublequote      = rng() % 4 != 0;
+    auto const skip_blank_lines = rng() % 4 != 0;
+    auto const text = random_multi_tile_document(rng, delimiter, terminator, quotechar, comment);
+    SCOPED_TRACE("document " + std::to_string(i) + ", " + std::to_string(text.size()) + " bytes");
+
+    auto opts = cudf::io::csv_reader_options::builder(
+                  cudf::io::source_info{cudf::host_span<std::byte const>{
+                    reinterpret_cast<std::byte const*>(text.data()), text.size()}})
+                  .compression(cudf::io::compression_type::NONE)
+                  .header(-1)
+                  .dtypes(std::vector<data_type>{dtype<cudf::string_view>()})
+                  .delimiter(delimiter)
+                  .lineterminator(terminator)
+                  .quotechar(quotechar)
+                  .quoting(quoting)
+                  .doublequote(doublequote)
+                  .comment(comment)
+                  .skip_blank_lines(skip_blank_lines)
+                  .build();
+    auto const whole = cudf::io::read_csv(opts);
+    opts.set_nrows(std::numeric_limits<cudf::size_type>::max());
+    CUDF_TEST_EXPECT_TABLES_EQUAL(whole.tbl->view(), cudf::io::read_csv(opts).tbl->view());
   }
 }
 
