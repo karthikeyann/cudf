@@ -557,3 +557,9 @@ add_custom_target(
   DEPENDS CUDF_BENCHMARKS
   COMMENT "Custom command for running cudf benchmarks."
 )
+
+# ##################################################################################################
+# * csv reader input-source comparison benchmarks --------------------------------------------------
+ConfigureNVBench(CSV_READER_REALISTIC_IO_NVBENCH io/csv/csv_read_realistic_io.cpp)
+ConfigureNVBench(CSV_READER_TYPE_INFERENCE_IO_NVBENCH io/csv/csv_read_type_inference_io.cpp)
+ConfigureNVBench(CSV_READER_QUOTING_IO_NVBENCH io/csv/csv_read_quoting_io.cpp)
