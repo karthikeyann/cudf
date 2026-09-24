@@ -31,12 +31,15 @@
 #include <thrust/execution_policy.h>
 
 #include <algorithm>
+#include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using cudf::data_type;
@@ -1372,6 +1375,11 @@ TEST_F(CsvReaderTest, MultiChunkRowCount)
   EXPECT_TRUE(all_equal(result_view.column(0), 123));
   EXPECT_TRUE(all_equal(result_view.column(1), 456));
   EXPECT_TRUE(all_equal(result_view.column(2), 789));
+
+  // The whole file is parsed as a single chunk; selecting rows parses it in chunks
+  auto chunked_opts = in_opts;
+  chunked_opts.set_nrows(static_cast<cudf::size_type>(num_rows));
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result_view, cudf::io::read_csv(chunked_opts).tbl->view());
 }
 
 TEST_F(CsvReaderTest, TypeInferenceThousands)
@@ -3582,6 +3590,141 @@ TEST_F(CsvReaderTest, ShortRowsMissingFieldsAreNull)
                      .delim_whitespace(true)
                      .build();
     CUDF_TEST_EXPECT_TABLES_EQUAL(view, cudf::io::read_csv(ws_opts).tbl->view());
+  }
+}
+
+namespace {
+// Host source that copies the requested range on every read. Records the largest read, and can
+// fail a given read, by throwing or by returning fewer bytes than requested.
+class copying_host_source : public cudf::io::datasource {
+ public:
+  enum class failure { NONE, THROW, SHORT_READ };
+
+  explicit copying_host_source(std::string const& data,
+                               failure fail          = failure::NONE,
+                               size_t fail_read_size = 0)
+    : _data{data}, _fail{fail}, _fail_read_size{fail_read_size}
+  {
+  }
+
+  std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
+  {
+    size = read_size(offset, size);
+    return buffer::create(std::vector<char>(_data.begin() + offset, _data.begin() + offset + size));
+  }
+
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    size = read_size(offset, size);
+    std::memcpy(dst, _data.data() + offset, size);
+    return size;
+  }
+
+  [[nodiscard]] size_t size() const override { return _data.size(); }
+
+  [[nodiscard]] size_t max_read_size() const { return _max_read_size; }
+
+ private:
+  size_t read_size(size_t offset, size_t size)
+  {
+    size = std::min(size, _data.size() - offset);
+    std::lock_guard lock{_mutex};
+    _max_read_size = std::max(_max_read_size, size);
+    if (size == _fail_read_size) {
+      if (_fail == failure::THROW) { throw std::runtime_error("read failure"); }
+      if (_fail == failure::SHORT_READ) { return size / 2; }
+    }
+    return size;
+  }
+
+  std::string const& _data;
+  failure _fail;
+  size_t _fail_read_size;
+  std::mutex _mutex;
+  size_t _max_read_size = 0;
+};
+
+// Rows with an INT32, a quoted multi-line STRING and a FLOAT64 column, and the expected columns
+struct multiline_rows {
+  std::string text = "id,text,value\n";
+  std::vector<int32_t> ids;
+  std::vector<std::string> texts;
+  std::vector<double> values;
+
+  explicit multiline_rows(int num_rows)
+  {
+    for (int i = 0; i < num_rows; ++i) {
+      auto const id  = std::to_string(i);
+      auto const str = i % 3 == 0 ? "line\n" + id : "text" + id;
+      text += id + ",\"" + str + "\"," + id + ".5\n";
+      ids.push_back(i);
+      texts.push_back(str);
+      values.push_back(i + 0.5);
+    }
+  }
+
+  [[nodiscard]] cudf::io::table_with_metadata read(cudf::io::source_info const& source) const
+  {
+    return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                                .compression(cudf::io::compression_type::NONE)
+                                .dtypes(std::vector<data_type>{
+                                  dtype<int32_t>(), dtype<cudf::string_view>(), dtype<double>()})
+                                .build());
+  }
+
+  void expect_equal(cudf::table_view const& table) const
+  {
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(table.column(0),
+                                        column_wrapper<int32_t>(ids.begin(), ids.end()));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      table.column(1), cudf::test::strings_column_wrapper(texts.begin(), texts.end()));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(table.column(2),
+                                        column_wrapper<double>(values.begin(), values.end()));
+  }
+};
+
+// Size of the reads with which the reader loads sources that do not prefer device reads
+constexpr size_t reader_host_read_bytes = 32 * 1024 * 1024;
+}  // namespace
+
+TEST_F(CsvReaderTest, HostSourcesReadInBoundedChunks)
+{
+  // Larger than the chunks in which the reader reads host sources
+  multiline_rows const rows{1'500'000};
+  ASSERT_GT(rows.text.size(), reader_host_read_bytes);
+
+  // Sources that don't prefer device reads are never read into host memory all at once
+  copying_host_source source{rows.text};
+  rows.expect_equal(rows.read(cudf::io::source_info{&source}).tbl->view());
+  EXPECT_EQ(source.max_read_size(), reader_host_read_bytes);
+
+  // Host buffers in pageable and in pinned memory
+  auto const as_bytes = [](char const* data, size_t size) {
+    return cudf::host_span<std::byte const>{reinterpret_cast<std::byte const*>(data), size};
+  };
+  rows.expect_equal(
+    rows.read(cudf::io::source_info{as_bytes(rows.text.data(), rows.text.size())}).tbl->view());
+  auto const stream = cudf::get_default_stream();
+  auto pinned       = cudf::detail::make_pinned_vector<char>(rows.text.size(), stream);
+  std::copy(rows.text.begin(), rows.text.end(), pinned.begin());
+  rows.expect_equal(
+    rows.read(cudf::io::source_info{as_bytes(pinned.data(), pinned.size())}).tbl->view());
+}
+
+TEST_F(CsvReaderTest, HostSourceReadFailures)
+{
+  multiline_rows const rows{1'500'000};
+  auto const last_read_size = rows.text.size() - reader_host_read_bytes;
+  ASSERT_LT(last_read_size, reader_host_read_bytes);
+
+  // The first and the last of the reads fail
+  for (auto const fail_read_size : {reader_host_read_bytes, last_read_size}) {
+    copying_host_source throwing{rows.text, copying_host_source::failure::THROW, fail_read_size};
+    EXPECT_THROW(std::ignore = rows.read(cudf::io::source_info{&throwing}), std::runtime_error);
+
+    copying_host_source short_reads{
+      rows.text, copying_host_source::failure::SHORT_READ, fail_read_size};
+    EXPECT_THROW(std::ignore = rows.read(cudf::io::source_info{&short_reads}), cudf::logic_error);
   }
 }
 

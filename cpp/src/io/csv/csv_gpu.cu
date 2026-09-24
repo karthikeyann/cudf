@@ -566,7 +566,7 @@ inline __device__ uint32_t select_rowmap(uint4 ctx_map, uint32_t ctxid)
  * @param t thread id (leaf node id)
  */
 template <uint32_t lanemask, uint32_t tmask, uint32_t base, uint32_t level_scale>
-inline __device__ void ctx_merge(device_span<uint64_t> ctxtree, packed_rowctx_t* ctxb, uint32_t t)
+inline __device__ void ctx_merge(packed_rowctx_t* ctxtree, packed_rowctx_t* ctxb, uint32_t t)
 {
   uint64_t tmp = shuffle_xor(*ctxb, lanemask);
   if (!(t & tmask)) {
@@ -589,7 +589,7 @@ inline __device__ void ctx_merge(device_span<uint64_t> ctxtree, packed_rowctx_t*
  */
 template <uint32_t rmask>
 inline __device__ void ctx_unmerge(
-  uint32_t base, device_span<uint64_t const> ctxtree, uint32_t* ctx, uint32_t* brow4, uint32_t t)
+  uint32_t base, packed_rowctx_t const* ctxtree, uint32_t* ctx, uint32_t* brow4, uint32_t t)
 {
   rowctx32_t ctxb_left, ctxb_right, ctxb_sum;
   ctxb_sum   = get_row_context(ctxtree[base], *ctx);
@@ -621,7 +621,7 @@ inline __device__ void ctx_unmerge(
  * @param[in] ctxb packed row context for the current character block
  * @param t thread id (leaf node id)
  */
-static inline __device__ void rowctx_merge_transform(device_span<uint64_t> ctxtree,
+static inline __device__ void rowctx_merge_transform(packed_rowctx_t* ctxtree,
                                                      packed_rowctx_t ctxb,
                                                      uint32_t t)
 {
@@ -655,8 +655,8 @@ static inline __device__ void rowctx_merge_transform(device_span<uint64_t> ctxtr
  *
  * @return Final row context and count (row_position*4 + context_id format)
  */
-static inline __device__ rowctx32_t
-rowctx_inverse_merge_transform(device_span<uint64_t const> ctxtree, uint32_t t)
+static inline __device__ rowctx32_t rowctx_inverse_merge_transform(packed_rowctx_t const* ctxtree,
+                                                                   uint32_t t)
 {
   uint32_t ctx     = ctxtree[0] & 3;  // Starting input context
   rowctx32_t brow4 = 0;               // output row in block *4
@@ -707,7 +707,6 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  */
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   gather_row_offsets_gpu(uint64_t* row_ctx,
-                         device_span<uint64_t> ctxtree,
                          device_span<uint64_t> offsets_out,
                          device_span<char const> const data,
                          size_t chunk_size,
@@ -723,8 +722,10 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          int escapechar,
                          int commentchar)
 {
-  auto start            = data.data();
-  auto const bk_ctxtree = ctxtree.subspan(blockIdx.x * bk_ctxtree_size, bk_ctxtree_size);
+  // Merge tree of the row contexts of the block's 32-character slices
+  __shared__ packed_rowctx_t bk_ctxtree[bk_ctxtree_size];
+
+  auto start = data.data();
 
   // file-level end position for this scan, clamped to the file size
   size_t const end_in_file = (parse_pos >= data_size || chunk_size > data_size - parse_pos)
@@ -946,11 +947,9 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
                                      cuda::stream_ref stream)
 {
   uint32_t dim_grid = 1 + (chunk_size / rowofs_block_bytes);
-  auto ctxtree      = rmm::device_uvector<packed_rowctx_t>(dim_grid * bk_ctxtree_size, stream);
 
   gather_row_offsets_gpu<<<dim_grid, rowofs_block_dim, 0, stream.get()>>>(
     row_ctx,
-    ctxtree,
     offsets_out,
     data,
     chunk_size,

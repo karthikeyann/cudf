@@ -198,6 +198,61 @@ void erase_except_last(C& container, cuda::stream_ref stream)
   container.resize(1, stream);
 }
 
+/// Size of the chunks in which the input is read and parsed when only some of the rows are selected
+constexpr size_t max_row_selection_chunk_bytes = 64 * 1024 * 1024;  // 64MB
+
+/// Size of the reads from sources that do not prefer device reads
+constexpr size_t max_host_read_bytes = 32 * 1024 * 1024;  // 32MB
+
+/**
+ * @brief Reads a range of the source into device memory.
+ *
+ * Sources that prefer device reads are read directly into `dst`. Other sources are read in chunks
+ * of at most `max_host_read_bytes`, so that the host memory used stays bounded regardless of the
+ * size of the range: at most two chunks are held at a time, the one being copied to the device and
+ * the next one, whose read is requested before the copy so that it overlaps with it.
+ *
+ * @param source The source to read from
+ * @param offset Position of the range in the source
+ * @param dst Device memory that receives the range, and whose size is the size of the range
+ * @param stream CUDA stream used for the copies
+ */
+void read_source_to_device(datasource* source,
+                           size_t offset,
+                           device_span<char> dst,
+                           cuda::stream_ref stream)
+{
+  if (dst.empty()) { return; }
+  if (source->is_device_read_preferred(dst.size())) {
+    source->device_read(offset, dst.size(), reinterpret_cast<uint8_t*>(dst.data()), stream);
+    return;
+  }
+  auto const chunk_size = [&](size_t pos) {
+    return std::min(max_host_read_bytes, dst.size() - pos);
+  };
+  auto next_chunk = source->host_read_async(offset, chunk_size(0));
+  try {
+    for (size_t pos = 0; pos < dst.size();) {
+      auto const chunk = next_chunk.get();
+      auto const size  = chunk_size(pos);
+      CUDF_EXPECTS(chunk->size() == size, "Unexpected end of the CSV source data");
+      if (pos + size < dst.size()) {
+        next_chunk = source->host_read_async(offset + pos + size, chunk_size(pos + size));
+      }
+      // Synchronous, so that the chunk can be released
+      cudf::detail::cuda_memcpy(
+        dst.subspan(pos, size),
+        host_span<char const>{reinterpret_cast<char const*>(chunk->data()), size},
+        stream);
+      pos += size;
+    }
+  } catch (...) {
+    // The pending read uses the source, which may be destroyed once the exception propagates
+    if (next_chunk.valid()) { next_chunk.wait(); }
+    throw;
+  }
+}
+
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 [[nodiscard]] bool has_utf8_bom(host_span<char const> data)
 {
@@ -240,9 +295,12 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
   bool load_whole_file,
   cuda::stream_ref stream)
 {
-  constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
+  auto const data_size = data.has_value() ? data->size() : source->size();
+  // Reading in chunks bounds the work done before reaching the end of the byte range or the
+  // requested number of rows. When the whole file is read anyway, a single chunk avoids the host
+  // synchronizations of each chunk and the regrowth of the row offsets.
+  auto const max_chunk_bytes = load_whole_file ? data_size : max_row_selection_chunk_bytes;
 
-  auto const data_size      = data.has_value() ? data->size() : source->size();
   auto const buffer_size    = std::min(max_chunk_bytes, data_size);
   auto const max_input_size = [&] {
     if (range_end == data_size) {
@@ -279,25 +337,11 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
 
     auto const read_offset = byte_range_offset + input_pos + previous_data_size;
     auto const read_size   = target_pos - input_pos - previous_data_size;
+    auto const read_dst    = device_span<char>{d_data.data() + previous_data_size, read_size};
     if (data.has_value()) {
-      cudf::detail::cuda_memcpy_async(
-        device_span<char>{d_data.data() + previous_data_size, read_size},
-        data->subspan(read_offset, read_size),
-        stream);
+      cudf::detail::cuda_memcpy_async(read_dst, data->subspan(read_offset, read_size), stream);
     } else {
-      if (source->is_device_read_preferred(read_size)) {
-        source->device_read(read_offset,
-                            read_size,
-                            reinterpret_cast<uint8_t*>(d_data.data() + previous_data_size),
-                            stream);
-      } else {
-        auto const buffer = source->host_read(read_offset, read_size);
-        // Use sync version to prevent buffer going out of scope before we copy the data.
-        cudf::detail::cuda_memcpy(
-          device_span<char>{d_data.data() + previous_data_size, read_size},
-          host_span<char const>{reinterpret_cast<char const*>(buffer->data()), buffer->size()},
-          stream);
-      }
+      read_source_to_device(source, read_offset, read_dst, stream);
     }
 
     // Pass 1: Count the potential number of rows in each character block for each
