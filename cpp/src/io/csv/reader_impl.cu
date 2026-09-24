@@ -789,6 +789,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 
   auto const num_actual_columns = static_cast<int32_t>(column_names.size());
   auto num_active_columns       = num_actual_columns;
+  auto const is_column_index    = [num_actual_columns](int index) {
+    return index >= 0 && index < num_actual_columns;
+  };
   auto column_flags =
     cudf::detail::make_host_vector<column_parse::flags>(num_actual_columns, stream);
   std::fill(
@@ -880,12 +883,34 @@ table_with_metadata read_csv(cudf::io::datasource* source,
                    reader_opts.get_names().size() == unique_use_cols_indexes.size(),
                  "Specify names of all columns in the file, or names of all selected columns");
 
+    // The columns of the input are named by its header or first row. Input without rows (an empty
+    // input or a byte range without a row start) has no data to read, and its columns are those
+    // named by the user, if any: as many names as selected columns name the selected columns (were
+    // they the names of all columns, all columns would be selected), other names name all columns.
+    auto const are_selected_columns_named =
+      detected_column_names.empty() and
+      reader_opts.get_names().size() == unique_use_cols_indexes.size();
     for (auto const index : unique_use_cols_indexes) {
-      column_flags[index] = column_parse::enabled | column_parse::inferred;
-      if (are_opts_col_names_used) {
-        column_names[index] = reader_opts.get_names()[num_active_columns];
+      CUDF_EXPECTS(index >= 0 and
+                     (is_column_index(index) or are_selected_columns_named or column_names.empty()),
+                   "Selected column index is out of range",
+                   std::out_of_range);
+    }
+
+    if (are_selected_columns_named) {
+      std::fill(
+        column_flags.begin(), column_flags.end(), column_parse::enabled | column_parse::inferred);
+      num_active_columns = num_actual_columns;
+    } else {
+      for (auto const index : unique_use_cols_indexes) {
+        // Without rows or names, no column is known and none is selected
+        if (not is_column_index(index)) { continue; }
+        column_flags[index] = column_parse::enabled | column_parse::inferred;
+        if (are_opts_col_names_used) {
+          column_names[index] = reader_opts.get_names()[num_active_columns];
+        }
+        ++num_active_columns;
       }
-      ++num_active_columns;
     }
   }
 
@@ -905,8 +930,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   // User can specify which columns should be read as datetime
   if (!reader_opts.get_parse_dates_indexes().empty() ||
       !reader_opts.get_parse_dates_names().empty()) {
+    // Like names that match no column, indexes that match no column are ignored
     for (auto const index : reader_opts.get_parse_dates_indexes()) {
-      column_flags[index] |= column_parse::as_datetime;
+      if (is_column_index(index)) { column_flags[index] |= column_parse::as_datetime; }
     }
 
     for (auto const& name : reader_opts.get_parse_dates_names()) {
@@ -919,8 +945,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 
   // User can specify which columns should be parsed as hexadecimal
   if (!reader_opts.get_parse_hex_indexes().empty() || !reader_opts.get_parse_hex_names().empty()) {
+    // Like names that match no column, indexes that match no column are ignored
     for (auto const index : reader_opts.get_parse_hex_indexes()) {
-      column_flags[index] |= column_parse::as_hexadecimal;
+      if (is_column_index(index)) { column_flags[index] |= column_parse::as_hexadecimal; }
     }
 
     for (auto const& name : reader_opts.get_parse_hex_names()) {

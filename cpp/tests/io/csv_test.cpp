@@ -3200,6 +3200,91 @@ TEST_F(CsvReaderTest, EmptyFirstField)
                                       result.tbl->view().column(1));
 }
 
+TEST_F(CsvReaderTest, UseColsIndexesOutOfRange)
+{
+  auto const read_use_cols = [](std::string const& buffer,
+                                std::vector<int> indexes,
+                                std::vector<std::string> names = {},
+                                std::size_t range_offset       = 0,
+                                std::size_t range_size         = 0,
+                                int header                     = -1) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .header(header)
+        .names(std::move(names))
+        .use_cols_indexes(std::move(indexes))
+        .byte_range_offset(range_offset)
+        .byte_range_size(range_size);
+    return cudf::io::read_csv(in_opts);
+  };
+  auto const column_names = [](cudf::io::table_with_metadata const& result) {
+    std::vector<std::string> names;
+    for (auto const& info : result.metadata.schema_info) {
+      names.push_back(info.name);
+    }
+    return names;
+  };
+
+  // Selecting a column that is not in the input is an error
+  std::string const buffer = "1,2,3,4,5,6\n7,8,9,10,11,12\n";
+  EXPECT_THROW(read_use_cols(buffer, {0, 6}), std::out_of_range);
+  EXPECT_THROW(read_use_cols(buffer, {-1}), std::out_of_range);
+  EXPECT_THROW(read_use_cols("", {-1}), std::out_of_range);
+  // The header names the columns of the input, even without data rows
+  EXPECT_THROW(read_use_cols("a,b,c\n", {5}, {}, 0, 0, 0), std::out_of_range);
+
+  // Without rows or names, the columns are unknown and none is selected
+  EXPECT_EQ(read_use_cols("", {0}).tbl->num_columns(), 0);
+  // The byte range [14, 22) contains no row start
+  auto const range_offset = 14;
+  auto const range_size   = 8;
+  EXPECT_EQ(read_use_cols(buffer, {2, 5}, {}, range_offset, range_size).tbl->num_columns(), 0);
+
+  // Without rows, as many names as selected columns name the selected columns
+  for (auto const& indexes : std::vector<std::vector<int>>{{2, 5}, {0, 5}, {1, 5}, {0, 1}}) {
+    auto const result = read_use_cols(buffer, indexes, {"x", "y"}, range_offset, range_size);
+    EXPECT_EQ(result.tbl->num_rows(), 0);
+    EXPECT_EQ(column_names(result), (std::vector<std::string>{"x", "y"}));
+  }
+  EXPECT_EQ(column_names(read_use_cols("", {1, 5}, {"x", "y"})),
+            (std::vector<std::string>{"x", "y"}));
+  // Other names name all columns, and an index must match one of them
+  std::vector<std::string> const six_names{"a", "b", "c", "d", "e", "f"};
+  auto const all_names = read_use_cols(buffer, {2, 5}, six_names, range_offset, range_size);
+  EXPECT_EQ(all_names.tbl->num_rows(), 0);
+  EXPECT_EQ(column_names(all_names), (std::vector<std::string>{"c", "f"}));
+  EXPECT_THROW(read_use_cols(buffer, {2, 6}, six_names, range_offset, range_size),
+               std::out_of_range);
+  EXPECT_THROW(read_use_cols(buffer, {2, 5}, {"a", "b", "c"}, range_offset, range_size),
+               std::out_of_range);
+}
+
+TEST_F(CsvReaderTest, ParseDatesAndHexIndexesOutOfRange)
+{
+  // Like column names that match no column, parse_dates and parse_hex indexes that match no column
+  // are ignored; the other indexes still apply
+  std::string const buffer = "ff,1\n10,2\n";
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .header(-1)
+      .dtypes(std::vector<data_type>{dtype<int64_t>(), dtype<int64_t>()})
+      .parse_dates(std::vector<int>{-1, 3})
+      .parse_hex(std::vector<int>{-2, 0, 7});
+  auto const result = cudf::io::read_csv(in_opts);
+
+  ASSERT_EQ(result.tbl->num_columns(), 2);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int64_t>({255, 16}),
+                                      result.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int64_t>({1, 2}),
+                                      result.tbl->view().column(1));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {
