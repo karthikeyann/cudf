@@ -255,6 +255,31 @@ __device__ char const* seek_field_end_by_words(char const* begin,
   return current;
 }
 
+/**
+ * @brief Marks the field of row `row` in a column as valid.
+ *
+ * The lanes of a warp decode 32 consecutive rows that start at a multiple of 32 (a one-dimensional
+ * grid of `csvparse_block_dim` threads per block, one thread per row), so the validity bits they
+ * set in a column's mask are in the same word, at the index of the lane. The lanes that mark
+ * fields of the same column together set their bits with a single atomic operation.
+ *
+ * @param mask Validity mask of the column
+ * @param column Index of the column
+ * @param row Index of the row
+ */
+__device__ void set_valid_warp_aggregated(cudf::bitmask_type* mask, int column, size_type row)
+{
+  static_assert(csvparse_block_dim % cudf::detail::warp_size == 0,
+                "The rows of a warp must share the words of the validity masks");
+  // The lanes that are active together normally mark the same column, but nothing guarantees it
+  // (lanes that diverged in earlier fields may meet here at different columns), so they are grouped
+  // by column for correctness
+  auto const lanes = __match_any_sync(__activemask(), column);
+  // The bit of row `row` in its mask word is `row % warp_size`, which is the index of the lane
+  auto const lane = static_cast<int>(threadIdx.x % cudf::detail::warp_size);
+  if (lane == __ffs(lanes) - 1) { atomicOr(&mask[cudf::word_index(row)], lanes); }
+}
+
 }  // namespace
 
 /*
@@ -462,8 +487,7 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
  * @param[in] row_offsets The start the CSV data of interest
  * @param[in] dtypes The data type of the column
  * @param[out] columns The output column data
- * @param[out] valids The bitmaps indicating whether column fields are valid
- * @param[out] valid_counts The number of valid fields in each column
+ * @param[out] valids The bitmaps indicating whether the fields of non-string columns are valid
  */
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
@@ -472,8 +496,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
-                      device_span<cudf::bitmask_type* const> valids,
-                      device_span<size_type> valid_counts)
+                      device_span<cudf::bitmask_type* const> valids)
 {
   // Fields are parsed through a read-only view; only string unescaping writes to `data`
   char const* const raw_csv = data.data();
@@ -560,8 +583,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                     options,
                                     column_flags[col] & column_parse::as_hexadecimal)) {
             // set the valid bitmap - all bits were set to 0 to start
-            set_bit(valids[actual_col], rec_id);
-            atomicAdd(&valid_counts[actual_col], 1);
+            set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
           }
         }
       } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
@@ -1359,7 +1381,6 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
-                            device_span<size_type> valid_counts,
                             cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -1368,7 +1389,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
 
   convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(
-    options, data, column_flags, row_offsets, dtypes, columns, valids, valid_counts);
+    options, data, column_flags, row_offsets, dtypes, columns, valids);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

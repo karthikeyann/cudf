@@ -237,8 +237,8 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
  * @param[out] columns Device memory output of column data. Fixed-width data is only written where
  * the field is valid and needs no initialization; string pairs must be zero-initialized, since
  * fields missing from short rows are not written
- * @param[out] valids Device memory output of column valids bitmap data; must be zero-initialized
- * @param[out] valid_counts Device memory output of the number of valid fields in each column
+ * @param[in,out] valids Validity bitmaps of the columns; must be zero-initialized. The bits of the
+ * valid fields of non-string columns are set
  * @param[in] stream CUDA stream to use
  */
 void decode_row_column_data(cudf::io::parse_options_view const& options,
@@ -248,7 +248,6 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
-                            device_span<size_type> valid_counts,
                             cuda::stream_ref stream);
 
 }  // namespace gpu

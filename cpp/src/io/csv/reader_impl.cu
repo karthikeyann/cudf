@@ -26,6 +26,7 @@
 #include <cudf/io/detail/csv.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/logger.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -723,9 +724,6 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     h_valid[i] = out_buffers[i].null_mask();
   }
 
-  auto d_valid_counts = cudf::detail::make_zeroed_device_uvector_async<size_type>(
-    num_active_columns, stream, cudf::get_current_device_resource_ref());
-
   cudf::io::csv::gpu::decode_row_column_data(
     parse_opts.view(),
     data,
@@ -734,12 +732,17 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     make_device_uvector_async(column_types, stream, cudf::get_current_device_resource_ref()),
     make_device_uvector_async(h_data, stream, cudf::get_current_device_resource_ref()),
     make_device_uvector_async(h_valid, stream, cudf::get_current_device_resource_ref()),
-    d_valid_counts,
     stream);
 
-  auto const h_valid_counts = cudf::detail::make_host_vector(d_valid_counts, stream);
+  // Only the validity of non-string columns is decoded into the masks; string columns get theirs
+  // (and their null counts) when they are built from the decoded string pairs
+  std::vector<bitmask_type const*> decoded_masks(num_active_columns, nullptr);
   for (int i = 0; i < num_active_columns; ++i) {
-    out_buffers[i].null_count() = num_records - h_valid_counts[i];
+    if (column_types[i].id() != cudf::type_id::STRING) { decoded_masks[i] = h_valid[i]; }
+  }
+  auto const null_counts = cudf::batch_null_count(decoded_masks, 0, num_records, stream);
+  for (int i = 0; i < num_active_columns; ++i) {
+    out_buffers[i].null_count() = null_counts[i];
   }
 
   return out_buffers;
