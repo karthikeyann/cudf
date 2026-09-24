@@ -4529,6 +4529,47 @@ TEST_F(CsvReaderTest, InvalidRowStagingPolicy)
                cudf::logic_error);
 }
 
+TEST_F(CsvReaderTest, TypeInferenceOfShortRows)
+{
+  // Rows of fields of 1 to 3 characters, with the counts of each block in shared memory (up to 32
+  // columns) or in global memory
+  constexpr int num_rows  = 300;
+  auto const column_types = std::vector<data_type>{
+    dtype<int64_t>(), dtype<double>(), dtype<bool>(), dtype<cudf::string_view>()};
+  for (int const num_columns : {1, 3, 32, 33, 36}) {
+    SCOPED_TRACE("columns " + std::to_string(num_columns));
+    std::string buffer;
+    for (int row = 0; row < num_rows; ++row) {
+      for (int col = 0; col < num_columns; ++col) {
+        if (col != 0) { buffer += ','; }
+        if ((row + col) % 11 == 0) { continue; }
+        switch (col % column_types.size()) {
+          case 0: buffer += std::to_string(row % 10); break;
+          case 1: buffer += std::to_string(row % 7) + ".5"; break;
+          case 2: buffer += row % 3 == 0 ? "T" : "F"; break;
+          default: buffer += static_cast<char>('a' + row % 26); break;
+        }
+      }
+      buffer += '\n';
+    }
+    std::vector<data_type> dtypes;
+    for (int col = 0; col < num_columns; ++col) {
+      dtypes.push_back(column_types[col % column_types.size()]);
+    }
+
+    auto const read = [&](std::vector<data_type> const& types) {
+      return cudf::io::read_csv(host_buffer_options(buffer)
+                                  .header(-1)
+                                  .true_values({"T"})
+                                  .false_values({"F"})
+                                  .dtypes(types)
+                                  .build());
+    };
+    with_each_row_staging_policy(
+      [&] { CUDF_TEST_EXPECT_TABLES_EQUAL(read(dtypes).tbl->view(), read({}).tbl->view()); });
+  }
+}
+
 namespace {
 // Rows with an INT64, a FLOAT64, a quoted STRING column with escaped quotes and an unquoted STRING
 // filler column that brings each row to a given length, and the columns they hold

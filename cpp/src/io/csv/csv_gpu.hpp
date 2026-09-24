@@ -203,9 +203,9 @@ device_span<uint64_t> remove_blank_rows(cudf::io::parse_options_view const& opti
 
 /**
  * @brief Computes the shared memory size needed to stage the rows of every thread block of the
- * kernels of `decode_row_column_data`.
+ * kernels of `detect_column_types` and `decode_row_column_data`.
  *
- * Each thread block of the kernel parses consecutive rows. When the rows of every block fit in
+ * Each thread block of these kernels parses consecutive rows. When the rows of every block fit in
  * the shared memory of the launch, each block can copy its rows there and parse the copy, which can
  * be faster than parsing them in global memory. The size is written to device memory, so that it
  * can be copied to the host together with other values.
@@ -226,6 +226,8 @@ void compute_row_staging_size(device_span<uint64_t const> row_offsets,
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] num_active_columns Number of active columns
+ * @param[in] staging_size Shared memory size needed to stage the rows of every thread block, as
+ * computed by `compute_row_staging_size` for `row_offsets`, or 0 to parse the rows in global memory
  * @param[in] stream CUDA stream to use
  *
  * @return stats Histogram of each dtypes' occurrence for each column
@@ -236,6 +238,7 @@ std::vector<column_type_histogram> detect_column_types(
   device_span<column_parse::flags const> column_flags,
   device_span<uint64_t const> row_offsets,
   size_t const num_active_columns,
+  size_t const staging_size,
   cuda::stream_ref stream);
 
 /**

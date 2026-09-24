@@ -494,10 +494,16 @@ constexpr int num_field_classes = static_cast<int>(field_class::NUM_CLASSES);
  * (RTX PRO 6000 Blackwell): larger shared memory allocations per block made type detection slower
  * than counting in global memory (64 columns: 8.9 ms instead of 5.7 ms; 32 columns with the
  * allocation padded to 2KB: 8.3 ms instead of 3.6 ms), likely because the kernel, which reads rows
- * through the L1 cache, then gets a larger shared memory carveout. The counters of wider tables are
- * spread over enough addresses that global memory atomics do not contend much on them.
+ * through the L1 cache (without row staging), then gets a larger shared memory carveout. The
+ * counters of wider tables are spread over enough addresses that global memory atomics do not
+ * contend much on them.
  */
 constexpr size_t max_shared_count_columns = 32;
+
+// The rows that type detection stages in shared memory follow the counters of the block, which
+// keep them aligned: each column has `num_field_classes` counters
+static_assert(num_field_classes * sizeof(cudf::size_type) % staging_word_size == 0,
+              "The counters of a column must keep the staged rows aligned");
 
 /// Returns the class of a field that holds an integer of the given class
 __device__ field_class to_field_class(cudf::io::gpu::integral_field_class integral_class)
@@ -669,9 +675,14 @@ __device__ void count_field_classes(parse_options_view const& opts,
  *
  * Data is processed one row at a time, so the number of threads is equal to the number of rows.
  * Each block counts the classes of its fields in shared memory if `use_shared_counts` is set, with
- * `field_class_counts.size()` counters of dynamic shared memory, and then adds its counts to
- * `field_class_counts`; otherwise it counts directly in `field_class_counts`.
+ * `field_class_counts.size()` counters at the start of the dynamic shared memory, and then adds its
+ * counts to `field_class_counts`; otherwise it counts directly in `field_class_counts`.
  *
+ * With `stage_rows`, each block first copies its rows into the dynamic shared memory that follows
+ * the counters, which must be large enough for the rows of every block, and its threads parse the
+ * copy (see `stage_block_rows`); otherwise, they parse `csv_text`.
+ *
+ * @tparam stage_rows Whether to stage the rows of each block in shared memory
  * @tparam use_shared_counts Whether to count in shared memory
  *
  * @param opts A set of parsing options
@@ -680,22 +691,37 @@ __device__ void count_field_classes(parse_options_view const& opts,
  * @param row_offsets The start the CSV data of interest
  * @param field_class_counts Number of fields of each class in each inferred column, in groups of
  * `num_field_classes` counters per column
+ * @param staging_size Size of the dynamic shared memory that follows the counters, with
+ * `stage_rows`
  */
-template <bool use_shared_counts>
+template <bool stage_rows, bool use_shared_counts>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   data_type_detection(parse_options_view const opts,
                       device_span<char const> csv_text,
                       device_span<column_parse::flags const> const column_flags,
                       device_span<uint64_t const> const row_offsets,
-                      device_span<cudf::size_type> field_class_counts)
+                      device_span<cudf::size_type> field_class_counts,
+                      size_t staging_size)
 {
-  extern __shared__ cudf::size_type shared_field_class_counts[];
+  extern __shared__ uint4 shared_memory[];
+  auto const shared_field_class_counts = reinterpret_cast<cudf::size_type*>(shared_memory);
   if constexpr (use_shared_counts) {
     for (auto i = threadIdx.x; i < field_class_counts.size(); i += blockDim.x) {
       shared_field_class_counts[i] = 0;
     }
     __syncthreads();
   }
+
+  auto const chars = [&] {
+    if constexpr (stage_rows) {
+      auto const counts_size =
+        use_shared_counts ? field_class_counts.size() * sizeof(cudf::size_type) : 0;
+      return stage_block_rows(
+        csv_text, row_offsets, reinterpret_cast<char*>(shared_memory) + counts_size, staging_size);
+    } else {
+      return block_characters{csv_text.data(), 0};
+    }
+  }();
 
   // ThreadIds range per block, so also need the blockId
   // This is entry into the fields; threadId is an element within `num_records`
@@ -704,11 +730,10 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 
   // we can have more threads than data; these threads only take part in updating the counts
   if (rec_id_next < row_offsets.size()) {
-    auto const raw_csv = csv_text.data();
     count_field_classes(opts,
-                        raw_csv,
-                        raw_csv + row_offsets[rec_id],
-                        raw_csv + row_offsets[rec_id_next],
+                        chars.begin,
+                        chars.at(row_offsets[rec_id]),
+                        chars.at(row_offsets[rec_id_next]),
                         column_flags,
                         use_shared_counts ? shared_field_class_counts : field_class_counts.data());
   }
@@ -1680,6 +1705,7 @@ std::vector<column_type_histogram> detect_column_types(
   device_span<column_parse::flags const> const column_flags,
   device_span<uint64_t const> const row_starts,
   size_t const num_active_columns,
+  size_t const staging_size,
   cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -1692,11 +1718,17 @@ std::vector<column_type_histogram> detect_column_types(
   // Narrow tables have few counters, which every warp updates: count them per block in shared
   // memory
   bool const use_shared_counts = num_active_columns <= max_shared_count_columns;
-  auto const kernel = use_shared_counts ? data_type_detection<true> : data_type_detection<false>;
-  auto const shared_memory_size =
-    use_shared_counts ? d_counts.size() * sizeof(cudf::size_type) : size_t{0};
-  kernel<<<grid_size, block_size, shared_memory_size, stream.get()>>>(
-    options, data, column_flags, row_starts, d_counts);
+  auto const counts_size       = use_shared_counts ? d_counts.size() * sizeof(cudf::size_type) : 0;
+  auto const [staged_kernel, unstaged_kernel] =
+    use_shared_counts
+      ? std::pair{data_type_detection<true, true>, data_type_detection<false, true>}
+      : std::pair{data_type_detection<true, false>, data_type_detection<false, false>};
+  auto const stage_rows =
+    is_row_staging_used(staged_kernel, unstaged_kernel, staging_size, counts_size);
+  auto const kernel         = stage_rows ? staged_kernel : unstaged_kernel;
+  auto const rows_smem_size = stage_rows ? staging_size : 0;
+  kernel<<<grid_size, block_size, counts_size + rows_smem_size, stream.get()>>>(
+    options, data, column_flags, row_starts, d_counts, rows_smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 
   auto const h_counts = cudf::detail::make_host_vector(d_counts, stream);
