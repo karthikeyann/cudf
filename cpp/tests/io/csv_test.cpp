@@ -4027,6 +4027,49 @@ TEST_F(CsvReaderTest, RandomDocumentsWholeFileAndChunked)
   }
 }
 
+TEST_F(CsvReaderTest, BlankAndCommentRowsAcrossTiles)
+{
+  // Blank lines, CRLF blank lines and comment lines, alone and in long runs that span the 32KB
+  // tiles of the single-pass row gathering, at the start and at the end of the data
+  for (char const terminator : {'\n', ';'}) {
+    SCOPED_TRACE("terminator " + std::string{terminator});
+    csv_document doc{',', terminator};
+    size_t num_blank_lines = 0;
+    auto const add_blank   = [&](std::string const& line) {
+      doc.add_line(line);
+      ++num_blank_lines;
+    };
+    add_blank("");
+    for (int i = 0; doc.text().size() < 200'000; ++i) {
+      doc.add_row("s" + std::to_string(i));
+      if (i % 7 == 0) { add_blank(""); }
+      if (i % 11 == 0) { doc.add_line("#comment" + std::to_string(i)); }
+      if (terminator == '\n' && i % 13 == 0) { add_blank("\r"); }
+      if (i % 500 == 0) {
+        for (int j = 0; j < 3000; ++j) {
+          if (j % 2 == 0) {
+            add_blank("");
+          } else {
+            doc.add_line("#");
+          }
+        }
+      }
+    }
+    add_blank("");
+    doc.add_line("#comment");
+    add_blank("");
+    expect_document_rows(doc, '#');
+
+    // Without skipping blank lines, blank lines are rows of nulls; comment lines are still skipped
+    auto opts         = doc.options().comment('#').skip_blank_lines(false).build();
+    auto const result = cudf::io::read_csv(opts);
+    ASSERT_EQ(static_cast<size_t>(result.tbl->num_rows()), doc.num_rows() + num_blank_lines);
+    EXPECT_EQ(static_cast<size_t>(result.tbl->view().column(2).null_count()), num_blank_lines);
+    opts.set_nrows(result.tbl->num_rows());
+    CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), cudf::io::read_csv(opts).tbl->view());
+  }
+}
+
 TEST_F(CsvReaderTest, UnterminatedQuoteAtEndOfData)
 {
   // The last field extends from the unterminated quote, which is kept, to the end of the data

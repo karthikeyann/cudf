@@ -447,8 +447,11 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
     } while (pos < max_input_size);
   }
 
+  // The single-pass gathering of the whole file already excludes blank rows
   auto const non_blank_row_offsets =
-    io::csv::gpu::remove_blank_rows(parse_opts.view(), d_data, all_row_offsets, stream);
+    load_whole_file
+      ? device_span<uint64_t>{all_row_offsets}
+      : io::csv::gpu::remove_blank_rows(parse_opts.view(), d_data, all_row_offsets, stream);
   auto row_offsets = selected_rows_offsets{std::move(all_row_offsets), non_blank_row_offsets};
 
   // Remove header rows and extract header

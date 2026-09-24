@@ -971,6 +971,36 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
 }
 
 /**
+ * @brief Predicate that identifies blank and comment rows by the offset of their first character.
+ *
+ * A row is blank if it starts with the comment character or, when blank lines are skipped, with
+ * the terminator or (for a '\n' terminator) a carriage return. Characters that do not apply are
+ * replaced with one that does. If none does (no comment character and blank lines are kept), all
+ * three are '\0', so rows that start with a NUL character are still removed. The offset of the end
+ * of the data, which only marks where the last row ends, is never blank.
+ */
+struct is_blank_row {
+  device_span<char const> data;
+  char newline;
+  char comment;
+  char carriage;
+
+  is_blank_row(parse_options_view const& options, device_span<char const> data)
+    : data{data},
+      newline{options.skipblanklines ? options.terminator : options.comment},
+      comment{options.comment != '\0' ? options.comment : newline},
+      carriage{(options.skipblanklines && options.terminator == '\n') ? '\r' : comment}
+  {
+  }
+
+  __device__ bool operator()(uint64_t pos) const
+  {
+    return pos != data.size() &&
+           (data[pos] == newline || data[pos] == comment || data[pos] == carriage);
+  }
+};
+
+/**
  * @brief Slices per thread in single-pass row gathering.
  *
  * Determines the tile size (32KB). Larger tiles need less per-tile work (block scans, transitions,
@@ -1024,10 +1054,11 @@ __device__ __forceinline__ uint32_t apply_transition(state_transition transition
  *
  * Each thread computes the row contexts of its consecutive slices for every input state. A block
  * scan over the threads' state transitions gives each thread its input state, which selects the
- * row start bitmaps of its slices.
+ * row start bitmaps of its slices. Blank and comment rows are then cleared from the bitmaps.
  *
  * @param data Character data
  * @param chars Characters that determine where rows start
+ * @param is_blank Identifies the blank and comment rows
  * @param tile Index of the tile
  * @param start_state Parser state at the start of the tile
  * @param[out] row_bitmaps Row start bitmap of every slice
@@ -1036,6 +1067,7 @@ __device__ __forceinline__ uint32_t apply_transition(state_transition transition
  */
 __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data,
                                                     row_parse_chars const& chars,
+                                                    is_blank_row const& is_blank,
                                                     size_t tile,
                                                     uint32_t start_state,
                                                     uint32_t* row_bitmaps,
@@ -1072,7 +1104,12 @@ __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data
   uint32_t num_rows = 0;
 #pragma unroll
   for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
-    auto const rowmap            = select_rowmap(ctx_maps[j], state);
+    auto rowmap          = select_rowmap(ctx_maps[j], state);
+    auto const slice_pos = (first_slice + j) * slice_chars;
+    for (auto rows = rowmap; rows != 0; rows &= rows - 1) {
+      auto const bit = __ffs(rows) - 1;
+      if (is_blank(slice_pos + bit)) { rowmap &= ~(1u << bit); }
+    }
     row_bitmaps[first_slice + j] = rowmap;
     num_rows += __popc(rowmap);
     state = apply_transition(static_cast<state_transition>(ctx_maps[j].w), state);
@@ -1092,13 +1129,14 @@ __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   gather_speculative_row_bitmaps_gpu(device_span<char const> data,
                                      row_parse_chars chars,
+                                     is_blank_row is_blank,
                                      uint32_t* row_bitmaps,
                                      uint64_t* tile_row_counts,
                                      state_transition* tile_transitions)
 {
-  auto const tile = static_cast<size_t>(blockIdx.x);
-  auto const transition =
-    gather_tile_row_bitmaps(data, chars, tile, ROW_CTX_NONE, row_bitmaps, tile_row_counts);
+  auto const tile       = static_cast<size_t>(blockIdx.x);
+  auto const transition = gather_tile_row_bitmaps(
+    data, chars, is_blank, tile, ROW_CTX_NONE, row_bitmaps, tile_row_counts);
   if (threadIdx.x == 0) { tile_transitions[tile] = transition; }
 }
 
@@ -1111,6 +1149,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   repair_row_bitmaps_gpu(device_span<char const> data,
                          row_parse_chars chars,
+                         is_blank_row is_blank,
                          device_span<state_transition const> tile_start_transitions,
                          uint32_t* row_bitmaps,
                          uint64_t* tile_row_counts)
@@ -1119,7 +1158,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   // The data starts in the NONE state
   auto const start_state = apply_transition(tile_start_transitions[tile], ROW_CTX_NONE);
   if (start_state == ROW_CTX_NONE) { return; }
-  gather_tile_row_bitmaps(data, chars, tile, start_state, row_bitmaps, tile_row_counts);
+  gather_tile_row_bitmaps(data, chars, is_blank, tile, start_state, row_bitmaps, tile_row_counts);
 }
 
 /**
@@ -1165,17 +1204,10 @@ size_t __host__ count_blank_rows(cudf::io::parse_options_view const& opts,
                                  device_span<uint64_t const> row_offsets,
                                  cuda::stream_ref stream)
 {
-  auto const newline  = opts.skipblanklines ? opts.terminator : opts.comment;
-  auto const comment  = opts.comment != '\0' ? opts.comment : newline;
-  auto const carriage = (opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment;
-  return thrust::count_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data = data, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != data.size()) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
-    });
+  return thrust::count_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                          row_offsets.begin(),
+                          row_offsets.end(),
+                          is_blank_row{opts, data});
 }
 
 device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view const& options,
@@ -1183,18 +1215,11 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
                                                  device_span<uint64_t> row_offsets,
                                                  cuda::stream_ref stream)
 {
-  size_t d_size       = data.size();
-  auto const newline  = options.skipblanklines ? options.terminator : options.comment;
-  auto const comment  = options.comment != '\0' ? options.comment : newline;
-  auto const carriage = (options.skipblanklines && options.terminator == '\n') ? '\r' : comment;
-  auto new_end        = thrust::remove_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data = data, d_size, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != d_size) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
-    });
+  auto new_end =
+    thrust::remove_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                      row_offsets.begin(),
+                      row_offsets.end(),
+                      is_blank_row{options, data});
   return row_offsets.subspan(0, new_end - row_offsets.begin());
 }
 
@@ -1247,6 +1272,7 @@ rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& o
   // The last tile holds the row that ends the data, at data.size()
   auto const num_tiles = data.size() / tile_chars + 1;
   auto const chars     = row_parse_chars::from(options);
+  auto const is_blank  = is_blank_row{options, data};
 
   rmm::device_uvector<uint32_t> row_bitmaps(num_tiles * tile_slices, stream);
   // One more entry than tiles, so that the exclusive scan of the row counts ends with the total
@@ -1255,7 +1281,7 @@ rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& o
   rmm::device_uvector<state_transition> tile_transitions(num_tiles, stream);
 
   gather_speculative_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
-    data, chars, row_bitmaps.data(), tile_rows.data(), tile_transitions.data());
+    data, chars, is_blank, row_bitmaps.data(), tile_rows.data(), tile_transitions.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
   // Transition from the start of the data to the start of each tile
@@ -1269,7 +1295,7 @@ rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& o
   // Every tile is processed at most once more, so the total work is at most twice that of a single
   // pass even if the speculation fails for every tile
   repair_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
-    data, chars, tile_transitions, row_bitmaps.data(), tile_rows.data());
+    data, chars, is_blank, tile_transitions, row_bitmaps.data(), tile_rows.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
   // First row of each tile, followed by the total number of rows
