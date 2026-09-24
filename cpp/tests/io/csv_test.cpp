@@ -3729,6 +3729,253 @@ TEST_F(CsvReaderTest, HostSourceReadFailures)
 }
 
 namespace {
+// CSV document with an INT32, a STRING and a FLOAT64 column, and the values it holds
+class csv_document {
+ public:
+  csv_document(char delimiter, char terminator) : _delimiter{delimiter}, _terminator{terminator} {}
+
+  // Appends a row whose string field is written as `field` and reads as `value`
+  void add_row(std::string const& field, std::string const& value)
+  {
+    auto const id = static_cast<int32_t>(_ids.size());
+    _text += row_text(id, field);
+    _ids.push_back(id);
+    _strings.push_back(value);
+    _values.push_back(id + 0.5);
+  }
+
+  void add_row(std::string const& field) { add_row(field, field); }
+
+  // Appends a line that is not a row (e.g. a comment), followed by the terminator
+  void add_line(std::string const& line) { _text += line + _terminator; }
+
+  // Appends rows until the document is exactly `length` characters long
+  void pad_to(size_t length)
+  {
+    constexpr size_t max_row_length = 64;
+    while (_text.size() + max_row_length < length) {
+      add_row("filler");
+    }
+    auto const padding = length - _text.size() - row_text(_ids.size(), "").size();
+    add_row(std::string(padding, 'x'));
+  }
+
+  void append_text(std::string const& text) { _text += text; }
+
+  [[nodiscard]] std::string const& text() const { return _text; }
+  [[nodiscard]] size_t num_rows() const { return _ids.size(); }
+
+  [[nodiscard]] cudf::io::csv_reader_options_builder options() const
+  {
+    return cudf::io::csv_reader_options::builder(
+             cudf::io::source_info{cudf::host_span<std::byte const>{
+               reinterpret_cast<std::byte const*>(_text.data()), _text.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .header(-1)
+      .names({"id", "text", "value"})
+      .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>(), dtype<double>()})
+      .delimiter(_delimiter)
+      .lineterminator(_terminator);
+  }
+
+  // Expects `table` to hold the rows [first, first + table.num_rows())
+  void expect_rows(cudf::table_view const& table, size_t first = 0) const
+  {
+    auto const last = first + table.num_rows();
+    ASSERT_LE(last, num_rows());
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      table.column(0), column_wrapper<int32_t>(_ids.begin() + first, _ids.begin() + last));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      table.column(1),
+      cudf::test::strings_column_wrapper(_strings.begin() + first, _strings.begin() + last));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      table.column(2), column_wrapper<double>(_values.begin() + first, _values.begin() + last));
+  }
+
+ private:
+  [[nodiscard]] std::string row_text(size_t id, std::string const& field) const
+  {
+    auto const text = std::to_string(id);
+    return text + _delimiter + field + _delimiter + text + ".5" + _terminator;
+  }
+
+  char _delimiter;
+  char _terminator;
+  std::string _text;
+  std::vector<int32_t> _ids;
+  std::vector<std::string> _strings;
+  std::vector<double> _values;
+};
+
+// Reads all rows of the document as a whole file, and also through the chunked row selection path
+// (nrows), and expects both to hold the document's rows
+void expect_document_rows(csv_document const& doc, char comment = '\0')
+{
+  auto opts         = doc.options().comment(comment).build();
+  auto const result = cudf::io::read_csv(opts);
+  ASSERT_EQ(static_cast<size_t>(result.tbl->num_rows()), doc.num_rows());
+  doc.expect_rows(result.tbl->view());
+
+  opts.set_nrows(static_cast<cudf::size_type>(doc.num_rows()));
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), cudf::io::read_csv(opts).tbl->view());
+}
+}  // namespace
+
+TEST_F(CsvReaderTest, CommentCharacterEndingAlignedSlice)
+{
+  // A comment character that starts a row at the last character of a 32-character slice leaves the
+  // slice in the COMMENT state, which changes how the quote at the start of the next slice is
+  // parsed; the data starts aligned, so the first slice ends at character 31. With the '#' comment
+  // character, `#""` enters a quoted field that extends to the end of the data. With the comment
+  // character equal to the delimiter, the quote after it opens no field.
+  std::string const tail = std::string(30, 'a') + "\n";
+  std::string rows;
+  for (int i = 0; i < 20; ++i) {
+    rows += "4\n";
+  }
+  auto const read_rows = [](std::string const& text, char comment) {
+    auto opts = cudf::io::csv_reader_options::builder(
+                  cudf::io::source_info{cudf::host_span<std::byte const>{
+                    reinterpret_cast<std::byte const*>(text.data()), text.size()}})
+                  .compression(cudf::io::compression_type::NONE)
+                  .header(-1)
+                  .comment(comment)
+                  .dtypes(std::vector<data_type>{dtype<cudf::string_view>()})
+                  .build();
+    auto const whole = cudf::io::read_csv(opts).tbl;
+    opts.set_nrows(std::numeric_limits<cudf::size_type>::max());
+    CUDF_TEST_EXPECT_TABLES_EQUAL(whole->view(), cudf::io::read_csv(opts).tbl->view());
+    return whole->num_rows();
+  };
+  EXPECT_EQ(read_rows(tail + "#\"\"x\n1\n2\n3\n" + rows, '#'), 1);
+  EXPECT_EQ(read_rows(tail + ",\"x\n1\n2\n3\n" + rows, ','), 24);
+}
+
+TEST_F(CsvReaderTest, RowBoundariesAcrossBlocks)
+{
+  // A probe with quoted fields that hold terminators (also after '\r'), delimiters and escaped
+  // quotes, and a comment line is repeated so that it crosses the first four boundaries of the
+  // 16KB blocks of the row gathering. Each character of the probe is placed in turn at the
+  // boundaries, so that every parser state occurs at the start of a block and every character at
+  // each position of a 32-character slice.
+  constexpr size_t block_size = 16 * 1024;
+  constexpr size_t num_blocks = 4;
+  for (auto const [delimiter, terminator] :
+       {std::pair{',', '\n'}, std::pair{',', '\r'}, std::pair{'\x01', '\xFE'}}) {
+    std::string const t{terminator};
+    std::string const d{delimiter};
+    auto const add_probe = [&](csv_document& doc) {
+      doc.add_row("\"a\r" + t + "b\"\"c\"\"" + t + "d" + d + "e\"",
+                  "a\r" + t + "b\"c\"" + t + "d" + d + "e");
+      doc.add_line("#" + d);
+      doc.add_row("\"\"\"\"", "\"");
+      doc.add_row("\"a" + t + "\"", "a" + t);
+    };
+    csv_document probe_only{delimiter, terminator};
+    add_probe(probe_only);
+    auto const probe_size = probe_only.text().size();
+
+    for (size_t shift = 0; shift <= probe_size; ++shift) {
+      SCOPED_TRACE("terminator " + std::to_string(static_cast<int>(terminator)) + ", shift " +
+                   std::to_string(shift));
+      csv_document doc{delimiter, terminator};
+      for (size_t block = 1; block <= num_blocks; ++block) {
+        doc.pad_to(block * block_size - shift);
+        add_probe(doc);
+      }
+      doc.add_row("last");
+      expect_document_rows(doc, '#');
+    }
+  }
+}
+
+TEST_F(CsvReaderTest, UnterminatedQuoteAtEndOfData)
+{
+  // The last field extends from the unterminated quote, which is kept, to the end of the data
+  for (size_t const length : {100ul, 64ul * 1024, 64ul * 1024 + 100}) {
+    SCOPED_TRACE("length " + std::to_string(length));
+    csv_document doc{',', '\n'};
+    doc.pad_to(length);
+    doc.append_text(std::to_string(doc.num_rows()) + ",\"unterminated\n1,2\n");
+    auto opts         = doc.options().build();
+    auto const result = cudf::io::read_csv(opts);
+    ASSERT_EQ(static_cast<size_t>(result.tbl->num_rows()), doc.num_rows() + 1);
+    auto const last_row = static_cast<cudf::size_type>(doc.num_rows());
+    doc.expect_rows(cudf::slice(result.tbl->view(), {0, last_row})[0]);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      cudf::slice(result.tbl->view().column(1), {last_row, last_row + 1})[0],
+      cudf::test::strings_column_wrapper({"\"unterminated\n1,2\n"}));
+
+    opts.set_nrows(static_cast<cudf::size_type>(doc.num_rows() + 1));
+    CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), cudf::io::read_csv(opts).tbl->view());
+  }
+}
+
+TEST_F(CsvReaderTest, ByteRangesCoverAllRows)
+{
+  // Quoted fields with delimiters and escaped quotes (byte ranges are located by searching for
+  // terminators, so quoted fields must not hold any)
+  csv_document doc{',', '\n'};
+  for (int i = 0; i < 6000; ++i) {
+    auto const text = std::to_string(i);
+    if (i % 3 == 0) {
+      doc.add_row("\"a,\"\"" + text + "\"\"\"", "a,\"" + text + "\"");
+    } else {
+      doc.add_row("s" + text);
+    }
+  }
+  auto const full = cudf::io::read_csv(doc.options().build());
+  doc.expect_rows(full.tbl->view());
+
+  auto const data_size = doc.text().size();
+  for (size_t const range_size : {1000ul, 4099ul, 16384ul, 70000ul}) {
+    SCOPED_TRACE("range size " + std::to_string(range_size));
+    std::vector<std::unique_ptr<cudf::table>> ranges;
+    for (size_t offset = 0; offset < data_size; offset += range_size) {
+      ranges.push_back(
+        cudf::io::read_csv(
+          doc.options().byte_range_offset(offset).byte_range_size(range_size).build())
+          .tbl);
+    }
+    std::vector<cudf::table_view> views;
+    std::transform(ranges.begin(), ranges.end(), std::back_inserter(views), [](auto const& t) {
+      return t->view();
+    });
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(full.tbl->view(), cudf::concatenate(views)->view());
+  }
+}
+
+TEST_F(CsvReaderTest, RowSelectionAcrossChunks)
+{
+  // Row selection reads the input in 64MB chunks; a quoted field with terminators spans the end of
+  // the first chunk
+  constexpr size_t chunk_size = 64 * 1024 * 1024;
+  csv_document doc{',', '\n'};
+  doc.pad_to(chunk_size - 12);
+  auto const special_row = doc.num_rows();
+  doc.add_row("\"a\nb\nc\nd\ne\nacross the\nchunk\"\"boundary\"",
+              "a\nb\nc\nd\ne\nacross the\nchunk\"boundary");
+  for (int i = 0; i < 1000; ++i) {
+    doc.add_row("tail" + std::to_string(i));
+  }
+
+  auto const whole = cudf::io::read_csv(doc.options().build());
+  ASSERT_EQ(static_cast<size_t>(whole.tbl->num_rows()), doc.num_rows());
+  auto const tail_start = static_cast<cudf::size_type>(special_row - 100);
+  doc.expect_rows(cudf::slice(whole.tbl->view(), {tail_start, whole.tbl->num_rows()})[0],
+                  tail_start);
+
+  // The first chunk is kept in part, or discarded
+  for (auto const skip_rows : {special_row - 5, special_row + 5}) {
+    SCOPED_TRACE("skiprows " + std::to_string(skip_rows));
+    auto const selected = cudf::io::read_csv(
+      doc.options().skiprows(static_cast<cudf::size_type>(skip_rows)).nrows(100).build());
+    ASSERT_EQ(selected.tbl->num_rows(), 100);
+    doc.expect_rows(selected.tbl->view(), skip_rows);
+  }
+}
+
+namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {
   cudf::io::compression_type compression        = cudf::io::compression_type::NONE;
