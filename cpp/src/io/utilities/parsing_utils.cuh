@@ -204,7 +204,25 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
   if (base == 16 && begin + 2 < end && *begin == '0' && *(begin + 1) == 'x') { begin += 2; }
 
   // Handle the whole part of the number
-  // auto index = begin;
+  if constexpr (cuda::std::is_same_v<T, double> and base == 10) {
+    // Accumulate the leading whole digits in an integer, which is much faster than in a double.
+    // The double accumulation below is exact while the value has at most `digits10` (15) digits:
+    // every intermediate value is an integer below 10^15 < 2^53, so `value * 10 + digit` is exact
+    // whether or not the multiply-add is fused. So it would reach the integer's value exactly, and
+    // continuing it from there gives the same result. The 16th digit can round: taking it in the
+    // integer would only give the same result if the compiler fuses the multiply-add.
+    uint64_t whole_digits_value = 0;
+    int num_whole_digits        = 0;
+    while (begin < end and num_whole_digits < cuda::std::numeric_limits<double>::digits10 and
+           *begin != opts.decimal and *begin != 'e' and *begin != 'E') {
+      if (*begin != opts.thousands && *begin != '+') {
+        whole_digits_value = whole_digits_value * base + decode_digit<T>(*begin, &all_digits_valid);
+        ++num_whole_digits;
+      }
+      ++begin;
+    }
+    value = static_cast<T>(whole_digits_value);
+  }
   while (begin < end) {
     if (*begin == opts.decimal) {
       ++begin;

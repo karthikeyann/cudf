@@ -5312,6 +5312,81 @@ TEST_F(CsvReaderTest, FractionDigitPlaceValues)
     read_fields({"0.0,01", "0.0+0+1", "0.,0,0,1"}, dtype<double>(), ',').tbl->get_column(0));
 }
 
+TEST_F(CsvReaderTest, WholeDigitsOfDoubles)
+{
+  // The whole part is accumulated as `value * 10 + digit`, rounded at each digit. Up to 15 digits
+  // every step is exact; from the 16th digit on, each step can round.
+  auto const fields   = std::vector<std::string>{"123456789012345",
+                                                 "1234567890123456",
+                                                 "9007199254740993",
+                                                 "90071992547409930",
+                                                 "-123456789012345.25",
+                                                 "000000000000000000000000001",
+                                                 "-0",
+                                                 "1+2",
+                                                 "12a4"};
+  auto const expected = std::vector<std::optional<double>>{
+    123456789012345.0,
+    1234567890123456.0,
+    9007199254740992.0,   // 2^53 + 1 rounds to even
+    90071992547409920.0,  // 10 * (2^53 + 1) rounds to 10 * 2^53 (the nearest double is ...936)
+    -123456789012345.25,
+    1.0,
+    -0.0,
+    12.0,  // '+' characters are skipped
+    std::nullopt};
+  expect_bitwise_equal(expected, read_fields(fields, dtype<double>()).tbl->get_column(0));
+
+  // Thousands separators are skipped
+  expect_bitwise_equal(
+    std::vector<std::optional<double>>{1234567890123456.0, 9007199254740992.0},
+    read_fields({"1,234,567,890,123,456", "9,007,199,254,740,993"}, dtype<double>(), ',')
+      .tbl->get_column(0));
+
+  // Floats are accumulated as floats: 2^24 + 1 rounds to even
+  expect_bitwise_equal(std::vector<std::optional<float>>{16777216.0f},
+                       read_fields({"16777217"}, dtype<float>()).tbl->get_column(0));
+
+  // The whole digits also end at an upper-case exponent, within and after the first 15 digits:
+  // each field parses as with a lower-case exponent
+  std::vector<std::string> const upper_case = {
+    "1E5", "-2.5E2", "-2.5E-3", "123456789012345678E-3", "1234567890123456789E2", "9.999E307"};
+  auto lower_case = upper_case;
+  for (auto& field : lower_case) {
+    std::replace(field.begin(), field.end(), 'E', 'e');
+  }
+  auto const upper_case_result = read_fields(upper_case, dtype<double>());
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+    cudf::bit_cast(read_fields(lower_case, dtype<double>()).tbl->get_column(0).view(),
+                   dtype<int64_t>()),
+    cudf::bit_cast(upper_case_result.tbl->get_column(0).view(), dtype<int64_t>()));
+  expect_bitwise_equal(std::vector<std::optional<double>>{100000.0, -250.0},
+                       cudf::slice(upper_case_result.tbl->get_column(0).view(), {0, 2}).front());
+}
+
+TEST_F(CsvReaderTest, FloatingPointSyntaxEdgeCases)
+{
+  // The whole digits end at a decimal point or an exponent, which may have no digits; exponents
+  // beyond the range of doubles give zero or infinity (0 * infinity is NaN, which is null)
+  auto const fields   = std::vector<std::string>{"1.",
+                                                 "-1.",
+                                                 ".5",
+                                                 "1e",
+                                                 "1e+",
+                                                 "1e-",
+                                                 "7e0",
+                                                 "-0",
+                                                 "-0e5",
+                                                 "1e-400",
+                                                 "1e0400",
+                                                 "1e309",
+                                                 "0e400"};
+  auto const infinity = std::numeric_limits<double>::infinity();
+  auto const expected = std::vector<std::optional<double>>{
+    1.0, -1.0, 0.5, 1.0, 1.0, 1.0, 7.0, -0.0, -0.0, 0.0, infinity, infinity, std::nullopt};
+  expect_bitwise_equal(expected, read_fields(fields, dtype<double>()).tbl->get_column(0));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

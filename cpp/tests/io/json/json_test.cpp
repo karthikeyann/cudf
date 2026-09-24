@@ -2405,6 +2405,12 @@ TEST_F(JsonReaderTest, FloatingPointBits)
   }
   expect_bits(doubles, read_values(fractions, type_id::FLOAT64));
   expect_bits(floats, read_values(fractions, type_id::FLOAT32));
+
+  // Whole digits of doubles: exact up to 16 digits, rounded at the 16th (2^53 + 1 rounds to even);
+  // they end at an upper-case exponent too
+  expect_bits(
+    std::vector<double>{1234567890123456.0, 9007199254740992.0, 100000.0, -250.0},
+    read_values({"1234567890123456", "9007199254740993", "1E5", "-2.5E2"}, type_id::FLOAT64));
 }
 
 TEST_F(JsonReaderTest, TimestampsWithIncompleteTimeOfDay)
