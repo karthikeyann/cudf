@@ -4392,6 +4392,46 @@ TEST_F(CsvReaderTest, MoreColumnsThanGridDimension)
                                  column_wrapper<int64_t>({0, 1, 2}, {false, false, true}));
 }
 
+TEST_F(CsvReaderTest, TypeInferenceDecidedByFewRows)
+{
+  // The type of each column but the fillers is decided by one or a few fields among the later rows,
+  // which are processed by later blocks of threads, or by the number of NA fields, so every field
+  // of every block must be counted, for a narrow and a wide table.
+  constexpr int num_rows = 1000;
+  for (int const num_columns : {8, 40}) {
+    SCOPED_TRACE("columns " + std::to_string(num_columns));
+    std::string buffer;
+    for (int row = 0; row < num_rows; ++row) {
+      auto const text = std::to_string(row);
+      // An integer column with a single floating point value
+      buffer += row == 900 ? "0.5" : text;
+      // An NA column with a single integer
+      buffer += row == 700 ? ",7" : ",NA";
+      // An integer column with a string in the last row
+      buffer += row == num_rows - 1 ? ",x" : "," + text;
+      // An unsigned 64-bit integer column with a single negative value
+      buffer += row == 777 ? ",-1" : ",18446744073709551615";
+      // An NA column
+      buffer += ",NA";
+      for (int col = 5; col < num_columns; ++col) {
+        buffer += "," + text;
+      }
+      buffer += '\n';
+    }
+    std::vector<data_type> dtypes{dtype<double>(),
+                                  dtype<int64_t>(),
+                                  dtype<cudf::string_view>(),
+                                  dtype<cudf::string_view>(),
+                                  dtype<int8_t>()};
+    dtypes.resize(num_columns, dtype<int64_t>());
+
+    auto const inferred = cudf::io::read_csv(host_buffer_options(buffer).header(-1).build());
+    auto const expected =
+      cudf::io::read_csv(host_buffer_options(buffer).header(-1).dtypes(dtypes).build());
+    CUDF_TEST_EXPECT_TABLES_EQUAL(expected.tbl->view(), inferred.tbl->view());
+  }
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

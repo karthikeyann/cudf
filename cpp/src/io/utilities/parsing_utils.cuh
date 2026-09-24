@@ -284,20 +284,27 @@ __device__ __inline__ bool less_equal_than(char const* data, char const (&golden
 }
 
 /**
- * @brief Determine which counter to increment when a sequence of digits
- * and a parity sign is encountered.
+ * @brief Classes of integers distinguished by type inference
+ */
+enum class integral_field_class {
+  NEGATIVE_SMALL_INT,  ///< Negative integer representable as int64
+  POSITIVE_SMALL_INT,  ///< Non-negative integer representable as int64
+  BIG_INT,             ///< Integer only representable as uint64
+  OUT_OF_RANGE         ///< Integer representable as neither int64 nor uint64
+};
+
+/**
+ * @brief Classifies a sequence of digits and a sign by the 64-bit integer types that can
+ * represent it.
  *
  * @param data_begin The pointer to beginning of character string
  * @param data_end The pointer to end of character string
  * @param is_negative Whether the number is negative
- * @param stats Reference to structure with counters
- * @return Pointer to appropriate counter that belong to
- * the interpreted data type
+ * @return The class of the integer
  */
-__device__ __inline__ cudf::size_type* infer_integral_field_counter(char const* data_begin,
-                                                                    char const* data_end,
-                                                                    bool is_negative,
-                                                                    column_type_histogram& stats)
+__device__ __inline__ integral_field_class classify_integral_field(char const* data_begin,
+                                                                   char const* data_end,
+                                                                   bool is_negative)
 {
   static constexpr char uint64_max_abs[] = "18446744073709551615";
   static constexpr char int64_min_abs[]  = "9223372036854775808";
@@ -322,29 +329,55 @@ __device__ __inline__ cudf::size_type* infer_integral_field_counter(char const* 
     // representable by int64
     // If digit_count is 0 then ignore - sign, i.e. -000..00 should
     // be treated as a positive small integer
-    return is_negative && (digit_count != 0) ? &stats.negative_small_int_count
-                                             : &stats.positive_small_int_count;
+    return is_negative && (digit_count != 0) ? integral_field_class::NEGATIVE_SMALL_INT
+                                             : integral_field_class::POSITIVE_SMALL_INT;
   } else if (digit_count > (sizeof(uint64_max_abs) - 1)) {  // CASE 1 : Reject validity
     // If the length of the string representing the integer is greater
     // than string length of UInt64Max then count this as a string
     // since it cannot be represented as an int64 or uint64
-    return &stats.string_count;
+    return integral_field_class::OUT_OF_RANGE;
   } else if (digit_count == (sizeof(uint64_max_abs) - 1) && is_negative) {
     // A negative integer of length UInt64Max digit count cannot be represented
     // as a 64 bit integer
-    return &stats.string_count;
+    return integral_field_class::OUT_OF_RANGE;
   }
 
   if (digit_count == (sizeof(int64_max_abs) - 1) && is_negative) {
-    return less_equal_than(data_begin, int64_min_abs) ? &stats.negative_small_int_count
-                                                      : &stats.string_count;
+    return less_equal_than(data_begin, int64_min_abs) ? integral_field_class::NEGATIVE_SMALL_INT
+                                                      : integral_field_class::OUT_OF_RANGE;
   } else if (digit_count == (sizeof(int64_max_abs) - 1) && !is_negative) {
-    return less_equal_than(data_begin, int64_max_abs) ? &stats.positive_small_int_count
-                                                      : &stats.big_int_count;
+    return less_equal_than(data_begin, int64_max_abs) ? integral_field_class::POSITIVE_SMALL_INT
+                                                      : integral_field_class::BIG_INT;
   } else if (digit_count == (sizeof(uint64_max_abs) - 1)) {
-    return less_equal_than(data_begin, uint64_max_abs) ? &stats.big_int_count : &stats.string_count;
+    return less_equal_than(data_begin, uint64_max_abs) ? integral_field_class::BIG_INT
+                                                       : integral_field_class::OUT_OF_RANGE;
   }
 
+  return integral_field_class::OUT_OF_RANGE;
+}
+
+/**
+ * @brief Determine which counter to increment when a sequence of digits
+ * and a parity sign is encountered.
+ *
+ * @param data_begin The pointer to beginning of character string
+ * @param data_end The pointer to end of character string
+ * @param is_negative Whether the number is negative
+ * @param stats Reference to structure with counters
+ * @return Pointer to appropriate counter that belong to
+ * the interpreted data type
+ */
+__device__ __inline__ cudf::size_type* infer_integral_field_counter(char const* data_begin,
+                                                                    char const* data_end,
+                                                                    bool is_negative,
+                                                                    column_type_histogram& stats)
+{
+  switch (classify_integral_field(data_begin, data_end, is_negative)) {
+    case integral_field_class::NEGATIVE_SMALL_INT: return &stats.negative_small_int_count;
+    case integral_field_class::POSITIVE_SMALL_INT: return &stats.positive_small_int_count;
+    case integral_field_class::BIG_INT: return &stats.big_int_count;
+    case integral_field_class::OUT_OF_RANGE: break;
+  }
   return &stats.string_count;
 }
 

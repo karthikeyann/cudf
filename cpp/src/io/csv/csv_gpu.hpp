@@ -7,12 +7,13 @@
 
 #include "io/utilities/parsing_utils.cuh"
 
-#include <cudf/detail/utilities/host_vector.hpp>
 #include <cudf/types.hpp>
 
 #include <rmm/device_uvector.hpp>
 
 #include <cuda/stream>
+
+#include <vector>
 
 using cudf::device_span;
 
@@ -212,7 +213,7 @@ device_span<uint64_t> remove_blank_rows(cudf::io::parse_options_view const& opti
  *
  * @return stats Histogram of each dtypes' occurrence for each column
  */
-cudf::detail::host_vector<column_type_histogram> detect_column_types(
+std::vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> data,
   device_span<column_parse::flags const> column_flags,
