@@ -10,6 +10,7 @@
 #include "io/utilities/trie.cuh"
 
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -24,9 +25,13 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <rmm/device_buffer.hpp>
 #include <rmm/exec_policy.hpp>
 
+#include <cub/device/device_reduce.cuh>
 #include <cuda/atomic>
+#include <cuda/functional>
+#include <cuda/iterator>
 #include <cuda/std/algorithm>
 #include <cuda/stream>
 #include <thrust/count.h>
@@ -35,6 +40,7 @@
 #include <thrust/scan.h>
 #include <thrust/transform.h>
 
+#include <string>
 #include <type_traits>
 
 using namespace ::cudf::io;
@@ -278,6 +284,188 @@ __device__ void set_valid_warp_aggregated(cudf::bitmask_type* mask, int column, 
   // The bit of row `row` in its mask word is `row % warp_size`, which is the index of the lane
   auto const lane = static_cast<int>(threadIdx.x % cudf::detail::warp_size);
   if (lane == __ffs(lanes) - 1) { atomicOr(&mask[cudf::word_index(row)], lanes); }
+}
+
+/// Size and alignment of the loads and stores that stage rows in shared memory
+constexpr size_t staging_word_size = sizeof(uint4);
+
+/**
+ * @brief Returns the size of a shared memory buffer that holds any `span` consecutive characters
+ * staged by `stage_block_rows`.
+ *
+ * Staged characters keep their address modulo `staging_word_size`, so up to
+ * `staging_word_size - 1` bytes of the buffer precede them. The size is a multiple of
+ * `staging_word_size`, so that the end of the buffer is aligned too.
+ */
+__host__ __device__ constexpr size_t staging_buffer_size(size_t span)
+{
+  return cudf::util::round_up_unsafe(span + staging_word_size - 1, staging_word_size);
+}
+
+/**
+ * @brief Returns the rows `[first, last)` that thread block `block` of the decoding kernels parses,
+ * one row per thread, out of `num_rows` rows.
+ */
+__host__ __device__ cuda::std::pair<size_t, size_t> block_row_range(size_t block, size_t num_rows)
+{
+  auto const first = cuda::std::min(block * csvparse_block_dim, num_rows);
+  return {first, cuda::std::min<size_t>(first + csvparse_block_dim, num_rows)};
+}
+
+/// Policies of the decoding kernels for staging rows in shared memory
+enum class row_staging_policy { AUTO, ALWAYS, NEVER };
+
+/**
+ * @brief Returns the row staging policy set by the `LIBCUDF_CSV_ROW_STAGING` environment variable:
+ * `AUTO` (default), `ALWAYS` or `NEVER` (see `is_row_staging_used`).
+ *
+ * Staging does not change the results, only the speed, so the policy is meant for tests, which
+ * cover both parsing paths whatever the GPU, and for performance comparisons.
+ */
+row_staging_policy get_row_staging_policy()
+{
+  auto const policy = cudf::detail::getenv_or<std::string>("LIBCUDF_CSV_ROW_STAGING", "AUTO");
+  if (policy == "AUTO") { return row_staging_policy::AUTO; }
+  if (policy == "ALWAYS") { return row_staging_policy::ALWAYS; }
+  if (policy == "NEVER") { return row_staging_policy::NEVER; }
+  CUDF_FAIL("Invalid LIBCUDF_CSV_ROW_STAGING value: " + policy);
+}
+
+/**
+ * @brief Returns whether a decoding kernel launch stages the rows of its blocks.
+ *
+ * Rows can only be staged if the dynamic shared memory of the staged kernel fits in the limit that
+ * a launch can use without opting in to more (through
+ * `cudaFuncAttributeMaxDynamicSharedMemorySize`): 48KB on every GPU architecture, less the kernel's
+ * static shared memory. By default (`AUTO` policy, see `get_row_staging_policy`), they are then
+ * staged only if staging does not reduce the occupancy of the launch: the number of blocks that an
+ * SM runs at the same time, which the shared memory of a staged block (static and dynamic) can
+ * limit.
+ *
+ * Staged threads load their characters from shared memory instead of mostly missing in the L1
+ * cache, but with fewer resident blocks per SM, there are fewer warps to hide the latency of their
+ * loads, which can cost more than staging saves. The occupancy condition keeps staging where it
+ * costs no occupancy, whatever the shared memory and the register file of the GPU.
+ *
+ * The rows of all blocks are staged, or of none, by separate kernel instances: the shared memory
+ * size of a launch applies to all of its blocks, and in a kernel whose rows could be in either
+ * memory space, all character loads compile to generic loads, which are slower than global ones.
+ *
+ * @param staged_kernel Kernel instance that stages rows
+ * @param unstaged_kernel Kernel instance that parses rows in global memory
+ * @param staging_size Shared memory needed to stage the rows of every block (see
+ * `compute_row_staging_size`), or 0 to parse global memory
+ * @param other_smem_size Dynamic shared memory that both instances use for other purposes
+ */
+template <typename Kernel>
+bool is_row_staging_used(Kernel staged_kernel,
+                         Kernel unstaged_kernel,
+                         size_t staging_size,
+                         size_t other_smem_size)
+{
+  auto const policy = get_row_staging_policy();
+  if (staging_size == 0 or policy == row_staging_policy::NEVER) { return false; }
+  cudaFuncAttributes staged_attributes{};
+  CUDF_CUDA_TRY(cudaFuncGetAttributes(&staged_attributes, staged_kernel));
+  if (staging_size + other_smem_size >
+      static_cast<size_t>(staged_attributes.maxDynamicSharedSizeBytes)) {
+    return false;
+  }
+  if (policy == row_staging_policy::ALWAYS) { return true; }
+  int staged_blocks   = 0;
+  int unstaged_blocks = 0;
+  CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &staged_blocks, staged_kernel, csvparse_block_dim, staging_size + other_smem_size));
+  CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+    &unstaged_blocks, unstaged_kernel, csvparse_block_dim, other_smem_size));
+  return staged_blocks >= unstaged_blocks;
+}
+
+/**
+ * @brief The characters that the threads of a block parse: the block's rows staged in shared
+ * memory, or the whole data.
+ */
+struct block_characters {
+  char const* begin;      ///< Pointer to the first character that may be read
+  uint64_t begin_offset;  ///< Offset in the data of the character at `begin`
+
+  /// Returns a pointer to the character at `offset` in the data
+  [[nodiscard]] __device__ char const* at(uint64_t offset) const
+  {
+    return begin + (offset - begin_offset);
+  }
+
+  /// Returns the offset in the data of the character at `ptr`
+  [[nodiscard]] __device__ uint64_t offset_of(char const* ptr) const
+  {
+    return begin_offset + (ptr - begin);
+  }
+};
+
+/**
+ * @brief Copies the rows of the thread block into shared memory.
+ *
+ * Each thread block of a decoding kernel parses consecutive rows (see `block_row_range`), one row
+ * per thread, which are contiguous in the data. Parsing its own row, each thread of a warp reads a
+ * different part of the data, so every character load of the warp takes up to 32 separate
+ * memory transactions, and the loaded sectors are reused only while they stay in the L1 cache.
+ * The block instead first copies its rows into shared memory with coalesced loads, and the threads
+ * then parse the copy.
+ *
+ * Characters are copied to the same position modulo `staging_word_size` (see
+ * `staging_buffer_size`): the aligned words that lie entirely within the rows are copied with
+ * single loads and stores, and the characters of the rows before the first such word and after the
+ * last one are copied one at a time. No character outside of the rows is read: the characters of
+ * the rows of other blocks may be rewritten by those blocks while this one copies its rows (see
+ * `convert_csv_to_cudf`).
+ *
+ * The buffer must hold the rows of the block, which is the case if its size was computed by
+ * `compute_row_staging_size` for the same row offsets. The kernel stops with an error otherwise:
+ * falling back to parsing global memory would make every character load of the staged kernel
+ * instance a generic load (see `is_row_staging_used`). This is an internal invariant, which no
+ * input can break; it is checked in release builds too (unlike with `cudf_assert`), since an
+ * overflow of the buffer would otherwise corrupt shared memory or fault nondeterministically.
+ *
+ * All threads of the block must call this function; they are synchronized after the copy.
+ *
+ * @param data The data
+ * @param row_offsets Offsets of the rows in the data, followed by the offset of the end of the last
+ * row
+ * @param buffer Shared memory buffer, aligned to `staging_word_size`
+ * @param buffer_size Size of the buffer
+ * @return The staged rows
+ */
+__device__ block_characters stage_block_rows(device_span<char const> data,
+                                             device_span<uint64_t const> row_offsets,
+                                             char* buffer,
+                                             size_t buffer_size)
+{
+  auto const num_rows              = row_offsets.empty() ? 0 : row_offsets.size() - 1;
+  auto const [first_row, last_row] = block_row_range(blockIdx.x, num_rows);
+  auto const rows                  = data.data() + row_offsets[first_row];
+  auto const span = static_cast<size_t>(row_offsets[last_row] - row_offsets[first_row]);
+  // Position of the first character in the buffer
+  auto const lead = static_cast<size_t>(reinterpret_cast<uintptr_t>(rows) % staging_word_size);
+  if (lead + span > buffer_size) { __trap(); }
+
+  auto const staged = buffer + lead;
+  // Positions (relative to `rows`) of the first and of the end of the aligned words of the rows
+  auto const words_begin = cuda::std::min((staging_word_size - lead) % staging_word_size, span);
+  auto const words_end =
+    cuda::std::max(span - cuda::std::min((lead + span) % staging_word_size, span), words_begin);
+  auto const num_words = (words_end - words_begin) / staging_word_size;
+  auto const src_words = reinterpret_cast<uint4 const*>(rows + words_begin);
+  auto const dst_words = reinterpret_cast<uint4*>(staged + words_begin);
+  for (auto i = static_cast<size_t>(threadIdx.x); i < num_words; i += blockDim.x) {
+    dst_words[i] = src_words[i];
+  }
+  auto const num_edge_chars = words_begin + (span - words_end);
+  for (auto i = static_cast<size_t>(threadIdx.x); i < num_edge_chars; i += blockDim.x) {
+    auto const pos = i < words_begin ? i : words_end + (i - words_begin);
+    staged[pos]    = rows[pos];
+  }
+  __syncthreads();
+  return {staged, row_offsets[first_row]};
 }
 
 /**
@@ -537,21 +725,24 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 
 /**
  * @brief Collapses each escaped quote pair (two consecutive `quotechar`) of a quoted field's
- * content into a single `quotechar`, in place.
+ * content into a single `quotechar`, and writes the result to `out`.
  *
  * Pairs are matched left to right without overlap, so the result is the same as replacing every
  * occurrence of the two-character string with the one-character string (`""""` becomes `""`).
- * The write position never passes the read position, which makes the in-place update safe.
- * Content without escaped pairs is not written. Bytes past the returned length are left in an
- * unspecified state.
+ * `out` must hold a copy of the content, or be the content itself: the characters before the
+ * first pair are not written, and the write position never passes the read position, which makes
+ * the in-place update safe. Content without escaped pairs is not written. Characters of `out` past
+ * the returned length are left in an unspecified state.
  *
  * @param content First character of the content (after the opening quote)
  * @param length Number of characters in the content (excluding the closing quote)
+ * @param out Copy of the content, or the content itself, that receives the unescaped content
  * @param quotechar Quote character
  * @return Length of the unescaped content
  */
-__device__ __forceinline__ size_t unescape_doublequotes(char* content,
+__device__ __forceinline__ size_t unescape_doublequotes(char const* content,
                                                         size_t length,
+                                                        char* out,
                                                         char quotechar)
 {
   auto const end = content + length;
@@ -561,13 +752,14 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
   }
   if (in + 1 >= end) { return length; }
 
-  auto out = in;
+  auto const out_begin = out;
+  out += in - content;
   while (in < end) {
     auto const c = *in;
     *out++       = c;
     in += (c == quotechar && in + 1 < end && in[1] == quotechar) ? 2 : 1;
   }
-  return out - content;
+  return out - out_begin;
 }
 
 /**
@@ -578,15 +770,24 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
  * need to be initialized. String outputs do: a (pointer, length) pair is written for valid and NA
  * fields, while fields missing from the end of a short row rely on the zeroed pair reading as null.
  *
+ * With `stage_rows`, each block first copies its rows into dynamic shared memory, which must be
+ * large enough for the rows of every block, and its threads parse the copy (see
+ * `stage_block_rows`); otherwise, they parse `data`. The kernel has no static shared memory, so its
+ * staged rows can use all of the default limit; the `RowsAroundStagingLimit` test relies on this,
+ * and must be updated if static shared memory is added.
+ *
  * When `options.doublequote` is set, the escaped quote pairs of quoted string fields are collapsed
- * in place in `data`, and the string pairs point to the unescaped content. This relies on two
- * invariants:
+ * in place in `data`, and the string pairs point to the unescaped content in `data` (never to a
+ * staged copy). This relies on three invariants:
  * - All bytes used for row `i` lie within its byte range `[row_offsets[i], row_offsets[i + 1])`,
  *   and the ranges of different rows do not overlap, so each byte is used by one thread only.
  *   Loads that cover bytes outside the row, such as the word loads of `seek_field_end_by_words`,
  *   must not use them: other threads may be rewriting them.
  * - Within a row, a field is rewritten only after its end (and therefore the start of the next
  *   field) has been found, and the rewrite stays within the field.
+ * - A block stages exactly the byte ranges of its rows, before any of its threads rewrites a field.
+ *   The staged copy is never written: fields are unescaped from the copy into `data`, whose bytes
+ *   of the field are still those of the copy.
  * No other code reads `data` after this kernel, except to copy the strings it describes.
  *
  * @param[in] options A set of parsing options
@@ -596,7 +797,9 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
  * @param[in] dtypes The data type of the column
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether the fields of non-string columns are valid
+ * @param[in] staging_size Size of the dynamic shared memory, with `stage_rows`
  */
+template <bool stage_rows>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
                       device_span<char> data,
@@ -604,10 +807,20 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
-                      device_span<cudf::bitmask_type* const> valids)
+                      device_span<cudf::bitmask_type* const> valids,
+                      size_t staging_size)
 {
+  extern __shared__ uint4 staging_buffer[];
   // Fields are parsed through a read-only view; only string unescaping writes to `data`
-  char const* const raw_csv = data.data();
+  auto const chars = [&] {
+    if constexpr (stage_rows) {
+      return stage_block_rows(
+        data, row_offsets, reinterpret_cast<char*>(staging_buffer), staging_size);
+    } else {
+      return block_characters{data.data(), 0};
+    }
+  }();
+
   // thread IDs range per block, so also need the block id.
   // this is entry into the field array - tid is an elements within the num_entries array
   auto const rec_id      = grid_1d::global_thread_id();
@@ -616,8 +829,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   // we can have more threads than data, make sure we are not past the end of the data
   if (rec_id_next >= row_offsets.size()) return;
 
-  auto field_start   = raw_csv + row_offsets[rec_id];
-  auto const row_end = raw_csv + row_offsets[rec_id_next];
+  auto field_start   = chars.at(row_offsets[rec_id]);
+  auto const row_end = chars.at(row_offsets[rec_id_next]);
 
   auto next_field = field_start;
   int col         = 0;
@@ -629,7 +842,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, options);
     if (field_start >= row_end) break;
     next_field          = field_start;
-    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, options);
+    auto next_delimiter = seek_field_end_by_words(field_start, row_end, chars.begin, options);
 
     if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
@@ -671,14 +884,15 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
               }
             }
           }
+          // The string is the field's content in `data`
+          auto const content = data.data() + chars.offset_of(field_start);
           // A quoted field has both of its quotes, so the content length is not negative
           if (was_quoted && options.doublequote) {
-            end = field_start + unescape_doublequotes(data.data() + (field_start - raw_csv),
-                                                      end - field_start,
-                                                      options.quotechar);
+            end = field_start +
+                  unescape_doublequotes(field_start, end - field_start, content, options.quotechar);
           }
           auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-          str_list[rec_id].first  = field_start;
+          str_list[rec_id].first  = content;
           str_list[rec_id].second = end - field_start;
         } else {
           if (cudf::type_dispatcher(dtypes[actual_col],
@@ -1504,6 +1718,40 @@ std::vector<column_type_histogram> detect_column_types(
   return histograms;
 }
 
+void compute_row_staging_size(device_span<uint64_t const> row_offsets,
+                              uint64_t* staging_size,
+                              cuda::stream_ref stream)
+{
+  auto const num_rows   = row_offsets.empty() ? 0 : row_offsets.size() - 1;
+  auto const num_blocks = cudf::util::div_rounding_up_safe<size_t>(num_rows, csvparse_block_dim);
+  auto const block_staging_sizes = cuda::make_transform_iterator(
+    cuda::counting_iterator<size_t>{0},
+    cuda::proclaim_return_type<uint64_t>([row_offsets, num_rows] __device__(size_t block) {
+      auto const [first_row, last_row] = block_row_range(block, num_rows);
+      return staging_buffer_size(row_offsets[last_row] - row_offsets[first_row]);
+    }));
+
+  size_t temp_storage_bytes = 0;
+  CUDF_CUDA_TRY(cub::DeviceReduce::Reduce(nullptr,
+                                          temp_storage_bytes,
+                                          block_staging_sizes,
+                                          staging_size,
+                                          num_blocks,
+                                          cuda::maximum<uint64_t>{},
+                                          uint64_t{0},
+                                          stream.get()));
+  rmm::device_buffer temp_storage(
+    temp_storage_bytes, stream, cudf::get_current_device_resource_ref());
+  CUDF_CUDA_TRY(cub::DeviceReduce::Reduce(temp_storage.data(),
+                                          temp_storage_bytes,
+                                          block_staging_sizes,
+                                          staging_size,
+                                          num_blocks,
+                                          cuda::maximum<uint64_t>{},
+                                          uint64_t{0},
+                                          stream.get()));
+}
+
 void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<char> data,
                             device_span<column_parse::flags const> column_flags,
@@ -1511,6 +1759,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
+                            size_t staging_size,
                             cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -1518,8 +1767,12 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   auto const num_rows   = row_offsets.size() - 1;
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
 
-  convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(
-    options, data, column_flags, row_offsets, dtypes, columns, valids);
+  auto const stage_rows =
+    is_row_staging_used(convert_csv_to_cudf<true>, convert_csv_to_cudf<false>, staging_size, 0);
+  auto const kernel    = stage_rows ? convert_csv_to_cudf<true> : convert_csv_to_cudf<false>;
+  auto const smem_size = stage_rows ? staging_size : 0;
+  kernel<<<grid_size, block_size, smem_size, stream.get()>>>(
+    options, data, column_flags, row_offsets, dtypes, columns, valids, smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

@@ -259,6 +259,8 @@ void read_source_to_device(datasource* source,
 struct data_and_row_offsets {
   rmm::device_uvector<char> data;
   selected_rows_offsets row_offsets;
+  /// Shared memory size with which the decoding kernels stage the rows of each block
+  size_t row_staging_size = 0;
 };
 
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
@@ -479,24 +481,41 @@ data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* sour
     row_offsets.shrink(row_offsets.size() - skip_end_rows);
   }
 
-  if (has_header_row) {
-    auto const h_header_offsets = cudf::detail::make_host_vector(header_offsets, stream);
-    auto const header_start     = input_pos + h_header_offsets[0];
-    auto const header_end       = input_pos + h_header_offsets[1];
-    CUDF_EXPECTS(header_start <= header_end && header_end <= max_input_size,
-                 "Invalid csv header location");
-    header.resize(header_end - header_start);
-    if (data.has_value()) {
-      std::copy(data->begin() + byte_range_offset + header_start,
-                data->begin() + byte_range_offset + header_end,
-                header.begin());
-    } else {
-      source->host_read(header_start + byte_range_offset,
-                        header_end - header_start,
-                        reinterpret_cast<uint8_t*>(header.data()));
+  // The location of the header and the staging size of the rows to read are copied to the host
+  // with a single synchronization
+  size_t row_staging_size = 0;
+  if (has_header_row || row_offsets.size() > 1) {
+    rmm::device_uvector<uint64_t> d_row_staging_size(1, stream);
+    cudf::io::csv::gpu::compute_row_staging_size(row_offsets, d_row_staging_size.data(), stream);
+    // Staging size, followed by the header offsets
+    auto h_values =
+      cudf::detail::make_pinned_vector_async<uint64_t>(1 + header_offsets.size(), stream);
+    cudf::detail::cuda_memcpy_async(host_span<uint64_t>{h_values}.subspan(0, 1),
+                                    device_span<uint64_t const>{d_row_staging_size},
+                                    stream);
+    cudf::detail::cuda_memcpy_async(
+      host_span<uint64_t>{h_values}.subspan(1, header_offsets.size()), header_offsets, stream);
+    stream.sync();
+    row_staging_size = h_values[0];
+
+    if (has_header_row) {
+      auto const header_start = input_pos + h_values[1];
+      auto const header_end   = input_pos + h_values[2];
+      CUDF_EXPECTS(header_start <= header_end && header_end <= max_input_size,
+                   "Invalid csv header location");
+      header.resize(header_end - header_start);
+      if (data.has_value()) {
+        std::copy(data->begin() + byte_range_offset + header_start,
+                  data->begin() + byte_range_offset + header_end,
+                  header.begin());
+      } else {
+        source->host_read(header_start + byte_range_offset,
+                          header_end - header_start,
+                          reinterpret_cast<uint8_t*>(header.data()));
+      }
     }
   }
-  return {std::move(d_data), std::move(row_offsets)};
+  return {std::move(d_data), std::move(row_offsets), row_staging_size};
 }
 
 data_and_row_offsets select_data_and_row_offsets(cudf::io::datasource* source,
@@ -698,6 +717,7 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
                                        std::vector<std::string> const& column_names,
                                        device_span<char> data,
                                        device_span<uint64_t const> row_offsets,
+                                       size_t row_staging_size,
                                        host_span<data_type const> column_types,
                                        int32_t num_records,
                                        int32_t num_actual_columns,
@@ -740,6 +760,7 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     make_device_uvector_async(column_types, stream, cudf::get_current_device_resource_ref()),
     make_device_uvector_async(h_data, stream, cudf::get_current_device_resource_ref()),
     make_device_uvector_async(h_valid, stream, cudf::get_current_device_resource_ref()),
+    row_staging_size,
     stream);
 
   // Only the validity of non-string columns is decoded into the masks; string columns get theirs
@@ -1029,6 +1050,7 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       column_names,
       data,
       row_offsets,
+      data_row_offsets.row_staging_size,
       column_types,
       num_records,
       num_actual_columns,
