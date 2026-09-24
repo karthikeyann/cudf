@@ -4396,9 +4396,10 @@ TEST_F(CsvReaderTest, TypeInferenceDecidedByFewRows)
 {
   // The type of each column but the fillers is decided by one or a few fields among the later rows,
   // which are processed by later blocks of threads, or by the number of NA fields, so every field
-  // of every block must be counted, for a narrow and a wide table.
+  // of every block must be counted. Tables of up to 32 columns are counted per block in shared
+  // memory, wider ones in global memory.
   constexpr int num_rows = 1000;
-  for (int const num_columns : {8, 40}) {
+  for (int const num_columns : {8, 32, 33, 40}) {
     SCOPED_TRACE("columns " + std::to_string(num_columns));
     std::string buffer;
     for (int row = 0; row < num_rows; ++row) {
@@ -4424,6 +4425,48 @@ TEST_F(CsvReaderTest, TypeInferenceDecidedByFewRows)
                                   dtype<cudf::string_view>(),
                                   dtype<int8_t>()};
     dtypes.resize(num_columns, dtype<int64_t>());
+
+    auto const inferred = cudf::io::read_csv(host_buffer_options(buffer).header(-1).build());
+    auto const expected =
+      cudf::io::read_csv(host_buffer_options(buffer).header(-1).dtypes(dtypes).build());
+    CUDF_TEST_EXPECT_TABLES_EQUAL(expected.tbl->view(), inferred.tbl->view());
+  }
+}
+
+TEST_F(CsvReaderTest, TypeInferenceOfWideTables)
+{
+  // Type detection keeps the counts of each block in shared memory for up to 32 columns, and in
+  // global memory for wider tables
+  constexpr int num_rows  = 300;
+  auto const column_types = std::vector<data_type>{dtype<int64_t>(),
+                                                   dtype<uint64_t>(),
+                                                   dtype<double>(),
+                                                   dtype<bool>(),
+                                                   dtype<cudf::string_view>()};
+  for (int const num_columns : {1, 31, 32, 33, 1000}) {
+    SCOPED_TRACE("columns " + std::to_string(num_columns));
+    std::string buffer;
+    for (int row = 0; row < num_rows; ++row) {
+      for (int col = 0; col < num_columns; ++col) {
+        if (col != 0) { buffer += ','; }
+        if ((row + col) % 11 == 0) {
+          buffer += "NA";
+          continue;
+        }
+        switch (col % column_types.size()) {
+          case 0: buffer += std::to_string(row * (col + 1) - 100); break;
+          case 1: buffer += std::to_string(std::numeric_limits<uint64_t>::max() - row); break;
+          case 2: buffer += std::to_string(row) + ".25"; break;
+          case 3: buffer += row % 3 == 0 ? "true" : "false"; break;
+          default: buffer += "s" + std::to_string(row); break;
+        }
+      }
+      buffer += '\n';
+    }
+    std::vector<data_type> dtypes;
+    for (int col = 0; col < num_columns; ++col) {
+      dtypes.push_back(column_types[col % column_types.size()]);
+    }
 
     auto const inferred = cudf::io::read_csv(host_buffer_options(buffer).header(-1).build());
     auto const expected =

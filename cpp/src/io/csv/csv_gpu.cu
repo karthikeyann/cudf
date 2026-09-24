@@ -298,6 +298,19 @@ enum class field_class : int {
 /// Number of type detection counters of each column
 constexpr int num_field_classes = static_cast<int>(field_class::NUM_CLASSES);
 
+/**
+ * @brief Largest number of inferred columns whose type detection counters each block keeps in
+ * shared memory
+ *
+ * The counts are exact either way; this threshold only affects speed. It was measured on one GPU
+ * (RTX PRO 6000 Blackwell): larger shared memory allocations per block made type detection slower
+ * than counting in global memory (64 columns: 8.9 ms instead of 5.7 ms; 32 columns with the
+ * allocation padded to 2KB: 8.3 ms instead of 3.6 ms), likely because the kernel, which reads rows
+ * through the L1 cache, then gets a larger shared memory carveout. The counters of wider tables are
+ * spread over enough addresses that global memory atomics do not contend much on them.
+ */
+constexpr size_t max_shared_count_columns = 32;
+
 /// Returns the class of a field that holds an integer of the given class
 __device__ field_class to_field_class(cudf::io::gpu::integral_field_class integral_class)
 {
@@ -467,6 +480,11 @@ __device__ void count_field_classes(parse_options_view const& opts,
  * @brief CUDA kernel that detects the data types of the fields of CSV data.
  *
  * Data is processed one row at a time, so the number of threads is equal to the number of rows.
+ * Each block counts the classes of its fields in shared memory if `use_shared_counts` is set, with
+ * `field_class_counts.size()` counters of dynamic shared memory, and then adds its counts to
+ * `field_class_counts`; otherwise it counts directly in `field_class_counts`.
+ *
+ * @tparam use_shared_counts Whether to count in shared memory
  *
  * @param opts A set of parsing options
  * @param csv_text The entire CSV data to read
@@ -475,6 +493,7 @@ __device__ void count_field_classes(parse_options_view const& opts,
  * @param field_class_counts Number of fields of each class in each inferred column, in groups of
  * `num_field_classes` counters per column
  */
+template <bool use_shared_counts>
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   data_type_detection(parse_options_view const opts,
                       device_span<char const> csv_text,
@@ -482,21 +501,38 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<uint64_t const> const row_offsets,
                       device_span<cudf::size_type> field_class_counts)
 {
+  extern __shared__ cudf::size_type shared_field_class_counts[];
+  if constexpr (use_shared_counts) {
+    for (auto i = threadIdx.x; i < field_class_counts.size(); i += blockDim.x) {
+      shared_field_class_counts[i] = 0;
+    }
+    __syncthreads();
+  }
+
   // ThreadIds range per block, so also need the blockId
   // This is entry into the fields; threadId is an element within `num_records`
   auto const rec_id      = grid_1d::global_thread_id();
   auto const rec_id_next = rec_id + 1;
 
-  // we can have more threads than data, make sure we are not past the end of the data
-  if (rec_id_next >= row_offsets.size()) { return; }
+  // we can have more threads than data; these threads only take part in updating the counts
+  if (rec_id_next < row_offsets.size()) {
+    auto const raw_csv = csv_text.data();
+    count_field_classes(opts,
+                        raw_csv,
+                        raw_csv + row_offsets[rec_id],
+                        raw_csv + row_offsets[rec_id_next],
+                        column_flags,
+                        use_shared_counts ? shared_field_class_counts : field_class_counts.data());
+  }
 
-  auto const raw_csv = csv_text.data();
-  count_field_classes(opts,
-                      raw_csv,
-                      raw_csv + row_offsets[rec_id],
-                      raw_csv + row_offsets[rec_id_next],
-                      column_flags,
-                      field_class_counts.data());
+  if constexpr (use_shared_counts) {
+    __syncthreads();
+    for (auto i = threadIdx.x; i < field_class_counts.size(); i += blockDim.x) {
+      if (shared_field_class_counts[i] != 0) {
+        atomicAdd(&field_class_counts[i], shared_field_class_counts[i]);
+      }
+    }
+  }
 }
 
 /**
@@ -1439,7 +1475,13 @@ std::vector<column_type_histogram> detect_column_types(
   auto d_counts = cudf::detail::make_zeroed_device_uvector_async<cudf::size_type>(
     num_active_columns * num_field_classes, stream, cudf::get_current_device_resource_ref());
 
-  data_type_detection<<<grid_size, block_size, 0, stream.get()>>>(
+  // Narrow tables have few counters, which every warp updates: count them per block in shared
+  // memory
+  bool const use_shared_counts = num_active_columns <= max_shared_count_columns;
+  auto const kernel = use_shared_counts ? data_type_detection<true> : data_type_detection<false>;
+  auto const shared_memory_size =
+    use_shared_counts ? d_counts.size() * sizeof(cudf::size_type) : size_t{0};
+  kernel<<<grid_size, block_size, shared_memory_size, stream.get()>>>(
     options, data, column_flags, row_starts, d_counts);
   CUDF_CUDA_TRY(cudaGetLastError());
 
