@@ -30,6 +30,7 @@
 
 #include <cuda/iterator>
 
+#include <bit>
 #include <fstream>
 #include <limits>
 #include <map>
@@ -2358,6 +2359,52 @@ TEST_F(JsonReaderTest, ValueValidation)
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), b_column);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(2), c_column);
   }
+}
+
+TEST_F(JsonReaderTest, FloatingPointBits)
+{
+  // Floating-point parsing is shared with the CSV reader; these values are checked bit for bit
+  auto const read_values = [](std::vector<std::string> const& values, type_id type) {
+    std::string data;
+    for (auto const& value : values) {
+      data += "{\"a\": " + value + "}\n";
+    }
+    cudf::io::json_reader_options const in_options =
+      cudf::io::json_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+        .lines(true)
+        .dtypes(std::map<std::string, data_type>{{"a", data_type{type}}});
+    return cudf::io::read_json(in_options);
+  };
+  auto const expect_bits = []<typename T>(std::vector<T> const& expected,
+                                          cudf::io::table_with_metadata const& result) {
+    using bits_type = std::conditional_t<sizeof(T) == 8, int64_t, int32_t>;
+    std::vector<bits_type> bits;
+    for (auto const value : expected) {
+      bits.push_back(std::bit_cast<bits_type>(value));
+    }
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      wrapper<bits_type>(bits.begin(), bits.end()),
+      cudf::bit_cast(result.tbl->get_column(0).view(), data_type{type_to_id<bits_type>()}));
+  };
+
+  // A single nonzero fraction digit: its place value is 1 divided by 10 once per preceding digit
+  // and once more, each division rounded, and underflows to zero after the 323rd digit
+  std::vector<std::string> fractions{"-0"};
+  std::vector<double> doubles{-0.0};
+  std::vector<float> floats{-0.0f};
+  double place_value = 1;
+  for (int position = 1; position <= 324; ++position) {
+    place_value /= 10;
+    if (position <= 2 or position >= 322) {
+      fractions.push_back("0." + std::string(position - 1, '0') + "7");
+      doubles.push_back(7 * place_value);
+      floats.push_back(static_cast<float>(7 * place_value));
+    }
+  }
+  expect_bits(doubles, read_values(fractions, type_id::FLOAT64));
+  expect_bits(floats, read_values(fractions, type_id::FLOAT32));
 }
 
 TEST_F(JsonReaderTest, TimestampsWithIncompleteTimeOfDay)

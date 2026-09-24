@@ -37,6 +37,7 @@
 #include <thrust/execution_policy.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -5235,6 +5236,80 @@ TEST_F(CsvReaderTest, UnescapeMemoryOfDeviceBuffers)
       EXPECT_LT(peak, text.size());
     }
   }
+}
+
+namespace {
+
+/**
+ * @brief Reads `fields`, which hold no '|', as the rows of a single column of type `type`.
+ */
+cudf::io::table_with_metadata read_fields(std::vector<std::string> const& fields,
+                                          data_type type,
+                                          char thousands = '\0')
+{
+  std::string buffer;
+  for (auto const& field : fields) {
+    buffer += field + '\n';
+  }
+  auto const source = cudf::io::source_info{cudf::host_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}};
+  return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                              .compression(cudf::io::compression_type::NONE)
+                              .dtypes({type})
+                              .delimiter('|')
+                              .thousands(thousands)
+                              .header(-1)
+                              .build());
+}
+
+/**
+ * @brief Checks that the floating-point column `column` holds exactly the bits of `expected`,
+ * where empty elements are nulls.
+ */
+template <typename T>
+void expect_bitwise_equal(std::vector<std::optional<T>> const& expected,
+                          cudf::column_view const& column)
+{
+  using bits_type = std::conditional_t<sizeof(T) == 8, int64_t, int32_t>;
+  std::vector<bits_type> bits;
+  std::vector<bool> validity;
+  for (auto const& value : expected) {
+    bits.push_back(std::bit_cast<bits_type>(value.value_or(T{0})));
+    validity.push_back(value.has_value());
+  }
+  auto const expected_bits = column_wrapper<bits_type>(bits.begin(), bits.end(), validity.begin());
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bits, cudf::bit_cast(column, dtype<bits_type>()));
+}
+
+}  // namespace
+
+TEST_F(CsvReaderTest, FractionDigitPlaceValues)
+{
+  // A fraction digit's place value is 1 divided by 10 once per preceding digit and once more, each
+  // division rounded; it underflows to zero after the 323rd digit. Field `k` has its only nonzero
+  // digit at position `k`, so it parses to that digit times the place value.
+  std::vector<std::string> fields;
+  std::vector<std::optional<double>> expected_doubles;
+  std::vector<std::optional<float>> expected_floats;
+  double place_value = 1;
+  for (int k = 1; k <= 330; ++k) {
+    place_value /= 10;
+    for (int digit : {1, 7}) {
+      fields.push_back("0." + std::string(k - 1, '0') + std::to_string(digit));
+      expected_doubles.push_back(digit * place_value);
+      expected_floats.push_back(static_cast<float>(digit * place_value));
+    }
+  }
+  EXPECT_EQ(place_value, 0.0);
+  expect_bitwise_equal(expected_doubles, read_fields(fields, dtype<double>()).tbl->get_column(0));
+  expect_bitwise_equal(expected_floats, read_fields(fields, dtype<float>()).tbl->get_column(0));
+
+  // Thousands separators and '+' characters in a fraction are skipped, and have no place value
+  auto const thousandth = 1.0 / 10 / 10 / 10;
+  auto const expected   = std::vector<std::optional<double>>{thousandth, thousandth, thousandth};
+  expect_bitwise_equal(
+    expected,
+    read_fields({"0.0,01", "0.0+0+1", "0.,0,0,1"}, dtype<double>(), ',').tbl->get_column(0));
 }
 
 namespace {
