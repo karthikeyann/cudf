@@ -4533,6 +4533,67 @@ TEST_F(CsvReaderTest, InvalidRowStagingPolicy)
                cudf::logic_error);
 }
 
+TEST_F(CsvReaderTest, NaAndBooleanValuesWithCommonPrefixes)
+{
+  // Keys that are prefixes of other keys, a duplicate key and the empty key. The non-ASCII keys
+  // sort after the ASCII keys as unsigned bytes, and "é" (C3 A9) and "ÿ" (C3 BF) share a first
+  // byte.
+  std::vector<std::string> const na_values{"a", "ab", "abc", "", "b", "é", "aé", "ÿ", "ab"};
+  std::vector<std::string> const strings{"a",
+                                         "ab",
+                                         "abc",
+                                         "",
+                                         "b",
+                                         "é",
+                                         "aé",
+                                         "ÿ",
+                                         "abcd",
+                                         "abd",
+                                         "ac",
+                                         "ba",
+                                         "c",
+                                         "éa",
+                                         "è",
+                                         "aéa",
+                                         "ÿÿ"};
+  auto const num_na_strings = 8;
+  std::vector<std::string> const bools{"y", "ye", "yes", "sí", "n", "no", "nö", "nó"};
+
+  std::string buffer;
+  std::vector<bool> expected_valid;
+  std::vector<bool> expected_bools;
+  for (size_t row = 0; row < strings.size(); ++row) {
+    auto const& boolean = bools[row % bools.size()];
+    buffer += strings[row] + ',' + boolean + '\n';
+    expected_valid.push_back(row >= num_na_strings);
+    expected_bools.push_back(row % bools.size() < 4);
+  }
+  auto const expected_strings =
+    cudf::test::strings_column_wrapper(strings.begin(), strings.end(), expected_valid.begin());
+  auto const expected_bool_column =
+    cudf::test::fixed_width_column_wrapper<bool>(expected_bools.begin(), expected_bools.end());
+
+  auto const read = [&](std::vector<data_type> const& dtypes) {
+    return cudf::io::read_csv(host_buffer_options(buffer)
+                                .header(-1)
+                                .dtypes(dtypes)
+                                .keep_default_na(false)
+                                .na_values(na_values)
+                                .true_values({"y", "ye", "yes", "sí"})
+                                .false_values({"n", "no", "nö", "nó"})
+                                .build());
+  };
+  with_each_row_staging_policy([&] {
+    for (auto const& dtypes : {std::vector<data_type>{dtype<cudf::string_view>(), dtype<bool>()},
+                               std::vector<data_type>{}}) {
+      SCOPED_TRACE(dtypes.empty() ? "inferred types" : "explicit types");
+      auto const result = read(dtypes);
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_strings, result.tbl->view().column(0));
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bool_column, result.tbl->view().column(1));
+    }
+  });
+}
+
 TEST_F(CsvReaderTest, TypeInferenceOfShortRows)
 {
   // Rows of fields of 1 to 3 characters, with the counts of each block in shared memory (up to 32

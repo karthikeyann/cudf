@@ -5,7 +5,7 @@
 
 /**
  * @brief Serialized trie implementation for C++/CUDA
- * @file trie.cuh
+ * @file trie.hpp
  */
 
 #pragma once
@@ -32,6 +32,10 @@ static constexpr char trie_terminating_character = '\n';
  * `children_offset` member is the offset between the node and its first child, or negative if the
  * node has no children. Matching is successful if all characters are matched and the final node is
  * the last character of a word (i.e. `is_leaf` is true).
+ *
+ * The first node is the root, which matches the empty key. Its children are the nodes that follow
+ * it, so its `children_offset` instead holds the length of the longest key, or -1 if that does not
+ * fit, which lets lookups reject longer keys without searching the trie.
  *
  * Node indexes and offsets are stored as `int16_t`, so `children_offset` is only meaningful for
  * tries of at most `std::numeric_limits<int16_t>::max()` nodes.
@@ -62,7 +66,7 @@ inline trie_view make_trie_view(optional_trie const& t)
  * @param keys Array of strings to insert into the trie
  * @param stream CUDA stream used for device memory operations and kernel launches.
  *
- * @return A host vector of nodes representing the serialized trie
+ * @return The nodes of the serialized trie in device memory; empty if `keys` is empty
  */
 CUDF_EXPORT trie create_serialized_trie(std::vector<std::string> const& keys,
                                         cuda::stream_ref stream);
