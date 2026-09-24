@@ -13,8 +13,10 @@
 #include <cudf_test/type_lists.hpp>
 
 #include <cudf/aggregation.hpp>
+#include <cudf/concatenate.hpp>
 #include <cudf/copying.hpp>
 #include <cudf/detail/iterator.cuh>
+#include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/io/csv.hpp>
 #include <cudf/io/datasource.hpp>
 #include <cudf/reduction.hpp>
@@ -3283,6 +3285,222 @@ TEST_F(CsvReaderTest, ParseDatesAndHexIndexesOutOfRange)
                                       result.tbl->view().column(0));
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int64_t>({1, 2}),
                                       result.tbl->view().column(1));
+}
+
+namespace {
+// Options builder for reading an uncompressed host buffer
+cudf::io::csv_reader_options_builder host_buffer_options(std::string const& buffer)
+{
+  return cudf::io::csv_reader_options::builder(
+           cudf::io::source_info{cudf::host_span<std::byte const>{
+             reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+    .compression(cudf::io::compression_type::NONE);
+}
+}  // namespace
+
+TEST_F(CsvReaderTest, EscapedQuotePairs)
+{
+  // Two string columns per row, so a field is unescaped next to other fields of the same row
+  std::string const buffer =
+    "0,\"a\"\"b\",\"c\"\"d\"\n"         // pair in the middle
+    "1,\"\"\"a\",\"b\"\"\"\n"           // pair at the start / at the end
+    "2,\"\"\"\",\"\"\"\"\"\"\n"         // content "" and """"
+    "3,\"\"\"a\"\"\",\"a\"\"\"\"b\"\n"  // quoted content, two adjacent pairs
+    "4,\"a\"\",b\",\"x\"\"\n\"\"y\"\n"  // pair before a delimiter / around a newline
+    "5,a\"\"b,\"a\"\"b\"\n"             // pairs in an unquoted field are kept
+    "6,\"\",\"plain\"\n";               // empty quoted field and a field without pairs
+  std::vector<std::string> const expected_a{"a\"b", "\"a", "\"", "\"a\"", "a\",b", "a\"\"b", ""};
+  std::vector<std::string> const expected_b{
+    "c\"d", "b\"", "\"\"", "a\"\"b", "x\"\n\"y", "a\"b", "plain"};
+
+  auto in_opts =
+    host_buffer_options(buffer).names({"id", "a", "b"}).header(-1).na_filter(false).build();
+  auto const inferred = cudf::io::read_csv(in_opts);
+
+  in_opts.set_dtypes(std::vector<data_type>{
+    dtype<int32_t>(), dtype<cudf::string_view>(), dtype<cudf::string_view>()});
+  auto const result = cudf::io::read_csv(in_opts);
+
+  auto const view = result.tbl->view();
+  ASSERT_EQ(view.num_columns(), 3);
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(view.column(0), column_wrapper<int32_t>{0, 1, 2, 3, 4, 5, 6});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    view.column(1), cudf::test::strings_column_wrapper(expected_a.begin(), expected_a.end()));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(
+    view.column(2), cudf::test::strings_column_wrapper(expected_b.begin(), expected_b.end()));
+
+  // Inferred string columns are unescaped the same way
+  CUDF_TEST_EXPECT_TABLES_EQUAL(view.select({1, 2}), inferred.tbl->view().select({1, 2}));
+}
+
+TEST_F(CsvReaderTest, EscapedQuotePairsOptions)
+{
+  auto const read_strings = [](std::string const& buffer, auto&& configure) {
+    auto in_opts =
+      host_buffer_options(buffer).header(-1).dtypes({dtype<cudf::string_view>()}).build();
+    configure(in_opts);
+    return cudf::io::read_csv(in_opts);
+  };
+  auto const strings = [](std::vector<std::string> const& values) {
+    return cudf::test::strings_column_wrapper(values.begin(), values.end());
+  };
+
+  {
+    // Custom quote character: only its pairs are escapes
+    auto const result = read_strings("'it''s'\n'\"a\"\"b\"'\n\"x\"\"y\"\n",
+                                     [](auto& opts) { opts.set_quotechar('\''); });
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0),
+                                   strings({"it's", "\"a\"\"b\"", "\"x\"\"y\""}));
+  }
+  {
+    // Whitespace around the quotes is removed before unescaping
+    auto const result = read_strings("  \"a\"\"b\"  \n\"\"\"c\" \n", [](auto& opts) {
+      opts.enable_detect_whitespace_around_quotes(true);
+    });
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), strings({"a\"b", "\"c"}));
+  }
+  {
+    // CRLF line ends, with a pair right before the closing quote
+    auto const result = read_strings("\"a\"\"\"\r\n\"b\"\"c\"\r\n\"\"\"\"\r\n", [](auto&) {});
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), strings({"a\"", "b\"c", "\""}));
+  }
+  {
+    // Without doublequote, pairs are kept as they are
+    auto const result =
+      read_strings("\"a\"\"b\"\n\"c\"\n", [](auto& opts) { opts.enable_doublequote(false); });
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), strings({"a\"\"b", "c"}));
+  }
+  {
+    // With quoting disabled, quotes are ordinary characters
+    auto const result = read_strings(
+      "\"a\"\"b\"\n", [](auto& opts) { opts.set_quoting(cudf::io::quote_style::NONE); });
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), strings({"\"a\"\"b\""}));
+  }
+}
+
+TEST_F(CsvReaderTest, EscapedQuotePairsManyRows)
+{
+  // Enough rows for many thread blocks; every other row is quoted and only those are unescaped
+  constexpr int num_rows = 10'000;
+  std::string buffer;
+  std::vector<int32_t> expected_ids;
+  std::vector<std::string> expected_strings;
+  std::vector<double> expected_values;
+  for (int i = 0; i < num_rows; ++i) {
+    auto const text = std::to_string(i);
+    if (i % 2 == 0) {
+      buffer += text + ",\"\"\"" + text + "\"\",\"\"\"," + text + ".5\n";
+      expected_strings.push_back("\"" + text + "\",\"");
+    } else {
+      buffer += text + "," + text + "\"\"," + text + ".5\n";
+      expected_strings.push_back(text + "\"\"");
+    }
+    expected_ids.push_back(i);
+    expected_values.push_back(i + 0.5);
+  }
+
+  auto const result = cudf::io::read_csv(host_buffer_options(buffer).header(-1).dtypes(
+    std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>(), dtype<double>()}));
+
+  auto const view = result.tbl->view();
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+    view.column(0), column_wrapper<int32_t>(expected_ids.begin(), expected_ids.end()));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+    view.column(1),
+    cudf::test::strings_column_wrapper(expected_strings.begin(), expected_strings.end()));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+    view.column(2), column_wrapper<double>(expected_values.begin(), expected_values.end()));
+}
+
+TEST_F(CsvReaderTest, EscapedQuotePairsByteRanges)
+{
+  // Rows are decoded in place, so the rows selected by a byte range must be unescaped exactly as in
+  // a full read: reading consecutive byte ranges and concatenating the results gives the full read
+  auto const read_range = [](std::string const& buffer, std::size_t offset, std::size_t size) {
+    return cudf::io::read_csv(
+      host_buffer_options(buffer)
+        .names({"a", "b", "c"})
+        .header(-1)
+        .dtypes(std::vector<data_type>{
+          dtype<int32_t>(), dtype<cudf::string_view>(), dtype<cudf::string_view>()})
+        .byte_range_offset(offset)
+        .byte_range_size(size));
+  };
+  auto const expect_concatenated_ranges_equal = [&](std::string const& buffer,
+                                                    std::vector<std::size_t> const& offsets) {
+    auto const full = read_range(buffer, 0, 0);
+    std::vector<std::unique_ptr<cudf::table>> parts;
+    for (std::size_t i = 0; i < offsets.size(); ++i) {
+      auto const end = i + 1 < offsets.size() ? offsets[i + 1] : buffer.size();
+      parts.push_back(read_range(buffer, offsets[i], end - offsets[i]).tbl);
+    }
+    std::vector<cudf::table_view> views;
+    std::transform(parts.begin(), parts.end(), std::back_inserter(views), [](auto const& part) {
+      return part->view();
+    });
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(full.tbl->view(), cudf::concatenate(views)->view());
+  };
+
+  constexpr int num_rows = 50;
+  {
+    // Ranges of any size, with pairs next to delimiters inside and outside quoted fields
+    std::string buffer;
+    for (int i = 0; i < num_rows; ++i) {
+      auto const text = std::to_string(i);
+      buffer += text + ",\"q\"\"" + text + ",\"\"z\"," + (i % 3 == 0 ? "u\"\"" : "\"\"\"\"") + "\n";
+    }
+    for (std::size_t const range_size : {7, 16, 33, 100}) {
+      std::vector<std::size_t> offsets;
+      for (std::size_t offset = 0; offset < buffer.size(); offset += range_size) {
+        offsets.push_back(offset);
+      }
+      expect_concatenated_ranges_equal(buffer, offsets);
+    }
+  }
+  {
+    // Quoted newlines. A range that starts after the beginning of the input can't tell them from
+    // row ends, so these ranges start at the beginning. A range selects the rows whose preceding
+    // row end is in the range, i.e. the rows that start at or before its end.
+    std::string buffer;
+    std::vector<std::size_t> row_starts;
+    for (int i = 0; i < num_rows; ++i) {
+      auto const text = std::to_string(i);
+      row_starts.push_back(buffer.size());
+      buffer += text + ",\"q\"\"" + text + "\n\"\"z\",\"a\r\n\"\"\"\n";
+    }
+    auto const full = read_range(buffer, 0, 0);
+    for (std::size_t const range_size : {1, 20, 21, 22, 100, 500}) {
+      auto const num_selected = std::count_if(
+        row_starts.begin(), row_starts.end(), [&](auto start) { return start <= range_size; });
+      auto const expected =
+        cudf::slice(full.tbl->view(), {0, static_cast<cudf::size_type>(num_selected)}).front();
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected, read_range(buffer, 0, range_size).tbl->view());
+    }
+  }
+}
+
+TEST_F(CsvReaderTest, EscapedQuotePairsDeviceSourceUnchanged)
+{
+  // The reader unescapes its own copy of the data, never the caller's buffer. The reader copies
+  // device inputs today; this guards against future zero-copy paths writing the caller's buffer.
+  std::string const buffer = "a,b\n1,\"x\"\"y\"\n2,\"\"\"\"\"\"\n";
+  auto const stream        = cudf::get_default_stream();
+  auto const d_buffer =
+    cudf::detail::make_device_uvector(cudf::host_span<char const>{buffer.data(), buffer.size()},
+                                      stream,
+                                      cudf::get_current_device_resource_ref());
+
+  auto const result = cudf::io::read_csv(
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::device_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(d_buffer.data()), d_buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()}));
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(1),
+                                 cudf::test::strings_column_wrapper({"x\"y", "\"\""}));
+
+  auto const h_after = cudf::detail::make_std_vector(d_buffer, stream);
+  EXPECT_EQ(std::string(h_after.begin(), h_after.end()), buffer);
 }
 
 namespace {
