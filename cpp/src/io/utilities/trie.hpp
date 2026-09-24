@@ -68,5 +68,19 @@ inline trie_view make_trie_view(optional_trie const& t)
 CUDF_EXPORT trie create_serialized_trie(std::vector<std::string> const& keys,
                                         cuda::stream_ref stream);
 
+/**
+ * @brief Creates the serialized tries of several sets of keys.
+ *
+ * Like `create_serialized_trie` for each set of keys, but the tries are uploaded to the device with
+ * a single synchronization of `stream` instead of one per trie.
+ *
+ * @param key_sets Sets of strings, each to insert into its own trie
+ * @param stream CUDA stream used for device memory operations
+ *
+ * @return The serialized trie of each set of keys, in order; empty for an empty set
+ */
+CUDF_EXPORT std::vector<trie> create_serialized_tries(
+  host_span<std::vector<std::string> const> key_sets, cuda::stream_ref stream);
+
 }  // namespace detail
 }  // namespace cudf

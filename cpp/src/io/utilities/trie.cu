@@ -10,6 +10,7 @@
 
 #include "trie.cuh"
 
+#include <cudf/detail/utilities/cuda.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
@@ -108,6 +109,25 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
   if (keys.empty()) { return rmm::device_uvector<serial_trie_node>{0, stream}; }
   return cudf::detail::make_device_uvector(
     serialize_trie(keys), stream, cudf::get_current_device_resource_ref());
+}
+
+std::vector<rmm::device_uvector<serial_trie_node>> create_serialized_tries(
+  host_span<std::vector<std::string> const> key_sets, cuda::stream_ref stream)
+{
+  std::vector<std::vector<serial_trie_node>> host_tries;
+  std::vector<rmm::device_uvector<serial_trie_node>> tries;
+  host_tries.reserve(key_sets.size());
+  tries.reserve(key_sets.size());
+  for (auto const& keys : key_sets) {
+    host_tries.push_back(keys.empty() ? std::vector<serial_trie_node>{} : serialize_trie(keys));
+    tries.push_back(cudf::detail::make_device_uvector_async(
+      host_tries.back(), stream, cudf::get_current_device_resource_ref()));
+  }
+  // The copies may read the host nodes only when the stream reaches them (see
+  // `cudf::detail::memcpy_batch_async`), so the nodes must stay alive until the stream is
+  // synchronized: once for all tries, instead of once per trie as in `create_serialized_trie`
+  cudf::detail::sync_stream(stream);
+  return tries;
 }
 
 }  // namespace detail

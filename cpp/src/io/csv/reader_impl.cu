@@ -1168,11 +1168,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 }
 
 /**
- * @brief Create a serialized trie for N/A value matching, based on the options.
+ * @brief Returns the values to match as N/A values, based on the options.
  */
-cudf::detail::trie create_na_trie(char quotechar,
-                                  csv_reader_options const& reader_opts,
-                                  cuda::stream_ref stream)
+std::vector<std::string> get_na_values(char quotechar, csv_reader_options const& reader_opts)
 {
   // Default values to recognize as null values
   static std::vector<std::string> const default_na_values{"",
@@ -1194,7 +1192,7 @@ cudf::detail::trie create_na_trie(char quotechar,
                                                           "nan",
                                                           "null"};
 
-  if (!reader_opts.is_enabled_na_filter()) { return cudf::detail::trie(0, stream); }
+  if (!reader_opts.is_enabled_na_filter()) { return {}; }
 
   std::vector<std::string> na_values = reader_opts.get_na_values();
   if (reader_opts.is_enabled_keep_default_na()) {
@@ -1206,7 +1204,7 @@ cudf::detail::trie create_na_trie(char quotechar,
     na_values.emplace_back(2, quotechar);
   }
 
-  return cudf::detail::create_serialized_trie(na_values, stream);
+  return na_values;
 }
 
 parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::stream_ref stream)
@@ -1246,22 +1244,15 @@ parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::st
   CUDF_EXPECTS(parse_opts.thousands != parse_opts.delimiter,
                "Thousands separator cannot be the same as the delimiter");
 
-  // Handle user-defined true values, whereby field data is substituted with a
-  // boolean true or numeric `1` value
-  if (not reader_opts.get_true_values().empty()) {
-    parse_opts.trie_true =
-      cudf::detail::create_serialized_trie(reader_opts.get_true_values(), stream);
-  }
-
-  // Handle user-defined false values, whereby field data is substituted with a
-  // boolean false or numeric `0` value
-  if (not reader_opts.get_false_values().empty()) {
-    parse_opts.trie_false =
-      cudf::detail::create_serialized_trie(reader_opts.get_false_values(), stream);
-  }
-
-  // Handle user-defined N/A values, whereby field data is treated as null
-  parse_opts.trie_na = create_na_trie(parse_opts.quotechar, reader_opts, stream);
+  // Fields that match the true (false) values are substituted with a boolean true (false) or a
+  // numeric 1 (0) value, and fields that match the N/A values are null
+  auto const key_sets   = std::vector{reader_opts.get_true_values(),
+                                    reader_opts.get_false_values(),
+                                    get_na_values(parse_opts.quotechar, reader_opts)};
+  auto tries            = cudf::detail::create_serialized_tries(key_sets, stream);
+  parse_opts.trie_true  = std::move(tries[0]);
+  parse_opts.trie_false = std::move(tries[1]);
+  parse_opts.trie_na    = std::move(tries[2]);
 
   return parse_opts;
 }
