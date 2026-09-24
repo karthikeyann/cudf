@@ -36,12 +36,14 @@
 #include <thrust/execution_policy.h>
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
 #include <limits>
 #include <mutex>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <string>
@@ -4472,6 +4474,290 @@ TEST_F(CsvReaderTest, TypeInferenceOfWideTables)
     auto const expected =
       cudf::io::read_csv(host_buffer_options(buffer).header(-1).dtypes(dtypes).build());
     CUDF_TEST_EXPECT_TABLES_EQUAL(expected.tbl->view(), inferred.tbl->view());
+  }
+}
+
+namespace {
+/**
+ * @brief Sets the policy with which the CSV decoding kernels stage rows in shared memory (the
+ * `LIBCUDF_CSV_ROW_STAGING` environment variable) for the lifetime of the object, and then restores
+ * the previous one.
+ */
+class row_staging_policy_setter {
+ public:
+  explicit row_staging_policy_setter(char const* policy)
+  {
+    if (auto const* previous = std::getenv(variable); previous != nullptr) { _previous = previous; }
+    setenv(variable, policy, 1);
+  }
+  row_staging_policy_setter(row_staging_policy_setter const&)            = delete;
+  row_staging_policy_setter& operator=(row_staging_policy_setter const&) = delete;
+  ~row_staging_policy_setter()
+  {
+    if (_previous.has_value()) {
+      setenv(variable, _previous->c_str(), 1);
+    } else {
+      unsetenv(variable);
+    }
+  }
+
+ private:
+  static constexpr char const* variable = "LIBCUDF_CSV_ROW_STAGING";
+  std::optional<std::string> _previous;
+};
+
+/**
+ * @brief Runs `test` with the rows of the decoding kernels staged in shared memory wherever they
+ * fit, and with the rows never staged, so that both parsing paths are tested on every GPU.
+ */
+template <typename Test>
+void with_each_row_staging_policy(Test const& test)
+{
+  for (auto const* policy : {"ALWAYS", "NEVER"}) {
+    SCOPED_TRACE(std::string{"row staging "} + policy);
+    row_staging_policy_setter const setter{policy};
+    test();
+  }
+}
+}  // namespace
+
+TEST_F(CsvReaderTest, InvalidRowStagingPolicy)
+{
+  row_staging_policy_setter const setter{"SOMETIMES"};
+  std::string const buffer = "1,2\n3,4\n";
+  EXPECT_THROW(cudf::io::read_csv(host_buffer_options(buffer).header(-1).build()),
+               cudf::logic_error);
+}
+
+TEST_F(CsvReaderTest, TypeInferenceOfShortRows)
+{
+  // Rows of fields of 1 to 3 characters, with the counts of each block in shared memory (up to 32
+  // columns) or in global memory
+  constexpr int num_rows  = 300;
+  auto const column_types = std::vector<data_type>{
+    dtype<int64_t>(), dtype<double>(), dtype<bool>(), dtype<cudf::string_view>()};
+  for (int const num_columns : {1, 3, 32, 33, 36}) {
+    SCOPED_TRACE("columns " + std::to_string(num_columns));
+    std::string buffer;
+    for (int row = 0; row < num_rows; ++row) {
+      for (int col = 0; col < num_columns; ++col) {
+        if (col != 0) { buffer += ','; }
+        if ((row + col) % 11 == 0) { continue; }
+        switch (col % column_types.size()) {
+          case 0: buffer += std::to_string(row % 10); break;
+          case 1: buffer += std::to_string(row % 7) + ".5"; break;
+          case 2: buffer += row % 3 == 0 ? "T" : "F"; break;
+          default: buffer += static_cast<char>('a' + row % 26); break;
+        }
+      }
+      buffer += '\n';
+    }
+    std::vector<data_type> dtypes;
+    for (int col = 0; col < num_columns; ++col) {
+      dtypes.push_back(column_types[col % column_types.size()]);
+    }
+
+    auto const read = [&](std::vector<data_type> const& types) {
+      return cudf::io::read_csv(host_buffer_options(buffer)
+                                  .header(-1)
+                                  .true_values({"T"})
+                                  .false_values({"F"})
+                                  .dtypes(types)
+                                  .build());
+    };
+    with_each_row_staging_policy(
+      [&] { CUDF_TEST_EXPECT_TABLES_EQUAL(read(dtypes).tbl->view(), read({}).tbl->view()); });
+  }
+}
+
+namespace {
+// Rows with an INT64, a FLOAT64, a quoted STRING column with escaped quotes and an unquoted STRING
+// filler column that brings each row to a given length, and the columns they hold
+struct rows_of_lengths {
+  std::string text;
+  std::vector<int64_t> ints;
+  std::vector<double> doubles;
+  std::vector<std::string> quoted;
+  std::vector<std::string> fillers;
+
+  explicit rows_of_lengths(std::vector<size_t> const& row_lengths, std::string prefix = "")
+    : text{std::move(prefix)}
+  {
+    for (size_t i = 0; i < row_lengths.size(); ++i) {
+      auto const id = std::to_string(i);
+      ints.push_back(static_cast<int64_t>(i) * 37 - 1000);
+      doubles.push_back(static_cast<double>(i) + 0.25);
+      quoted.push_back("q\"" + id + "\"");
+      auto const row = std::to_string(ints.back()) + ',' + id + ".25,\"q\"\"" + id + "\"\"\",";
+      // At least one filler character, so that the filler is not an NA field
+      auto const filler_length = std::max(row_lengths[i], row.size() + 2) - row.size() - 1;
+      fillers.push_back(std::string(filler_length, static_cast<char>('a' + i % 26)));
+      text += row + fillers.back() + '\n';
+    }
+  }
+
+  [[nodiscard]] cudf::table expected() const
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(column_wrapper<int64_t>(ints.begin(), ints.end()).release());
+    columns.push_back(column_wrapper<double>(doubles.begin(), doubles.end()).release());
+    columns.push_back(cudf::test::strings_column_wrapper(quoted.begin(), quoted.end()).release());
+    columns.push_back(cudf::test::strings_column_wrapper(fillers.begin(), fillers.end()).release());
+    return cudf::table{std::move(columns)};
+  }
+
+  /**
+   * @brief Checks the columns read from a host buffer, with explicit and with inferred column
+   * types, with each row staging policy.
+   *
+   * @param header Index of the header row (-1 for none), which `text` must then hold
+   * @param comment Comment character, which lines of `text` before the rows may start with
+   */
+  void expect_read(int header = -1, char comment = '\0') const
+  {
+    auto const table = expected();
+    auto const read  = [&](bool infer_types) {
+      auto opts = host_buffer_options(text).header(header).comment(comment).build();
+      if (not infer_types) {
+        opts.set_dtypes({dtype<int64_t>(),
+                         dtype<double>(),
+                         dtype<cudf::string_view>(),
+                         dtype<cudf::string_view>()});
+      }
+      return cudf::io::read_csv(opts).tbl;
+    };
+    with_each_row_staging_policy([&] {
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table.view(), read(false)->view());
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(table.view(), read(true)->view());
+    });
+  }
+};
+
+/// Rows per thread block of the decoding kernels
+constexpr size_t rows_per_decode_block = 128;
+/// Shared memory of a kernel launch without opting in to more, on every GPU: the decode kernel has
+/// no static shared memory, so its staged rows can use all of it (see `convert_csv_to_cudf`)
+constexpr size_t max_staging_size = 48 * 1024;
+/// Alignment of the staged rows in shared memory: up to 15 bytes precede the first row
+constexpr size_t staging_alignment = 16;
+}  // namespace
+
+TEST_F(CsvReaderTest, RowsAroundStagingLimit)
+{
+  // The first block of rows starts at the last position of a 16-byte word, so that 15 bytes of the
+  // shared memory precede them when staged (after a comment line of 15 characters). Its rows have:
+  // - the most characters that can be staged, which fill the shared memory;
+  // - a multiple of 16 characters, which need the 15 bytes before them on top of their number;
+  // - one character more than can be staged, so they are parsed in global memory.
+  // The other rows are short.
+  auto const prefix             = "#" + std::string(13, 'c') + "\n";
+  auto const max_staged_chars   = max_staging_size - (staging_alignment - 1);
+  auto const aligned_block_size = max_staged_chars / staging_alignment * staging_alignment;
+  for (auto const block_size : {max_staged_chars, aligned_block_size, max_staged_chars + 1}) {
+    SCOPED_TRACE("block characters " + std::to_string(block_size));
+    std::vector<size_t> row_lengths(rows_per_decode_block - 1, block_size / rows_per_decode_block);
+    row_lengths.push_back(block_size - (rows_per_decode_block - 1) * row_lengths.front());
+    row_lengths.resize(300, 40);
+    rows_of_lengths{row_lengths, prefix}.expect_read(-1, '#');
+  }
+}
+
+TEST_F(CsvReaderTest, RowStagingSizeOfRowsAfterHeader)
+{
+  // The rows to read are those after the header, and the shared memory that stages them is sized
+  // for the blocks of these rows, whose first block is longer than any block of rows that includes
+  // the header: 128 rows of 100 characters, followed by short rows
+  std::vector<size_t> row_lengths(rows_per_decode_block, 100);
+  row_lengths.resize(400, 30);
+  for (int const header : {0, 1}) {
+    SCOPED_TRACE("header " + std::to_string(header));
+    auto const prefix = std::string{header == 1 ? "x\n" : ""} + "a,b,c,d\n";
+    rows_of_lengths{row_lengths, prefix}.expect_read(header);
+  }
+}
+
+TEST_F(CsvReaderTest, LongRows)
+{
+  // Blocks of rows too long to be staged in shared memory are parsed in global memory
+  rows_of_lengths{std::vector<size_t>(1000, 530)}.expect_read();
+
+  // A single row too long for its block to be staged, among short rows (first, in the middle and
+  // last): the rows of no block are staged, since a launch stages the rows of all blocks or none
+  for (size_t const long_row : {0, 500, 999}) {
+    SCOPED_TRACE("long row " + std::to_string(long_row));
+    std::vector<size_t> row_lengths(1000, 40);
+    row_lengths[long_row] = 60 * 1024;
+    rows_of_lengths{row_lengths}.expect_read();
+  }
+}
+
+TEST_F(CsvReaderTest, RowsAtAllAlignments)
+{
+  // Staged rows keep their alignment in shared memory: rows of varied lengths, shifted by a
+  // comment line of 0 to 16 characters so that each block's rows start at every position of a
+  // 16-byte word
+  std::vector<size_t> row_lengths;
+  for (size_t i = 0; i < 700; ++i) {
+    row_lengths.push_back(20 + (i * 7) % 45);
+  }
+  for (size_t shift = 0; shift <= 16; ++shift) {
+    SCOPED_TRACE("shift " + std::to_string(shift));
+    auto const prefix = shift == 0 ? std::string{} : '#' + std::string(shift - 1, 'c') + '\n';
+    rows_of_lengths{row_lengths, prefix}.expect_read(-1, '#');
+  }
+}
+
+TEST_F(CsvReaderTest, EmptyEdgeFieldsOfBlocks)
+{
+  // Rows of 16 characters whose first and last fields are empty, so that the rows of every block
+  // start at the beginning of a 16-byte word, where they are staged at the start of the shared
+  // memory buffer, and end with an empty field. Parsing the empty fields must not read outside of
+  // the rows. Under compute-sanitizer with exact allocations (--rmm_mode=cuda), such reads are
+  // detected when the rows are parsed in global memory. (Reads just before a shared memory buffer
+  // are not detected: they fall in memory reserved by the system.)
+  std::vector<int64_t> values;
+  std::string rows;
+  for (int64_t i = 0; i < 300; ++i) {
+    values.push_back(1'000'000'000'000 + i);
+    rows += ',' + std::to_string(values.back()) + ",\n";
+  }
+  ASSERT_EQ(rows.size(), 300 * 16);
+  auto const zeros         = std::vector<int64_t>(values.size(), 0);
+  auto const empty_strings = std::vector<std::string>(values.size());
+
+  for (bool const final_terminator : {true, false}) {
+    SCOPED_TRACE(final_terminator ? "with final terminator" : "without final terminator");
+    auto const text = final_terminator ? rows : rows.substr(0, rows.size() - 1);
+    // Without a final terminator, the last row ends with its delimiter, and its last field is
+    // missing (null)
+    std::vector<bool> last_valid(values.size(), true);
+    last_valid.back() = final_terminator;
+
+    with_each_row_staging_policy([&] {
+      // Without NA filtering, an empty numeric field parses as zero
+      auto const result =
+        cudf::io::read_csv(host_buffer_options(text)
+                             .header(-1)
+                             .na_filter(false)
+                             .dtypes({dtype<int64_t>(), dtype<int64_t>(), dtype<int64_t>()})
+                             .build());
+      auto const view = result.tbl->view();
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int64_t>(zeros.begin(), zeros.end()),
+                                          view.column(0));
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int64_t>(values.begin(), values.end()),
+                                          view.column(1));
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+        column_wrapper<int64_t>(zeros.begin(), zeros.end(), last_valid.begin()), view.column(2));
+
+      // With inferred types, empty fields are strings without NA filtering
+      auto const inferred =
+        cudf::io::read_csv(host_buffer_options(text).header(-1).na_filter(false).build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+        cudf::test::strings_column_wrapper(empty_strings.begin(), empty_strings.end()),
+        inferred.tbl->view().column(0));
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int64_t>(values.begin(), values.end()),
+                                          inferred.tbl->view().column(1));
+    });
   }
 }
 
