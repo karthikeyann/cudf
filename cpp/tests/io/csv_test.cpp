@@ -3061,6 +3061,39 @@ TEST_F(CsvReaderTest, DurationsAtEndOfInput)
   expect_duration("1 days 00:00:01.", cudf::duration_ms{24h + 1s});
 }
 
+TEST_F(CsvReaderTest, NaValuesDoNotMatchLongerFields)
+{
+  // The fields that are not null extend an NA value with characters that occur in the NA values
+  std::string const buffer = "NA\nNAA\nNA/A\nNAULL\n#NA\n#NAA\nN/A\n";
+
+  cudf::io::csv_reader_options const default_na_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes({dtype<cudf::string_view>()})
+      .header(-1);
+  auto const default_na_result   = cudf::io::read_csv(default_na_opts);
+  auto const default_na_expected = cudf::test::strings_column_wrapper(
+    {"", "NAA", "NA/A", "NAULL", "", "#NAA", ""}, {false, true, true, true, false, true, false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(default_na_expected, default_na_result.tbl->view().column(0));
+
+  std::string const custom_buffer = "a\nb\naa\nab\nba\nbb\n";
+  cudf::io::csv_reader_options const custom_na_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(custom_buffer.data()), custom_buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes({dtype<cudf::string_view>()})
+      .header(-1)
+      .keep_default_na(false)
+      .na_values({"a", "b"});
+  auto const custom_na_result   = cudf::io::read_csv(custom_na_opts);
+  auto const custom_na_expected = cudf::test::strings_column_wrapper(
+    {"", "", "aa", "ab", "ba", "bb"}, {false, false, true, true, true, true});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(custom_na_expected, custom_na_result.tbl->view().column(0));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

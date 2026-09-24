@@ -2398,6 +2398,24 @@ TEST_F(JsonReaderTest, TimestampsWithIncompleteTimeOfDay)
                                  cudf::slice(time_only_second.tbl->get_column(0), {0, 1}).front());
 }
 
+TEST_F(JsonReaderTest, NaValuesDoNotMatchLongerValues)
+{
+  // The values that are not null extend an NA value with characters that occur in the NA values
+  std::string const data = "{\"a\": 1}\n{\"a\": 22}\n{\"a\": 2}\n{\"a\": 21}\n{\"a\": 12}\n";
+
+  cudf::io::json_reader_options const in_options =
+    cudf::io::json_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+      .lines(true)
+      .na_values({"1", "2"});
+  auto const result = cudf::io::read_json(in_options);
+
+  ASSERT_EQ(result.tbl->num_columns(), 1);
+  auto const expected = int64_wrapper{{0, 22, 0, 21, 12}, {false, true, false, true, true}};
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->get_column(0));
+}
+
 TEST_F(JsonReaderTest, MixedTypes)
 {
   using LCWS    = cudf::test::lists_column_wrapper<cudf::string_view>;
