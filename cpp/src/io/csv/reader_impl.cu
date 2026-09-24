@@ -198,6 +198,61 @@ void erase_except_last(C& container, cuda::stream_ref stream)
   container.resize(1, stream);
 }
 
+/// Size of the chunks in which the input is read and parsed when only some of the rows are selected
+constexpr size_t max_row_selection_chunk_bytes = 64 * 1024 * 1024;  // 64MB
+
+/// Size of the reads from sources that do not prefer device reads
+constexpr size_t max_host_read_bytes = 32 * 1024 * 1024;  // 32MB
+
+/**
+ * @brief Reads a range of the source into device memory.
+ *
+ * Sources that prefer device reads are read directly into `dst`. Other sources are read in chunks
+ * of at most `max_host_read_bytes`, so that the host memory used stays bounded regardless of the
+ * size of the range: at most two chunks are held at a time, the one being copied to the device and
+ * the next one, whose read is requested before the copy so that it overlaps with it.
+ *
+ * @param source The source to read from
+ * @param offset Position of the range in the source
+ * @param dst Device memory that receives the range, and whose size is the size of the range
+ * @param stream CUDA stream used for the copies
+ */
+void read_source_to_device(datasource* source,
+                           size_t offset,
+                           device_span<char> dst,
+                           cuda::stream_ref stream)
+{
+  if (dst.empty()) { return; }
+  if (source->is_device_read_preferred(dst.size())) {
+    source->device_read(offset, dst.size(), reinterpret_cast<uint8_t*>(dst.data()), stream);
+    return;
+  }
+  auto const chunk_size = [&](size_t pos) {
+    return std::min(max_host_read_bytes, dst.size() - pos);
+  };
+  auto next_chunk = source->host_read_async(offset, chunk_size(0));
+  try {
+    for (size_t pos = 0; pos < dst.size();) {
+      auto const chunk = next_chunk.get();
+      auto const size  = chunk_size(pos);
+      CUDF_EXPECTS(chunk->size() == size, "Unexpected end of the CSV source data");
+      if (pos + size < dst.size()) {
+        next_chunk = source->host_read_async(offset + pos + size, chunk_size(pos + size));
+      }
+      // Synchronous, so that the chunk can be released
+      cudf::detail::cuda_memcpy(
+        dst.subspan(pos, size),
+        host_span<char const>{reinterpret_cast<char const*>(chunk->data()), size},
+        stream);
+      pos += size;
+    }
+  } catch (...) {
+    // The pending read uses the source, which may be destroyed once the exception propagates
+    if (next_chunk.valid()) { next_chunk.wait(); }
+    throw;
+  }
+}
+
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 [[nodiscard]] bool has_utf8_bom(host_span<char const> data)
 {
@@ -240,10 +295,7 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
   bool load_whole_file,
   cuda::stream_ref stream)
 {
-  constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
-
   auto const data_size      = data.has_value() ? data->size() : source->size();
-  auto const buffer_size    = std::min(max_chunk_bytes, data_size);
   auto const max_input_size = [&] {
     if (range_end == data_size) {
       return data_size - byte_range_offset;
@@ -261,151 +313,155 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
   auto pos = range_begin;
   // When using byte range, need the line terminator of last line before the range
   auto input_pos = byte_range_offset == 0 ? pos : pos - 1;
-  uint64_t ctx   = 0;
+
+  auto const load_input = [&](size_t offset, device_span<char> dst) {
+    if (data.has_value()) {
+      cudf::detail::cuda_memcpy_async(dst, data->subspan(offset, dst.size()), stream);
+    } else {
+      read_source_to_device(source, offset, dst, stream);
+    }
+  };
 
   rmm::device_uvector<char> d_data{0, stream};
-  d_data.reserve((load_whole_file) ? data_size : std::min(buffer_size * 2, max_input_size), stream);
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
+  if (load_whole_file) {
+    // Without row selection, the whole file is loaded and its rows gathered in a single pass
+    d_data.resize(max_input_size - input_pos, stream);
+    load_input(byte_range_offset + input_pos, d_data);
+    all_row_offsets = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(), d_data, stream);
+  } else {
+    // Reading in chunks bounds the work done before reaching the end of the byte range or the
+    // requested number of rows
+    auto const buffer_size = std::min(max_row_selection_chunk_bytes, data_size);
+    d_data.reserve(std::min(buffer_size * 2, max_input_size), stream);
 
-  auto const max_blocks =
-    std::max<size_t>((buffer_size / cudf::io::csv::gpu::rowofs_block_bytes) + 1, 2);
-  cudf::detail::hostdevice_vector<uint64_t> row_ctx(max_blocks, stream);
-  do {
-    auto const target_pos = std::min(pos + max_chunk_bytes, max_input_size);
-    auto const chunk_size = target_pos - pos;
+    auto const max_blocks =
+      std::max<size_t>((buffer_size / cudf::io::csv::gpu::rowofs_block_bytes) + 1, 2);
+    cudf::detail::hostdevice_vector<uint64_t> row_ctx(max_blocks, stream);
+    uint64_t ctx = 0;
+    do {
+      auto const target_pos = std::min(pos + max_row_selection_chunk_bytes, max_input_size);
+      auto const chunk_size = target_pos - pos;
 
-    auto const previous_data_size = d_data.size();
-    d_data.resize(target_pos - input_pos, stream);
+      auto const previous_data_size = d_data.size();
+      d_data.resize(target_pos - input_pos, stream);
 
-    auto const read_offset = byte_range_offset + input_pos + previous_data_size;
-    auto const read_size   = target_pos - input_pos - previous_data_size;
-    if (data.has_value()) {
-      cudf::detail::cuda_memcpy_async(
-        device_span<char>{d_data.data() + previous_data_size, read_size},
-        data->subspan(read_offset, read_size),
-        stream);
-    } else {
-      if (source->is_device_read_preferred(read_size)) {
-        source->device_read(read_offset,
-                            read_size,
-                            reinterpret_cast<uint8_t*>(d_data.data() + previous_data_size),
-                            stream);
-      } else {
-        auto const buffer = source->host_read(read_offset, read_size);
-        // Use sync version to prevent buffer going out of scope before we copy the data.
-        cudf::detail::cuda_memcpy(
-          device_span<char>{d_data.data() + previous_data_size, read_size},
-          host_span<char const>{reinterpret_cast<char const*>(buffer->data()), buffer->size()},
-          stream);
-      }
-    }
+      auto const read_offset = byte_range_offset + input_pos + previous_data_size;
+      auto const read_size   = target_pos - input_pos - previous_data_size;
+      auto const read_dst    = device_span<char>{d_data.data() + previous_data_size, read_size};
+      load_input(read_offset, read_dst);
 
-    // Pass 1: Count the potential number of rows in each character block for each
-    // possible parser state at the beginning of the block.
-    auto const num_blocks = cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
-                                                                   row_ctx.device_ptr(),
-                                                                   device_span<uint64_t>(),
-                                                                   d_data,
-                                                                   chunk_size,
-                                                                   pos,
-                                                                   input_pos,
-                                                                   max_input_size,
-                                                                   range_begin,
-                                                                   range_end,
-                                                                   skip_rows,
-                                                                   stream);
+      // Pass 1: Count the potential number of rows in each character block for each
+      // possible parser state at the beginning of the block.
+      auto const num_blocks = cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
+                                                                     row_ctx.device_ptr(),
+                                                                     device_span<uint64_t>(),
+                                                                     d_data,
+                                                                     chunk_size,
+                                                                     pos,
+                                                                     input_pos,
+                                                                     max_input_size,
+                                                                     range_begin,
+                                                                     range_end,
+                                                                     skip_rows,
+                                                                     stream);
 
-    cudf::detail::cuda_memcpy(
-      host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
-      device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
-      stream);
-
-    // Sum up the rows in each character block, selecting the row count that
-    // corresponds to the current input context. Also stores the now known input
-    // context per character block that will be needed by the second pass.
-    for (uint32_t i = 0; i < num_blocks; i++) {
-      uint64_t ctx_next = cudf::io::csv::gpu::select_row_context(ctx, row_ctx[i]);
-      row_ctx[i]        = ctx;
-      ctx               = ctx_next;
-    }
-    size_t total_rows = ctx >> 2;
-    if (total_rows > skip_rows) {
-      // At least one row in range in this batch
-      all_row_offsets.resize(total_rows - skip_rows, stream);
-
-      cudf::detail::cuda_memcpy_async(
-        device_span<uint64_t>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
-        host_span<uint64_t const>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
+      cudf::detail::cuda_memcpy(
+        host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
+        device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
         stream);
 
-      // Pass 2: Output row offsets
-      cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
-                                             row_ctx.device_ptr(),
-                                             all_row_offsets,
-                                             d_data,
-                                             chunk_size,
-                                             pos,
-                                             input_pos,
-                                             max_input_size,
-                                             range_begin,
-                                             range_end,
-                                             skip_rows,
-                                             stream);
-      // With byte range, we want to keep only one row out of the specified range
-      if (range_end < data_size) {
-        cudf::detail::cuda_memcpy(
-          host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
-          device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
+      // Sum up the rows in each character block, selecting the row count that
+      // corresponds to the current input context. Also stores the now known input
+      // context per character block that will be needed by the second pass.
+      for (uint32_t i = 0; i < num_blocks; i++) {
+        uint64_t ctx_next = cudf::io::csv::gpu::select_row_context(ctx, row_ctx[i]);
+        row_ctx[i]        = ctx;
+        ctx               = ctx_next;
+      }
+      size_t total_rows = ctx >> 2;
+      if (total_rows > skip_rows) {
+        // At least one row in range in this batch
+        all_row_offsets.resize(total_rows - skip_rows, stream);
+
+        cudf::detail::cuda_memcpy_async(
+          device_span<uint64_t>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
+          host_span<uint64_t const>(row_ctx.host_ptr(), row_ctx.size(), true)
+            .subspan(0, num_blocks),
           stream);
 
-        size_t rows_out_of_range = 0;
-        for (uint32_t i = 0; i < num_blocks; i++) {
-          rows_out_of_range += row_ctx[i];
-        }
-        if (rows_out_of_range != 0) {
-          // Keep one row out of range (used to infer length of previous row)
-          auto new_row_offsets_size =
-            all_row_offsets.size() - std::min(rows_out_of_range - 1, all_row_offsets.size());
-          all_row_offsets.resize(new_row_offsets_size, stream);
-          // Implies we reached the end of the range
-          break;
-        }
-      }
-      // num_rows does not include blank rows
-      if (num_rows >= 0) {
-        if (all_row_offsets.size() > header_rows + static_cast<size_t>(num_rows)) {
-          size_t num_blanks = cudf::io::csv::gpu::count_blank_rows(
-            parse_opts.view(), d_data, all_row_offsets, stream);
-          if (all_row_offsets.size() - num_blanks > header_rows + static_cast<size_t>(num_rows)) {
-            // Got the desired number of rows
+        // Pass 2: Output row offsets
+        cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
+                                               row_ctx.device_ptr(),
+                                               all_row_offsets,
+                                               d_data,
+                                               chunk_size,
+                                               pos,
+                                               input_pos,
+                                               max_input_size,
+                                               range_begin,
+                                               range_end,
+                                               skip_rows,
+                                               stream);
+        // With byte range, we want to keep only one row out of the specified range
+        if (range_end < data_size) {
+          cudf::detail::cuda_memcpy(
+            host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
+            device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size())
+              .subspan(0, num_blocks),
+            stream);
+
+          size_t rows_out_of_range = 0;
+          for (uint32_t i = 0; i < num_blocks; i++) {
+            rows_out_of_range += row_ctx[i];
+          }
+          if (rows_out_of_range != 0) {
+            // Keep one row out of range (used to infer length of previous row)
+            auto new_row_offsets_size =
+              all_row_offsets.size() - std::min(rows_out_of_range - 1, all_row_offsets.size());
+            all_row_offsets.resize(new_row_offsets_size, stream);
+            // Implies we reached the end of the range
             break;
           }
         }
+        // num_rows does not include blank rows
+        if (num_rows >= 0) {
+          if (all_row_offsets.size() > header_rows + static_cast<size_t>(num_rows)) {
+            size_t num_blanks = cudf::io::csv::gpu::count_blank_rows(
+              parse_opts.view(), d_data, all_row_offsets, stream);
+            if (all_row_offsets.size() - num_blanks > header_rows + static_cast<size_t>(num_rows)) {
+              // Got the desired number of rows
+              break;
+            }
+          }
+        }
+      } else {
+        // Discard data (all rows below skip_rows), keeping one character for history
+        size_t discard_bytes = std::max(d_data.size(), sizeof(char)) - sizeof(char);
+        if (discard_bytes != 0) {
+          erase_except_last(d_data, stream);
+          input_pos += discard_bytes;
+        }
       }
-    } else {
-      // Discard data (all rows below skip_rows), keeping one character for history
-      size_t discard_bytes = std::max(d_data.size(), sizeof(char)) - sizeof(char);
-      if (discard_bytes != 0) {
-        erase_except_last(d_data, stream);
-        input_pos += discard_bytes;
-      }
-    }
-    pos = target_pos;
-  } while (pos < max_input_size);
+      pos = target_pos;
+    } while (pos < max_input_size);
+  }
 
+  // The single-pass gathering of the whole file already excludes blank rows
   auto const non_blank_row_offsets =
-    io::csv::gpu::remove_blank_rows(parse_opts.view(), d_data, all_row_offsets, stream);
+    load_whole_file
+      ? device_span<uint64_t>{all_row_offsets}
+      : io::csv::gpu::remove_blank_rows(parse_opts.view(), d_data, all_row_offsets, stream);
   auto row_offsets = selected_rows_offsets{std::move(all_row_offsets), non_blank_row_offsets};
 
   // Remove header rows and extract header
   auto const header_row_index = std::max<size_t>(header_rows, 1) - 1;
   if (header_row_index + 1 < row_offsets.size()) {
-    cudf::detail::cuda_memcpy(host_span<uint64_t>{row_ctx}.subspan(0, 2),
-                              device_span<uint64_t const>{row_offsets.data() + header_row_index, 2},
-                              stream);
+    auto const header_offsets = cudf::detail::make_host_vector(
+      device_span<uint64_t const>{row_offsets.data() + header_row_index, 2}, stream);
 
-    auto const header_start = input_pos + row_ctx[0];
-    auto const header_end   = input_pos + row_ctx[1];
+    auto const header_start = input_pos + header_offsets[0];
+    auto const header_end   = input_pos + header_offsets[1];
     CUDF_EXPECTS(header_start <= header_end && header_end <= max_input_size,
                  "Invalid csv header location");
     header.resize(header_end - header_start);

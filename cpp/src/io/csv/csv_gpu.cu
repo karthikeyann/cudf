@@ -32,6 +32,7 @@
 #include <thrust/count.h>
 #include <thrust/detail/copy.h>
 #include <thrust/remove.h>
+#include <thrust/scan.h>
 #include <thrust/transform.h>
 
 #include <type_traits>
@@ -510,9 +511,11 @@ constexpr __device__ uint32_t make_char_context(uint32_t id0,
  * @param char_ctx state transitions associated with new character
  * @param pos Position within the current 32-character block
  *
- * NOTE: This is probably the most performance-critical piece of the row gathering kernel.
- * The char_ctx value should be created via make_char_context, and its value should
- * have been evaluated at compile-time.
+ * NOTE: This is the most performance-critical piece of the row gathering kernels when a slice is
+ * merged character by character. The char_ctx values come from make_char_context with constant
+ * arguments (see char_row_context), so that they are compile-time constants selected by branches.
+ * Slices that are not merged character by character only merge the characters whose transitions
+ * differ from the regular one (see slice_row_contexts).
  */
 inline __device__ void merge_char_context(uint4& ctx, uint32_t char_ctx, uint32_t pos)
 {
@@ -566,7 +569,7 @@ inline __device__ uint32_t select_rowmap(uint4 ctx_map, uint32_t ctxid)
  * @param t thread id (leaf node id)
  */
 template <uint32_t lanemask, uint32_t tmask, uint32_t base, uint32_t level_scale>
-inline __device__ void ctx_merge(device_span<uint64_t> ctxtree, packed_rowctx_t* ctxb, uint32_t t)
+inline __device__ void ctx_merge(packed_rowctx_t* ctxtree, packed_rowctx_t* ctxb, uint32_t t)
 {
   uint64_t tmp = shuffle_xor(*ctxb, lanemask);
   if (!(t & tmask)) {
@@ -589,7 +592,7 @@ inline __device__ void ctx_merge(device_span<uint64_t> ctxtree, packed_rowctx_t*
  */
 template <uint32_t rmask>
 inline __device__ void ctx_unmerge(
-  uint32_t base, device_span<uint64_t const> ctxtree, uint32_t* ctx, uint32_t* brow4, uint32_t t)
+  uint32_t base, packed_rowctx_t const* ctxtree, uint32_t* ctx, uint32_t* brow4, uint32_t t)
 {
   rowctx32_t ctxb_left, ctxb_right, ctxb_sum;
   ctxb_sum   = get_row_context(ctxtree[base], *ctx);
@@ -621,7 +624,7 @@ inline __device__ void ctx_unmerge(
  * @param[in] ctxb packed row context for the current character block
  * @param t thread id (leaf node id)
  */
-static inline __device__ void rowctx_merge_transform(device_span<uint64_t> ctxtree,
+static inline __device__ void rowctx_merge_transform(packed_rowctx_t* ctxtree,
                                                      packed_rowctx_t ctxb,
                                                      uint32_t t)
 {
@@ -655,8 +658,8 @@ static inline __device__ void rowctx_merge_transform(device_span<uint64_t> ctxtr
  *
  * @return Final row context and count (row_position*4 + context_id format)
  */
-static inline __device__ rowctx32_t
-rowctx_inverse_merge_transform(device_span<uint64_t const> ctxtree, uint32_t t)
+static inline __device__ rowctx32_t rowctx_inverse_merge_transform(packed_rowctx_t const* ctxtree,
+                                                                   uint32_t t)
 {
   uint32_t ctx     = ctxtree[0] & 3;  // Starting input context
   rowctx32_t brow4 = 0;               // output row in block *4
@@ -675,6 +678,184 @@ rowctx_inverse_merge_transform(device_span<uint64_t const> ctxtree, uint32_t t)
 }
 
 constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
+
+/// Characters per slice: each thread tracks the row contexts of 32-character slices
+constexpr uint32_t slice_chars = 32;
+static_assert(rowofs_block_bytes == rowofs_block_dim * slice_chars);
+
+/// Value of a disabled quote or comment character, which no character matches
+constexpr int no_char = 0x100;
+
+/**
+ * @brief Characters that determine where rows start.
+ *
+ * Characters are compared as `int` values of the `char` data.
+ */
+struct row_parse_chars {
+  int terminator;
+  int delimiter;
+  int quotechar;    ///< `no_char` if quoting is disabled
+  int commentchar;  ///< `no_char` if comments are disabled
+
+  static row_parse_chars from(parse_options_view const& options)
+  {
+    return {options.terminator,
+            options.delimiter,
+            options.quotechar ? options.quotechar : no_char,
+            options.comment ? options.comment : no_char};
+  }
+};
+
+/**
+ * @brief Returns the row context transitions of the character `c` preceded by `c_prev`, as a
+ * per-character context (see make_char_context).
+ */
+__device__ __forceinline__ uint32_t char_row_context(int c,
+                                                     int c_prev,
+                                                     row_parse_chars const& chars)
+{
+  if (c_prev == chars.terminator) {
+    if (c == chars.commentchar) {
+      // Start of a new comment row
+      return make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
+    } else if (c == chars.quotechar) {
+      // Quoted string on newrow, or quoted string ending in terminator
+      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+    }
+    // Start of a new row unless within a quote
+    return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
+  } else if (c == chars.quotechar) {
+    // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
+    // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
+    // exit because it might be the first quote of a "" escape sequence. We transition to
+    // COMMENT (pending exit) and wait for the next character:
+    //   - If next char is quote: it's a "" escape, return to QUOTE
+    //   - If next char is anything else: exit confirmed, go to NONE
+    // This doesn't conflict with actual comment handling because comments are only
+    // detected at row boundaries (after newline), where COMMENT state is set with row
+    // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
+    if (c_prev == chars.delimiter) {
+      // Quote after delimiter: start field or pending exit
+      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+    } else if (c_prev == chars.quotechar) {
+      // Quote after quote: "" escape or stay NONE (Spark compatibility)
+      return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+    }
+    // Quote after regular char: pending exit or stay NONE
+    return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
+  }
+  // Non-quote char: stay in current state, or exit from pending
+  return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+}
+
+/**
+ * @brief Returns a 4-bit mask of the bytes of `word` equal to `c` (bit i for byte i).
+ */
+__device__ __forceinline__ uint32_t match_bytes(uint32_t word, int c)
+{
+  if (c == no_char) { return 0; }
+  // 0xff in each matching byte
+  auto const matches = __vcmpeq4(word, static_cast<uint32_t>(c & 0xff) * 0x0101'0101u);
+  // Moves the low bit of byte i (bit 8i) to bit 21 + i: the partial products of the four bits
+  // land on distinct bit positions, so the multiplication does not carry into bits 21..24
+  return (((matches & 0x0101'0101u) * 0x0020'4081u) >> 21) & 0xf;
+}
+
+/**
+ * @brief Computes the row contexts of a 32-character slice: for each possible parser state at the
+ * start of the slice, the bitmap of the characters that start a row and the state at the end.
+ *
+ * The result holds the row start bitmaps for the NONE, QUOTE and COMMENT input states in `x`, `y`
+ * and `z`, and the output state for each input state in `w` (2 bits per input state, in the order
+ * NONE, QUOTE, COMMENT, EOF). Characters at or past `end` do not change the state, except that a
+ * row starts at `end` in every state if `end_is_eof` (the row that ends the data).
+ *
+ * @param slice First character of the slice
+ * @param end End of the characters to parse
+ * @param end_is_eof Whether `end` is the end of the data
+ * @param c_prev Character before the slice, or the terminator at the start of the data
+ * @param chars Characters that determine where rows start
+ */
+__device__ uint4 slice_row_contexts(
+  char const* slice, char const* end, bool end_is_eof, int c_prev, row_parse_chars const& chars)
+{
+  // Initial state is neutral context (no state transitions), zero rows
+  uint4 ctx_map = {
+    .x = 0,
+    .y = 0,
+    .z = 0,
+    .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6)};
+
+  if (slice + slice_chars <= end && reinterpret_cast<uintptr_t>(slice) % sizeof(uint4) == 0) {
+    // All 32 characters are in range: locate terminators, quotes and comment characters
+    auto const vectors      = reinterpret_cast<uint4 const*>(slice);
+    uint32_t const words[8] = {vectors[0].x,
+                               vectors[0].y,
+                               vectors[0].z,
+                               vectors[0].w,
+                               vectors[1].x,
+                               vectors[1].y,
+                               vectors[1].z,
+                               vectors[1].w};
+    uint32_t terminators    = 0;
+    uint32_t quotes         = 0;
+    uint32_t comments       = 0;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      terminators |= match_bytes(words[i], chars.terminator) << (4 * i);
+      quotes |= match_bytes(words[i], chars.quotechar) << (4 * i);
+      comments |= match_bytes(words[i], chars.commentchar) << (4 * i);
+    }
+    // Characters that follow a terminator
+    auto const row_starts = (terminators << 1) | (c_prev == chars.terminator ? 1u : 0u);
+
+    if ((quotes | comments) == 0) {
+      // Without quote and comment characters, every character after a terminator starts a row
+      // in the NONE and COMMENT states and none does in the QUOTE state. The COMMENT state exits
+      // to NONE at the first character, so both end in NONE; QUOTE stays QUOTE.
+      return {
+        row_starts,
+        0,
+        row_starts,
+        (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_NONE << 4) | (ROW_CTX_EOF << 6)};
+    }
+
+    // Only the characters that follow a terminator and the quote characters have transitions
+    // other than the regular one (NONE->NONE, QUOTE->QUOTE, COMMENT->NONE, no row start). The
+    // regular transition is idempotent, so each run of other characters is merged at once.
+    auto constexpr regular = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+    uint32_t pos           = 0;  // first character not merged yet
+    for (auto events = row_starts | quotes; events != 0; events &= events - 1) {
+      auto const k = static_cast<uint32_t>(__ffs(events)) - 1;
+      if (k > pos) { merge_char_context(ctx_map, regular, pos); }
+      int const c_before = k > 0 ? slice[k - 1] : c_prev;
+      merge_char_context(ctx_map, char_row_context(slice[k], c_before, chars), k);
+      pos = k + 1;
+    }
+    if (pos < slice_chars) { merge_char_context(ctx_map, regular, pos); }
+    return ctx_map;
+  }
+
+  // Loop through all 32 bytes and keep a bitmask of row starts for each possible input context
+  auto cur = slice;
+  int c;
+  for (uint32_t pos = 0; pos < slice_chars; pos++, cur++, c_prev = c) {
+    uint32_t ctx;
+    if (cur < end) {
+      c   = cur[0];
+      ctx = char_row_context(c, c_prev, chars);
+    } else if (end_is_eof && cur == end) {
+      // Add a newline at data end (need the extra row offset to infer length of previous row)
+      ctx = make_char_context(ROW_CTX_EOF, ROW_CTX_EOF, ROW_CTX_EOF, 1, 1, 1);
+    } else {
+      // Pass-through context (beyond chunk_size or data_end)
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+    }
+    // Merge with current context, keeping track of where new rows occur
+    merge_char_context(ctx_map, ctx, pos);
+  }
+  return ctx_map;
+}
 
 /**
  * @brief Gather row offsets from CSV character data split into 16KB chunks
@@ -699,15 +880,10 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  * @param byte_range_start Ignore rows starting before this position in the file
  * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
  * @param skip_rows Number of rows to skip (ignored in phase 1)
- * @param terminator Line terminator character
- * @param delimiter Column delimiter character
- * @param quotechar Quote character
- * @param escapechar Delimiter escape character
- * @param commentchar Comment line character (skip rows starting with this character)
+ * @param chars Characters that determine where rows start
  */
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   gather_row_offsets_gpu(uint64_t* row_ctx,
-                         device_span<uint64_t> ctxtree,
                          device_span<uint64_t> offsets_out,
                          device_span<char const> const data,
                          size_t chunk_size,
@@ -717,14 +893,12 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          size_t byte_range_start,
                          size_t byte_range_end,
                          size_t skip_rows,
-                         int terminator,
-                         int delimiter,
-                         int quotechar,
-                         int escapechar,
-                         int commentchar)
+                         row_parse_chars chars)
 {
-  auto start            = data.data();
-  auto const bk_ctxtree = ctxtree.subspan(blockIdx.x * bk_ctxtree_size, bk_ctxtree_size);
+  // Merge tree of the row contexts of the block's 32-character slices
+  __shared__ packed_rowctx_t bk_ctxtree[bk_ctxtree_size];
+
+  auto start = data.data();
 
   // file-level end position for this scan, clamped to the file size
   size_t const end_in_file = (parse_pos >= data_size || chunk_size > data_size - parse_pos)
@@ -735,72 +909,16 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   size_t const data_end_off = data_size > start_offset ? data_size - start_offset : 0;
   auto const end            = start + cuda::std::min(end_off, data.size());
   auto const data_end       = start + cuda::std::min(data_end_off, data.size());
+  // The end of the data is in this window, and the chunk extends to it
+  bool const end_is_eof = data_end_off <= data.size() && end == data_end;
   // Offset of `parse_pos` inside the local `data` window, clamped to avoid underflow
   auto const parse_off = parse_pos > start_offset ? parse_pos - start_offset : 0;
   uint32_t const t     = threadIdx.x;
-  size_t block_pos     = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
-  auto cur             = start + block_pos;
-
-  // Initial state is neutral context (no state transitions), zero rows
-  uint4 ctx_map = {
-    .x = 0,
-    .y = 0,
-    .z = 0,
-    .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6)};
-  int c, c_prev = (cur > start && cur <= end) ? cur[-1] : terminator;
-  // Loop through all 32 bytes and keep a bitmask of row starts for each possible input context
-  for (uint32_t pos = 0; pos < 32; pos++, cur++, c_prev = c) {
-    uint32_t ctx;
-    if (cur < end) {
-      c = cur[0];
-      if (c_prev == terminator) {
-        if (c == commentchar) {
-          // Start of a new comment row
-          ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
-        } else if (c == quotechar) {
-          // Quoted string on newrow, or quoted string ending in terminator
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
-        } else {
-          // Start of a new row unless within a quote
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
-        }
-      } else if (c == quotechar) {
-        // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
-        // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
-        // exit because it might be the first quote of a "" escape sequence. We transition to
-        // COMMENT (pending exit) and wait for the next character:
-        //   - If next char is quote: it's a "" escape, return to QUOTE
-        //   - If next char is anything else: exit confirmed, go to NONE
-        // This doesn't conflict with actual comment handling because comments are only
-        // detected at row boundaries (after newline), where COMMENT state is set with row
-        // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
-        if (c_prev == delimiter) {
-          // Quote after delimiter: start field or pending exit
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-        } else if (c_prev == quotechar) {
-          // Quote after quote: "" escape or stay NONE (Spark compatibility)
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
-        } else {
-          // Quote after regular char: pending exit or stay NONE
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
-        }
-      } else {
-        // Non-quote char: stay in current state, or exit from pending
-        ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
-      }
-    } else {
-      bool const is_last_chunk = data_end_off <= data.size();
-      if (is_last_chunk && cur <= end && cur == data_end) {
-        // Add a newline at data end (need the extra row offset to infer length of previous row)
-        ctx = make_char_context(ROW_CTX_EOF, ROW_CTX_EOF, ROW_CTX_EOF, 1, 1, 1);
-      } else {
-        // Pass-through context (beyond chunk_size or data_end)
-        ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-      }
-    }
-    // Merge with current context, keeping track of where new rows occur
-    merge_char_context(ctx_map, ctx, pos);
-  }
+  size_t block_pos =
+    parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * slice_chars;
+  auto const cur   = start + block_pos;
+  int const c_prev = (cur > start && cur <= end) ? cur[-1] : chars.terminator;
+  auto ctx_map     = slice_row_contexts(cur, end, end_is_eof, c_prev, chars);
 
   // Eliminate rows that start before byte_range_start
   if (start_offset + block_pos < byte_range_start) {
@@ -852,22 +970,244 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   }
 }
 
+/**
+ * @brief Predicate that identifies blank and comment rows by the offset of their first character.
+ *
+ * A row is blank if it starts with the comment character or, when blank lines are skipped, with
+ * the terminator or (for a '\n' terminator) a carriage return. Characters that do not apply are
+ * replaced with one that does. If none does (no comment character and blank lines are kept), all
+ * three are '\0', so rows that start with a NUL character are still removed. The offset of the end
+ * of the data, which only marks where the last row ends, is never blank.
+ */
+struct is_blank_row {
+  device_span<char const> data;
+  char newline;
+  char comment;
+  char carriage;
+
+  is_blank_row(parse_options_view const& options, device_span<char const> data)
+    : data{data},
+      newline{options.skipblanklines ? options.terminator : options.comment},
+      comment{options.comment != '\0' ? options.comment : newline},
+      carriage{(options.skipblanklines && options.terminator == '\n') ? '\r' : comment}
+  {
+  }
+
+  __device__ bool operator()(uint64_t pos) const
+  {
+    return pos != data.size() &&
+           (data[pos] == newline || data[pos] == comment || data[pos] == carriage);
+  }
+};
+
+/**
+ * @brief Slices per thread in single-pass row gathering.
+ *
+ * Determines the tile size (32KB). Larger tiles need less per-tile work (block scans, transitions,
+ * row counts) but make the repair of a mis-speculated tile more expensive; with 1, 2 and 4 slices
+ * per thread, the total row gathering time of 2 is within 3% of the best on the CSV reader
+ * benchmarks with 0% to 100% quoted fields.
+ */
+constexpr uint32_t tile_slices_per_thread = 2;
+/// Slices per tile, the data processed by one thread block in single-pass row gathering
+constexpr uint32_t tile_slices = rowofs_block_dim * tile_slices_per_thread;
+/// Characters per tile (32KB)
+constexpr size_t tile_chars = static_cast<size_t>(tile_slices) * slice_chars;
+
+/**
+ * @brief Parser state transition function of a range of characters: the output state for each
+ * input state, 2 bits per input state in the order NONE, QUOTE, COMMENT, EOF.
+ */
+using state_transition = uint8_t;
+
+/// Transition of an empty range
+constexpr state_transition identity_transition =
+  ROW_CTX_NONE | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6);
+
+/**
+ * @brief Composes the transitions of two consecutive ranges (associative, not commutative).
+ */
+struct compose_transitions {
+  __device__ state_transition operator()(state_transition first, state_transition second) const
+  {
+    state_transition result = 0;
+#pragma unroll
+    for (uint32_t state = 0; state < 4; ++state) {
+      auto const mid = (first >> (2 * state)) & 3;
+      result |= ((second >> (2 * mid)) & 3) << (2 * state);
+    }
+    return result;
+  }
+};
+
+/**
+ * @brief Returns the output state of `transition` for the input state `state`.
+ */
+__device__ __forceinline__ uint32_t apply_transition(state_transition transition, uint32_t state)
+{
+  return (transition >> (2 * state)) & 3;
+}
+
+/**
+ * @brief Computes the row start bitmaps of a tile's slices, given the parser state at the start of
+ * the tile.
+ *
+ * Each thread computes the row contexts of its consecutive slices for every input state. A block
+ * scan over the threads' state transitions gives each thread its input state, which selects the
+ * row start bitmaps of its slices. Blank and comment rows are then cleared from the bitmaps.
+ *
+ * @param data Character data
+ * @param chars Characters that determine where rows start
+ * @param is_blank Identifies the blank and comment rows
+ * @param tile Index of the tile
+ * @param start_state Parser state at the start of the tile
+ * @param[out] row_bitmaps Row start bitmap of every slice
+ * @param[out] tile_row_counts Number of rows that start in each tile
+ * @return The state transition of the tile, in thread 0
+ */
+__device__ state_transition gather_tile_row_bitmaps(device_span<char const> data,
+                                                    row_parse_chars const& chars,
+                                                    is_blank_row const& is_blank,
+                                                    size_t tile,
+                                                    uint32_t start_state,
+                                                    uint32_t* row_bitmaps,
+                                                    uint64_t* tile_row_counts)
+{
+  using block_scan   = cub::BlockScan<state_transition, rowofs_block_dim>;
+  using block_reduce = cub::BlockReduce<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+  __shared__ typename block_reduce::TempStorage reduce_storage;
+
+  auto const t           = threadIdx.x;
+  auto const first_slice = (tile * rowofs_block_dim + t) * tile_slices_per_thread;
+  auto const end         = data.data() + data.size();
+
+  uint4 ctx_maps[tile_slices_per_thread];
+  auto thread_transition = identity_transition;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    auto const slice = data.data() + (first_slice + j) * slice_chars;
+    int const c_prev = (slice > data.data() && slice <= end) ? slice[-1] : chars.terminator;
+    ctx_maps[j]      = slice_row_contexts(slice, end, true, c_prev, chars);
+    thread_transition =
+      compose_transitions{}(thread_transition, static_cast<state_transition>(ctx_maps[j].w));
+  }
+
+  // Input state of the thread: the tile's start state through the transitions of earlier threads
+  state_transition prefix;
+  state_transition tile_transition;
+  block_scan(scan_storage)
+    .ExclusiveScan(
+      thread_transition, prefix, identity_transition, compose_transitions{}, tile_transition);
+  auto state = apply_transition(prefix, start_state);
+
+  uint32_t num_rows = 0;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    auto rowmap          = select_rowmap(ctx_maps[j], state);
+    auto const slice_pos = (first_slice + j) * slice_chars;
+    for (auto rows = rowmap; rows != 0; rows &= rows - 1) {
+      auto const bit = __ffs(rows) - 1;
+      if (is_blank(slice_pos + bit)) { rowmap &= ~(1u << bit); }
+    }
+    row_bitmaps[first_slice + j] = rowmap;
+    num_rows += __popc(rowmap);
+    state = apply_transition(static_cast<state_transition>(ctx_maps[j].w), state);
+  }
+  num_rows = block_reduce(reduce_storage).Sum(num_rows);
+  if (t == 0) { tile_row_counts[tile] = num_rows; }
+  return tile_transition;
+}
+
+/**
+ * @brief Single-pass row gathering, speculative pass: gathers the row start bitmaps of every tile
+ * assuming that it starts in the NONE state, and records the state transition of every tile.
+ *
+ * A tile starts in another state if a quoted field spans its start or ends right before it, so
+ * the assumption fails for roughly the proportion of quoted characters in the data.
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  gather_speculative_row_bitmaps_gpu(device_span<char const> data,
+                                     row_parse_chars chars,
+                                     is_blank_row is_blank,
+                                     uint32_t* row_bitmaps,
+                                     uint64_t* tile_row_counts,
+                                     state_transition* tile_transitions)
+{
+  auto const tile       = static_cast<size_t>(blockIdx.x);
+  auto const transition = gather_tile_row_bitmaps(
+    data, chars, is_blank, tile, ROW_CTX_NONE, row_bitmaps, tile_row_counts);
+  if (threadIdx.x == 0) { tile_transitions[tile] = transition; }
+}
+
+/**
+ * @brief Single-pass row gathering, repair pass: gathers the row start bitmaps of a tile again if
+ * it does not start in the NONE state assumed by the speculative pass.
+ *
+ * @param tile_start_transitions Transition from the start of the data to the start of each tile
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  repair_row_bitmaps_gpu(device_span<char const> data,
+                         row_parse_chars chars,
+                         is_blank_row is_blank,
+                         device_span<state_transition const> tile_start_transitions,
+                         uint32_t* row_bitmaps,
+                         uint64_t* tile_row_counts)
+{
+  auto const tile = static_cast<size_t>(blockIdx.x);
+  // The data starts in the NONE state
+  auto const start_state = apply_transition(tile_start_transitions[tile], ROW_CTX_NONE);
+  if (start_state == ROW_CTX_NONE) { return; }
+  gather_tile_row_bitmaps(data, chars, is_blank, tile, start_state, row_bitmaps, tile_row_counts);
+}
+
+/**
+ * @brief Single-pass row gathering, output pass: converts the row start bitmaps of each tile into
+ * row offsets.
+ *
+ * @param row_bitmaps Row start bitmap of every slice
+ * @param tile_first_rows Index of the first row of each tile
+ * @param[out] offsets Offsets of all rows
+ */
+CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
+  row_bitmaps_to_offsets_gpu(uint32_t const* row_bitmaps,
+                             uint64_t const* tile_first_rows,
+                             device_span<uint64_t> offsets)
+{
+  using block_scan = cub::BlockScan<uint32_t, rowofs_block_dim>;
+  __shared__ typename block_scan::TempStorage scan_storage;
+
+  auto const tile        = static_cast<size_t>(blockIdx.x);
+  auto const first_slice = (tile * rowofs_block_dim + threadIdx.x) * tile_slices_per_thread;
+  uint32_t rowmaps[tile_slices_per_thread];
+  uint32_t num_rows = 0;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    rowmaps[j] = row_bitmaps[first_slice + j];
+    num_rows += __popc(rowmaps[j]);
+  }
+  uint32_t first_row_in_tile;
+  block_scan(scan_storage).ExclusiveSum(num_rows, first_row_in_tile);
+
+  auto row = tile_first_rows[tile] + first_row_in_tile;
+#pragma unroll
+  for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
+    auto const slice_pos = (first_slice + j) * slice_chars;
+    for (auto rowmap = rowmaps[j]; rowmap != 0; rowmap &= rowmap - 1) {
+      offsets[row++] = slice_pos + __ffs(rowmap) - 1;
+    }
+  }
+}
+
 size_t __host__ count_blank_rows(cudf::io::parse_options_view const& opts,
                                  device_span<char const> data,
                                  device_span<uint64_t const> row_offsets,
                                  cuda::stream_ref stream)
 {
-  auto const newline  = opts.skipblanklines ? opts.terminator : opts.comment;
-  auto const comment  = opts.comment != '\0' ? opts.comment : newline;
-  auto const carriage = (opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment;
-  return thrust::count_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data = data, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != data.size()) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
-    });
+  return thrust::count_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                          row_offsets.begin(),
+                          row_offsets.end(),
+                          is_blank_row{opts, data});
 }
 
 device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view const& options,
@@ -875,18 +1215,11 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
                                                  device_span<uint64_t> row_offsets,
                                                  cuda::stream_ref stream)
 {
-  size_t d_size       = data.size();
-  auto const newline  = options.skipblanklines ? options.terminator : options.comment;
-  auto const comment  = options.comment != '\0' ? options.comment : newline;
-  auto const carriage = (options.skipblanklines && options.terminator == '\n') ? '\r' : comment;
-  auto new_end        = thrust::remove_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data = data, d_size, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != d_size) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
-    });
+  auto new_end =
+    thrust::remove_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                      row_offsets.begin(),
+                      row_offsets.end(),
+                      is_blank_row{options, data});
   return row_offsets.subspan(0, new_end - row_offsets.begin());
 }
 
@@ -932,6 +1265,52 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
+rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& options,
+                                                     device_span<char const> data,
+                                                     cuda::stream_ref stream)
+{
+  // The last tile holds the row that ends the data, at data.size()
+  auto const num_tiles = data.size() / tile_chars + 1;
+  auto const chars     = row_parse_chars::from(options);
+  auto const is_blank  = is_blank_row{options, data};
+
+  rmm::device_uvector<uint32_t> row_bitmaps(num_tiles * tile_slices, stream);
+  // One more entry than tiles, so that the exclusive scan of the row counts ends with the total
+  rmm::device_uvector<uint64_t> tile_rows(num_tiles + 1, stream);
+  tile_rows.set_element_to_zero_async(num_tiles, stream);
+  rmm::device_uvector<state_transition> tile_transitions(num_tiles, stream);
+
+  gather_speculative_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    data, chars, is_blank, row_bitmaps.data(), tile_rows.data(), tile_transitions.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+
+  // Transition from the start of the data to the start of each tile
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                         tile_transitions.begin(),
+                         tile_transitions.end(),
+                         tile_transitions.begin(),
+                         identity_transition,
+                         compose_transitions{});
+
+  // Every tile is processed at most once more, so the total work is at most twice that of a single
+  // pass even if the speculation fails for every tile
+  repair_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    data, chars, is_blank, tile_transitions, row_bitmaps.data(), tile_rows.data());
+  CUDF_CUDA_TRY(cudaGetLastError());
+
+  // First row of each tile, followed by the total number of rows
+  thrust::exclusive_scan(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                         tile_rows.begin(),
+                         tile_rows.end(),
+                         tile_rows.begin());
+  rmm::device_uvector<uint64_t> offsets(tile_rows.element(num_tiles, stream), stream);
+
+  row_bitmaps_to_offsets_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
+    row_bitmaps.data(), tile_rows.data(), offsets);
+  CUDF_CUDA_TRY(cudaGetLastError());
+  return offsets;
+}
+
 uint32_t __host__ gather_row_offsets(parse_options_view const& options,
                                      uint64_t* row_ctx,
                                      device_span<uint64_t> const offsets_out,
@@ -946,11 +1325,9 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
                                      cuda::stream_ref stream)
 {
   uint32_t dim_grid = 1 + (chunk_size / rowofs_block_bytes);
-  auto ctxtree      = rmm::device_uvector<packed_rowctx_t>(dim_grid * bk_ctxtree_size, stream);
 
   gather_row_offsets_gpu<<<dim_grid, rowofs_block_dim, 0, stream.get()>>>(
     row_ctx,
-    ctxtree,
     offsets_out,
     data,
     chunk_size,
@@ -960,11 +1337,7 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
     byte_range_start,
     byte_range_end,
     skip_rows,
-    options.terminator,
-    options.delimiter,
-    (options.quotechar) ? options.quotechar : 0x100,
-    /*(options.escapechar) ? options.escapechar :*/ 0x100,
-    (options.comment) ? options.comment : 0x100);
+    row_parse_chars::from(options));
   CUDF_CUDA_TRY(cudaGetLastError());
 
   return dim_grid;
