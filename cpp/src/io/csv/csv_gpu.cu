@@ -150,41 +150,308 @@ __device__ __inline__ bool is_floatingpoint(long len,
   return true;
 }
 
-/*
- * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
+namespace {
+
+/// Unit in which `seek_field_end_by_words` loads the characters of a row
+using char_word = uint64_t;
+/// Number of characters in a `char_word`
+constexpr int word_chars = sizeof(char_word);
+
+/// Returns a word with every byte set to `c`
+__device__ constexpr char_word repeat_char(char c)
+{
+  return char_word{0x0101'0101'0101'0101} * static_cast<uint8_t>(c);
+}
+
+/**
+ * @brief Flags the zero bytes of a word.
  *
- * Data is processed in one row/record at a time, so the number of total
- * threads (tid) is equal to the number of rows.
+ * Returns a word with the high bit set in each byte that is zero in `word`, and in no byte below
+ * the lowest zero byte. A byte above a zero byte may also be flagged (the subtraction borrows
+ * from a zero byte into the next one), so the flags are a superset of the zero bytes whose lowest
+ * flag is exact.
+ */
+__device__ constexpr char_word flag_zero_bytes(char_word word)
+{
+  constexpr char_word low_bits  = 0x0101'0101'0101'0101;
+  constexpr char_word high_bits = 0x8080'8080'8080'8080;
+  return (word - low_bits) & ~word & high_bits;
+}
+
+/**
+ * @brief Equivalent of `cudf::io::gpu::seek_field_end` (without escape characters) that loads the
+ * row in aligned 8-byte words rather than one character at a time.
+ *
+ * The decoding kernels use one thread per row, so the character loads of a warp are scattered over
+ * 32 rows and each of them is a separate memory transaction; word loads cut their number by up to
+ * 8x. In a field that does not start with a quote, only a delimiter, a terminator or a '\r' can end
+ * the field: the positions of these characters in a word are flagged with `flag_zero_bytes` and
+ * checked in increasing order with the exact test of `seek_field_end`, so the first position that
+ * passes it is the one `seek_field_end` returns (every occurrence is flagged, and false flags fail
+ * the test). The characters of a quoted field are checked one by one after the word is loaded.
+ *
+ * Only words that lie entirely within `[data_begin, end)` are loaded, whatever the alignment of
+ * the data, and the characters of the row outside of such words are read one at a time. The lower
+ * bound matters when `data_begin` is not the start of an aligned, reader-owned buffer (e.g. when
+ * parsing a caller's buffer in place). A word may start before `begin`, in the previous field or
+ * in the previous row; these characters are never used, as other threads may be modifying them.
+ *
+ * @param begin Pointer to the first character of the field
+ * @param end Pointer to the end of the row
+ * @param data_begin Pointer to the first character of the data that holds the row
+ * @param opts A set of parsing options
+ *
+ * @return Pointer to the character that ends the field, or `end`
+ */
+__device__ char const* seek_field_end_by_words(char const* begin,
+                                               char const* end,
+                                               char const* data_begin,
+                                               parse_options_view const& opts)
+{
+  if (opts.multi_delimiter) { return cudf::io::gpu::seek_field_end(begin, end, opts); }
+
+  bool const starts_with_quote = begin < end && *begin == opts.quotechar;
+  bool in_quotes               = false;
+  // Same test as `seek_field_end` for the character `c` at `pos`
+  auto const ends_field = [&](char c, char const* pos) {
+    if (starts_with_quote && c == opts.quotechar) {
+      in_quotes = !in_quotes;
+      return false;
+    }
+    return !in_quotes && (c == opts.delimiter || c == opts.terminator ||
+                          (c == '\r' && pos + 1 < end && pos[1] == '\n'));
+  };
+  auto const data_address = reinterpret_cast<uintptr_t>(data_begin);
+  auto const end_address  = reinterpret_cast<uintptr_t>(end);
+  auto current            = begin;
+  while (current < end) {
+    auto const offset       = static_cast<int>(reinterpret_cast<uintptr_t>(current) % word_chars);
+    auto const word_address = reinterpret_cast<uintptr_t>(current) - offset;
+    if (word_address < data_address || word_address + word_chars > end_address) {
+      if (ends_field(*current, current)) { return current; }
+      ++current;
+      continue;
+    }
+    auto const word_begin = current - offset;
+    auto const word       = *reinterpret_cast<char_word const*>(word_begin);
+    auto const char_at    = [word](int i) { return static_cast<char>(word >> (8 * i)); };
+    if (starts_with_quote) {
+      for (int i = offset; i < word_chars; ++i) {
+        if (ends_field(char_at(i), word_begin + i)) { return word_begin + i; }
+      }
+    } else {
+      auto candidates = (flag_zero_bytes(word ^ repeat_char(opts.delimiter)) |
+                         flag_zero_bytes(word ^ repeat_char(opts.terminator)) |
+                         flag_zero_bytes(word ^ repeat_char('\r'))) &
+                        (~char_word{0} << (8 * offset));
+      while (candidates != 0) {
+        auto const i = (__ffsll(static_cast<long long>(candidates)) - 1) / 8;
+        if (ends_field(char_at(i), word_begin + i)) { return word_begin + i; }
+        candidates &= candidates - 1;
+      }
+    }
+    current = word_begin + word_chars;
+  }
+  return current;
+}
+
+/**
+ * @brief Marks the field of row `row` in a column as valid.
+ *
+ * The lanes of a warp decode 32 consecutive rows that start at a multiple of 32 (a one-dimensional
+ * grid of `csvparse_block_dim` threads per block, one thread per row), so the validity bits they
+ * set in a column's mask are in the same word, at the index of the lane. The lanes that mark
+ * fields of the same column together set their bits with a single atomic operation.
+ *
+ * @param mask Validity mask of the column
+ * @param column Index of the column
+ * @param row Index of the row
+ */
+__device__ void set_valid_warp_aggregated(cudf::bitmask_type* mask, int column, size_type row)
+{
+  static_assert(csvparse_block_dim % cudf::detail::warp_size == 0,
+                "The rows of a warp must share the words of the validity masks");
+  // The lanes that are active together normally mark the same column, but nothing guarantees it
+  // (lanes that diverged in earlier fields may meet here at different columns), so they are grouped
+  // by column for correctness
+  auto const lanes = __match_any_sync(__activemask(), column);
+  // The bit of row `row` in its mask word is `row % warp_size`, which is the index of the lane
+  auto const lane = static_cast<int>(threadIdx.x % cudf::detail::warp_size);
+  if (lane == __ffs(lanes) - 1) { atomicOr(&mask[cudf::word_index(row)], lanes); }
+}
+
+/**
+ * @brief Classes of fields counted by type detection, one per counter of `column_type_histogram`
+ */
+enum class field_class : int {
+  NA,
+  BOOL,
+  FLOAT,
+  DATETIME,
+  STRING,
+  NEGATIVE_SMALL_INT,
+  POSITIVE_SMALL_INT,
+  BIG_INT,
+  NUM_CLASSES
+};
+
+/// Number of type detection counters of each column
+constexpr int num_field_classes = static_cast<int>(field_class::NUM_CLASSES);
+
+/**
+ * @brief Largest number of inferred columns whose type detection counters each block keeps in
+ * shared memory
+ *
+ * The counts are exact either way; this threshold only affects speed. It was measured on one GPU
+ * (RTX PRO 6000 Blackwell): larger shared memory allocations per block made type detection slower
+ * than counting in global memory (64 columns: 8.9 ms instead of 5.7 ms; 32 columns with the
+ * allocation padded to 2KB: 8.3 ms instead of 3.6 ms), likely because the kernel, which reads rows
+ * through the L1 cache, then gets a larger shared memory carveout. The counters of wider tables are
+ * spread over enough addresses that global memory atomics do not contend much on them.
+ */
+constexpr size_t max_shared_count_columns = 32;
+
+/// Returns the class of a field that holds an integer of the given class
+__device__ field_class to_field_class(cudf::io::gpu::integral_field_class integral_class)
+{
+  switch (integral_class) {
+    case cudf::io::gpu::integral_field_class::NEGATIVE_SMALL_INT:
+      return field_class::NEGATIVE_SMALL_INT;
+    case cudf::io::gpu::integral_field_class::POSITIVE_SMALL_INT:
+      return field_class::POSITIVE_SMALL_INT;
+    case cudf::io::gpu::integral_field_class::BIG_INT: return field_class::BIG_INT;
+    case cudf::io::gpu::integral_field_class::OUT_OF_RANGE: break;
+  }
+  return field_class::STRING;
+}
+
+/**
+ * @brief Returns the class of a field for type detection.
  *
  * @param opts A set of parsing options
- * @param csv_text The entire CSV data to read
- * @param column_flags Per-column parsing behavior flags
- * @param row_offsets The start the CSV data of interest
- * @param d_column_data The count for each column data type
+ * @param field_start Pointer to the first character of the field
+ * @param field_end Pointer past the last character of the field
+ * @param as_datetime Whether the column is parsed as datetime
  */
-CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
-  data_type_detection(parse_options_view const opts,
-                      device_span<char const> csv_text,
-                      device_span<column_parse::flags const> const column_flags,
-                      device_span<uint64_t const> const row_offsets,
-                      device_span<column_type_histogram> d_column_data)
+__device__ field_class classify_field(parse_options_view const& opts,
+                                      char const* field_start,
+                                      char const* field_end,
+                                      bool as_datetime)
 {
-  auto const raw_csv = csv_text.data();
+  auto const field_len = static_cast<size_t>(field_end - field_start);
+  if (serialized_trie_contains(opts.trie_na, {field_start, field_len})) { return field_class::NA; }
+  if (serialized_trie_contains(opts.trie_true, {field_start, field_len}) ||
+      serialized_trie_contains(opts.trie_false, {field_start, field_len})) {
+    return field_class::BOOL;
+  }
+  if (cudf::io::is_infinity(field_start, field_end)) { return field_class::FLOAT; }
 
-  // ThreadIds range per block, so also need the blockId
-  // This is entry into the fields; threadId is an element within `num_records`
-  auto const rec_id      = grid_1d::global_thread_id();
-  auto const rec_id_next = rec_id + 1;
+  // Modify field_start & end to ignore whitespace and quotechars
+  // This could possibly result in additional empty fields
+  auto const trimmed_field_range = trim_whitespaces_quotes(field_start, field_end);
+  auto const trimmed_field_len   = trimmed_field_range.second - trimmed_field_range.first;
+  if (trimmed_field_len == 0) { return field_class::STRING; }
 
-  // we can have more threads than data, make sure we are not past the end of the data
-  if (rec_id_next >= row_offsets.size()) { return; }
+  long count_number    = 0;
+  long count_decimal   = 0;
+  long count_thousands = 0;
+  long count_slash     = 0;
+  long count_dash      = 0;
+  long count_plus      = 0;
+  long count_colon     = 0;
+  long count_string    = 0;
+  long count_exponent  = 0;
+  for (auto cur = trimmed_field_range.first; cur < trimmed_field_range.second; ++cur) {
+    if (is_digit(*cur)) {
+      count_number++;
+      continue;
+    }
+    if (*cur == opts.decimal) {
+      count_decimal++;
+      continue;
+    }
+    if (*cur == opts.thousands) {
+      count_thousands++;
+      continue;
+    }
+    // Looking for unique characters that will help identify column types.
+    switch (*cur) {
+      case '-': count_dash++; break;
+      case '+': count_plus++; break;
+      case '/': count_slash++; break;
+      case ':': count_colon++; break;
+      case 'e':
+      case 'E':
+        if (cur > trimmed_field_range.first && cur < trimmed_field_range.second - 1)
+          count_exponent++;
+        break;
+      default: count_string++; break;
+    }
+  }
 
-  auto field_start   = raw_csv + row_offsets[rec_id];
-  auto const row_end = raw_csv + row_offsets[rec_id_next];
+  // Integers have to have the length of the string
+  // Off by one if they start with a minus sign
+  auto const int_req_number_cnt =
+    trimmed_field_len - count_thousands -
+    ((*trimmed_field_range.first == '-' || *trimmed_field_range.first == '+') &&
+     trimmed_field_len > 1);
 
-  auto next_field = field_start;
-  int col         = 0;
-  int actual_col  = 0;
+  if (as_datetime) {
+    // PANDAS uses `object` dtype if the date is unparseable
+    return is_datetime(count_string, count_decimal, count_colon, count_dash, count_slash)
+             ? field_class::DATETIME
+             : field_class::STRING;
+  }
+  if (count_number == int_req_number_cnt) {
+    auto const is_negative = (*trimmed_field_range.first == '-');
+    auto const data_begin =
+      trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
+    return to_field_class(
+      cudf::io::gpu::classify_integral_field(data_begin, data_begin + count_number, is_negative));
+  }
+  if (is_floatingpoint(trimmed_field_len,
+                       count_number,
+                       count_decimal,
+                       count_thousands,
+                       count_dash + count_plus,
+                       count_exponent)) {
+    return field_class::FLOAT;
+  }
+  return field_class::STRING;
+}
+
+/**
+ * @brief Increments `counts[index]`, with a single atomic operation for all the lanes of the warp
+ * that increment the same counter at the same time.
+ */
+__device__ void increment_warp_aggregated(cudf::size_type* counts, int index)
+{
+  auto const lanes = __match_any_sync(__activemask(), index);
+  auto const lane  = static_cast<int>(threadIdx.x % cudf::detail::warp_size);
+  if (lane == __ffs(lanes) - 1) { atomicAdd(&counts[index], __popc(lanes)); }
+}
+
+/**
+ * @brief Counts the class of each inferred field of a row.
+ *
+ * @param opts A set of parsing options
+ * @param data_begin Pointer to the first character of the data that holds the row
+ * @param row_begin Pointer to the first character of the row
+ * @param row_end Pointer past the last character of the row
+ * @param column_flags Per-column parsing behavior flags
+ * @param field_class_counts Number of fields of each class in each inferred column, in groups of
+ * `num_field_classes` counters per column
+ */
+__device__ void count_field_classes(parse_options_view const& opts,
+                                    char const* data_begin,
+                                    char const* row_begin,
+                                    char const* row_end,
+                                    device_span<column_parse::flags const> column_flags,
+                                    cudf::size_type* field_class_counts)
+{
+  auto field_start = row_begin;
+  int col          = 0;
+  int actual_col   = 0;
 
   // Going through all the columns of a given record
   while (col < column_flags.size() && field_start < row_end) {
@@ -192,106 +459,79 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     // not produce empty fields (matches pandas behavior).
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, opts);
     if (field_start >= row_end) break;
-    auto next_delimiter = cudf::io::gpu::seek_field_end(field_start, row_end, opts);
+    auto const next_delimiter = seek_field_end_by_words(field_start, row_end, data_begin, opts);
 
     // Checking if this is a column that the user wants --- user can filter columns
     if (column_flags[col] & column_parse::inferred) {
-      // points to last character in the field
-      auto const field_len = static_cast<size_t>(next_delimiter - field_start);
-      if (serialized_trie_contains(opts.trie_na, {field_start, field_len})) {
-        atomicAdd(&d_column_data[actual_col].null_count, 1);
-      } else if (serialized_trie_contains(opts.trie_true, {field_start, field_len}) ||
-                 serialized_trie_contains(opts.trie_false, {field_start, field_len})) {
-        atomicAdd(&d_column_data[actual_col].bool_count, 1);
-      } else if (cudf::io::is_infinity(field_start, next_delimiter)) {
-        atomicAdd(&d_column_data[actual_col].float_count, 1);
-      } else {
-        long count_number    = 0;
-        long count_decimal   = 0;
-        long count_thousands = 0;
-        long count_slash     = 0;
-        long count_dash      = 0;
-        long count_plus      = 0;
-        long count_colon     = 0;
-        long count_string    = 0;
-        long count_exponent  = 0;
-
-        // Modify field_start & end to ignore whitespace and quotechars
-        // This could possibly result in additional empty fields
-        auto const trimmed_field_range = trim_whitespaces_quotes(field_start, next_delimiter);
-        auto const trimmed_field_len   = trimmed_field_range.second - trimmed_field_range.first;
-
-        if (trimmed_field_len == 0) {
-          cuda::atomic_ref<cudf::size_type, cuda::thread_scope_device> ref{
-            d_column_data[actual_col].string_count};
-          ref.fetch_add(1, cuda::memory_order_relaxed);
-        } else {
-          for (auto cur = trimmed_field_range.first; cur < trimmed_field_range.second; ++cur) {
-            if (is_digit(*cur)) {
-              count_number++;
-              continue;
-            }
-            if (*cur == opts.decimal) {
-              count_decimal++;
-              continue;
-            }
-            if (*cur == opts.thousands) {
-              count_thousands++;
-              continue;
-            }
-            // Looking for unique characters that will help identify column types.
-            switch (*cur) {
-              case '-': count_dash++; break;
-              case '+': count_plus++; break;
-              case '/': count_slash++; break;
-              case ':': count_colon++; break;
-              case 'e':
-              case 'E':
-                if (cur > trimmed_field_range.first && cur < trimmed_field_range.second - 1)
-                  count_exponent++;
-                break;
-              default: count_string++; break;
-            }
-          }
-
-          // Integers have to have the length of the string
-          // Off by one if they start with a minus sign
-          auto const int_req_number_cnt =
-            trimmed_field_len - count_thousands -
-            ((*trimmed_field_range.first == '-' || *trimmed_field_range.first == '+') &&
-             trimmed_field_len > 1);
-
-          if (column_flags[col] & column_parse::as_datetime) {
-            // PANDAS uses `object` dtype if the date is unparseable
-            if (is_datetime(count_string, count_decimal, count_colon, count_dash, count_slash)) {
-              atomicAdd(&d_column_data[actual_col].datetime_count, 1);
-            } else {
-              atomicAdd(&d_column_data[actual_col].string_count, 1);
-            }
-          } else if (count_number == int_req_number_cnt) {
-            auto const is_negative = (*trimmed_field_range.first == '-');
-            auto const data_begin =
-              trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
-            cudf::size_type* ptr = cudf::io::gpu::infer_integral_field_counter(
-              data_begin, data_begin + count_number, is_negative, d_column_data[actual_col]);
-            atomicAdd(ptr, 1);
-          } else if (is_floatingpoint(trimmed_field_len,
-                                      count_number,
-                                      count_decimal,
-                                      count_thousands,
-                                      count_dash + count_plus,
-                                      count_exponent)) {
-            atomicAdd(&d_column_data[actual_col].float_count, 1);
-          } else {
-            atomicAdd(&d_column_data[actual_col].string_count, 1);
-          }
-        }
-      }
+      auto const cls = classify_field(
+        opts, field_start, next_delimiter, column_flags[col] & column_parse::as_datetime);
+      increment_warp_aggregated(field_class_counts,
+                                actual_col * num_field_classes + static_cast<int>(cls));
       actual_col++;
     }
-    next_field  = next_delimiter + 1;
-    field_start = next_field;
+    field_start = next_delimiter + 1;
     col++;
+  }
+}
+
+}  // namespace
+
+/**
+ * @brief CUDA kernel that detects the data types of the fields of CSV data.
+ *
+ * Data is processed one row at a time, so the number of threads is equal to the number of rows.
+ * Each block counts the classes of its fields in shared memory if `use_shared_counts` is set, with
+ * `field_class_counts.size()` counters of dynamic shared memory, and then adds its counts to
+ * `field_class_counts`; otherwise it counts directly in `field_class_counts`.
+ *
+ * @tparam use_shared_counts Whether to count in shared memory
+ *
+ * @param opts A set of parsing options
+ * @param csv_text The entire CSV data to read
+ * @param column_flags Per-column parsing behavior flags
+ * @param row_offsets The start the CSV data of interest
+ * @param field_class_counts Number of fields of each class in each inferred column, in groups of
+ * `num_field_classes` counters per column
+ */
+template <bool use_shared_counts>
+CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
+  data_type_detection(parse_options_view const opts,
+                      device_span<char const> csv_text,
+                      device_span<column_parse::flags const> const column_flags,
+                      device_span<uint64_t const> const row_offsets,
+                      device_span<cudf::size_type> field_class_counts)
+{
+  extern __shared__ cudf::size_type shared_field_class_counts[];
+  if constexpr (use_shared_counts) {
+    for (auto i = threadIdx.x; i < field_class_counts.size(); i += blockDim.x) {
+      shared_field_class_counts[i] = 0;
+    }
+    __syncthreads();
+  }
+
+  // ThreadIds range per block, so also need the blockId
+  // This is entry into the fields; threadId is an element within `num_records`
+  auto const rec_id      = grid_1d::global_thread_id();
+  auto const rec_id_next = rec_id + 1;
+
+  // we can have more threads than data; these threads only take part in updating the counts
+  if (rec_id_next < row_offsets.size()) {
+    auto const raw_csv = csv_text.data();
+    count_field_classes(opts,
+                        raw_csv,
+                        raw_csv + row_offsets[rec_id],
+                        raw_csv + row_offsets[rec_id_next],
+                        column_flags,
+                        use_shared_counts ? shared_field_class_counts : field_class_counts.data());
+  }
+
+  if constexpr (use_shared_counts) {
+    __syncthreads();
+    for (auto i = threadIdx.x; i < field_class_counts.size(); i += blockDim.x) {
+      if (shared_field_class_counts[i] != 0) {
+        atomicAdd(&field_class_counts[i], shared_field_class_counts[i]);
+      }
+    }
   }
 }
 
@@ -341,10 +581,10 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
  * When `options.doublequote` is set, the escaped quote pairs of quoted string fields are collapsed
  * in place in `data`, and the string pairs point to the unescaped content. This relies on two
  * invariants:
- * - All accesses for row `i` stay within its byte range `[row_offsets[i], row_offsets[i + 1])`,
- *   and the ranges of different rows do not overlap, so each byte is accessed by one thread only.
- *   Code that loads bytes outside the row (e.g. aligned word loads) must not use them: other
- *   threads may be rewriting them.
+ * - All bytes used for row `i` lie within its byte range `[row_offsets[i], row_offsets[i + 1])`,
+ *   and the ranges of different rows do not overlap, so each byte is used by one thread only.
+ *   Loads that cover bytes outside the row, such as the word loads of `seek_field_end_by_words`,
+ *   must not use them: other threads may be rewriting them.
  * - Within a row, a field is rewritten only after its end (and therefore the start of the next
  *   field) has been found, and the rewrite stays within the field.
  * No other code reads `data` after this kernel, except to copy the strings it describes.
@@ -355,8 +595,7 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
  * @param[in] row_offsets The start the CSV data of interest
  * @param[in] dtypes The data type of the column
  * @param[out] columns The output column data
- * @param[out] valids The bitmaps indicating whether column fields are valid
- * @param[out] valid_counts The number of valid fields in each column
+ * @param[out] valids The bitmaps indicating whether the fields of non-string columns are valid
  */
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
@@ -365,8 +604,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
-                      device_span<cudf::bitmask_type* const> valids,
-                      device_span<size_type> valid_counts)
+                      device_span<cudf::bitmask_type* const> valids)
 {
   // Fields are parsed through a read-only view; only string unescaping writes to `data`
   char const* const raw_csv = data.data();
@@ -391,7 +629,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, options);
     if (field_start >= row_end) break;
     next_field          = field_start;
-    auto next_delimiter = cudf::io::gpu::seek_field_end(field_start, row_end, options);
+    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, options);
 
     if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
@@ -453,8 +691,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                     options,
                                     column_flags[col] & column_parse::as_hexadecimal)) {
             // set the valid bitmap - all bits were set to 0 to start
-            set_bit(valids[actual_col], rec_id);
-            atomicAdd(&valid_counts[actual_col], 1);
+            set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
           }
         }
       } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
@@ -1223,7 +1460,7 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
   return row_offsets.subspan(0, new_end - row_offsets.begin());
 }
 
-cudf::detail::host_vector<column_type_histogram> detect_column_types(
+std::vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> const data,
   device_span<column_parse::flags const> const column_flags,
@@ -1235,14 +1472,36 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
   int const block_size = csvparse_block_dim;
   int const grid_size  = (row_starts.size() + block_size - 1) / block_size;
 
-  auto d_stats = cudf::detail::make_zeroed_device_uvector_async<column_type_histogram>(
-    num_active_columns, stream, cudf::get_current_device_resource_ref());
+  auto d_counts = cudf::detail::make_zeroed_device_uvector_async<cudf::size_type>(
+    num_active_columns * num_field_classes, stream, cudf::get_current_device_resource_ref());
 
-  data_type_detection<<<grid_size, block_size, 0, stream.get()>>>(
-    options, data, column_flags, row_starts, d_stats);
+  // Narrow tables have few counters, which every warp updates: count them per block in shared
+  // memory
+  bool const use_shared_counts = num_active_columns <= max_shared_count_columns;
+  auto const kernel = use_shared_counts ? data_type_detection<true> : data_type_detection<false>;
+  auto const shared_memory_size =
+    use_shared_counts ? d_counts.size() * sizeof(cudf::size_type) : size_t{0};
+  kernel<<<grid_size, block_size, shared_memory_size, stream.get()>>>(
+    options, data, column_flags, row_starts, d_counts);
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  return cudf::detail::make_host_vector(d_stats, stream);
+  auto const h_counts = cudf::detail::make_host_vector(d_counts, stream);
+  std::vector<column_type_histogram> histograms(num_active_columns);
+  for (size_t col = 0; col < num_active_columns; ++col) {
+    auto const count = [&](field_class cls) {
+      return h_counts[col * num_field_classes + static_cast<int>(cls)];
+    };
+    auto& histogram                    = histograms[col];
+    histogram.null_count               = count(field_class::NA);
+    histogram.bool_count               = count(field_class::BOOL);
+    histogram.float_count              = count(field_class::FLOAT);
+    histogram.datetime_count           = count(field_class::DATETIME);
+    histogram.string_count             = count(field_class::STRING);
+    histogram.negative_small_int_count = count(field_class::NEGATIVE_SMALL_INT);
+    histogram.positive_small_int_count = count(field_class::POSITIVE_SMALL_INT);
+    histogram.big_int_count            = count(field_class::BIG_INT);
+  }
+  return histograms;
 }
 
 void decode_row_column_data(cudf::io::parse_options_view const& options,
@@ -1252,7 +1511,6 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
-                            device_span<size_type> valid_counts,
                             cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -1261,7 +1519,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
 
   convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(
-    options, data, column_flags, row_offsets, dtypes, columns, valids, valid_counts);
+    options, data, column_flags, row_offsets, dtypes, columns, valids);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
