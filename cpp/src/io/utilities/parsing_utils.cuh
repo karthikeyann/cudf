@@ -97,7 +97,7 @@ CUDF_HOST_DEVICE constexpr char to_lower(char const c)
  */
 CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
 {
-  if (*begin == '-' || *begin == '+') begin++;
+  if (begin < end && (*begin == '-' || *begin == '+')) begin++;
   char const* cinf = "infinity";
   auto index       = begin;
   while (index < end) {
@@ -128,13 +128,13 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
   constexpr bool as_hex = (base == 16);
 
   // Handle negative values if necessary
-  int32_t sign = (*begin == '-') ? -1 : 1;
+  int32_t sign = (begin < end && *begin == '-') ? -1 : 1;
 
   // Handle infinity
   if (cuda::std::is_floating_point_v<T> && is_infinity(begin, end)) {
     return sign * cuda::std::numeric_limits<T>::infinity();
   }
-  if (*begin == '-' || *begin == '+') begin++;
+  if (begin < end && (*begin == '-' || *begin == '+')) begin++;
 
   // Skip over the "0x" prefix for hex notation
   if (base == 16 && begin + 2 < end && *begin == '0' && *(begin + 1) == 'x') { begin += 2; }
@@ -360,16 +360,10 @@ __device__ __inline__ cudf::size_type* infer_integral_field_counter(char const* 
 __inline__ __device__ bool is_whitespace(char ch) { return ch == '\t' || ch == ' '; }
 
 /**
- * @brief Skips past the current character if it matches the given value.
- */
-template <typename It>
-__inline__ __device__ It skip_character(It const& it, char ch)
-{
-  return it + (*it == ch);
-}
-
-/**
  * @brief Adjusts the range to ignore starting/trailing whitespace and quotation characters.
+ *
+ * At most one quotation character is removed from each end. Only characters within the range are
+ * inspected, so a lone quotation character yields an empty range rather than an inverted one.
  *
  * @param begin Pointer to the first character in the parsing range
  * @param end Pointer to the first character after the parsing range
@@ -382,13 +376,16 @@ __inline__ __device__ cuda::std::pair<char const*, char const*> trim_whitespaces
 {
   auto not_whitespace = [] __device__(auto c) { return !is_whitespace(c); };
 
-  auto const trim_begin = thrust::find_if(thrust::seq, begin, end, not_whitespace);
-  auto const trim_end   = thrust::find_if(thrust::seq,
-                                        cuda::std::make_reverse_iterator(end),
-                                        cuda::std::make_reverse_iterator(trim_begin),
-                                        not_whitespace);
+  auto trim_begin = thrust::find_if(thrust::seq, begin, end, not_whitespace);
+  auto trim_end   = thrust::find_if(thrust::seq,
+                                  cuda::std::make_reverse_iterator(end),
+                                  cuda::std::make_reverse_iterator(trim_begin),
+                                  not_whitespace)
+                    .base();
 
-  return {skip_character(trim_begin, quotechar), skip_character(trim_end, quotechar).base()};
+  if (trim_begin < trim_end && *trim_begin == quotechar) { ++trim_begin; }
+  if (trim_begin < trim_end && *(trim_end - 1) == quotechar) { --trim_end; }
+  return {trim_begin, trim_end};
 }
 
 /**

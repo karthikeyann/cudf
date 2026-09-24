@@ -3120,6 +3120,86 @@ TEST_F(CsvReaderTest, NonAsciiNaAndBooleanValues)
   CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bools, result.tbl->view().column(1));
 }
 
+TEST_F(CsvReaderTest, LoneQuoteField)
+{
+  // A quote character that opens a quoted field at the end of the input is not a quoted string;
+  // the field keeps the quote character
+  auto const read_last_field = [](std::string const& buffer, bool detect_whitespace_around_quotes) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()})
+        .detect_whitespace_around_quotes(detect_whitespace_around_quotes);
+    return cudf::io::read_csv(in_opts);
+  };
+
+  auto const expected_ints = cudf::test::fixed_width_column_wrapper<int32_t>({1, 2});
+  {
+    auto const result = read_last_field("a,b\n1,x\n2,\"", false);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_ints, result.tbl->view().column(0));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"x", "\""}),
+                                   result.tbl->view().column(1));
+  }
+  {
+    // Whitespace is only removed around quoted strings
+    auto const result = read_last_field("a,b\n1,x\n2, \"", true);
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_ints, result.tbl->view().column(0));
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"x", " \""}),
+                                   result.tbl->view().column(1));
+  }
+}
+
+TEST_F(CsvReaderTest, LoneQuoteNonStringField)
+{
+  // With the enclosing quote stripped, a lone quote at the end of the input is an empty field, like
+  // an empty quoted field. Parsing it must not read the byte after the input; run under
+  // compute-sanitizer with exact allocations (--rmm_mode=cuda) to detect such reads.
+  std::string const buffer = "\"\"\n\"";
+  for (auto const type :
+       {type_id::INT32, type_id::FLOAT64, type_id::BOOL8, type_id::DURATION_SECONDS}) {
+    SCOPED_TRACE(static_cast<int>(type));
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes({data_type{type}})
+        .header(-1)
+        .na_filter(false);
+    auto const result = cudf::io::read_csv(in_opts);
+    auto const column = result.tbl->view().column(0);
+    ASSERT_EQ(column.size(), 2);
+    EXPECT_EQ(column.null_count(), 0);
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::slice(column, {0, 1}).front(),
+                                   cudf::slice(column, {1, 2}).front());
+  }
+}
+
+TEST_F(CsvReaderTest, EmptyFirstField)
+{
+  // The first field of the input is empty, so the byte before it is outside the input. Parsing it
+  // must not read that byte; run under compute-sanitizer with exact allocations (--rmm_mode=cuda)
+  // to detect such reads.
+  std::string const buffer = ",1\n2,3\n";
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<int32_t>()})
+      .header(-1)
+      .na_filter(false);
+  auto const result = cudf::io::read_csv(in_opts);
+
+  // Without NA filtering, an empty numeric field parses as zero
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int32_t>({0, 2}),
+                                      result.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::fixed_width_column_wrapper<int32_t>({1, 3}),
+                                      result.tbl->view().column(1));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {
