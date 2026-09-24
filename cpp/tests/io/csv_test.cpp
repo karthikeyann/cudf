@@ -4761,6 +4761,23 @@ TEST_F(CsvReaderTest, EmptyEdgeFieldsOfBlocks)
   }
 }
 
+TEST_F(CsvReaderTest, InferredZeroIntegerAtEndOfData)
+{
+  // Type inference skips the leading zeros of integers of 19 digits or more. An integer made of
+  // zeros only must not be read past its end, which can be the end of the data. Under
+  // compute-sanitizer with exact allocations (--rmm_mode=cuda), such a read is detected when the
+  // rows are parsed in global memory (not staged in shared memory).
+  with_each_row_staging_policy([] {
+    for (size_t const num_zeros : {19, 20, 21, 32}) {
+      SCOPED_TRACE(std::to_string(num_zeros) + " zeros");
+      auto const text   = "s,n\na,1\nb," + std::string(num_zeros, '0');
+      auto const result = cudf::io::read_csv(host_buffer_options(text).build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(column_wrapper<int64_t>{1, 0},
+                                          result.tbl->view().column(1));
+    }
+  });
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {
