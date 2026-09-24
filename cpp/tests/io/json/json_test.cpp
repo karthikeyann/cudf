@@ -2416,6 +2416,28 @@ TEST_F(JsonReaderTest, NaValuesDoNotMatchLongerValues)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->get_column(0));
 }
 
+TEST_F(JsonReaderTest, NonAsciiNaValues)
+{
+  auto const read_json = [](std::string const& data, std::vector<std::string> na_values) {
+    cudf::io::json_reader_options const in_options =
+      cudf::io::json_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+        .lines(true)
+        .na_values(std::move(na_values));
+    return cudf::io::read_json(in_options);
+  };
+
+  // "é" is a two-byte UTF-8 sequence whose bytes are negative as signed char. NA values are matched
+  // against the raw values, unquoted (accepted outside of strict mode) or including the quotes.
+  auto const unquoted = read_json("{\"a\": é}\n{\"a\": éé}\n", {"é"});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"", "éé"}, {false, true}),
+                                 unquoted.tbl->get_column(0));
+  auto const quoted = read_json("{\"a\": \"é\"}\n{\"a\": \"b\"}\n", {"\"é\""});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"", "b"}, {false, true}),
+                                 quoted.tbl->get_column(0));
+}
+
 TEST_F(JsonReaderTest, MixedTypes)
 {
   using LCWS    = cudf::test::lists_column_wrapper<cudf::string_view>;

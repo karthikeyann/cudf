@@ -28,9 +28,10 @@ static constexpr char trie_terminating_character = '\n';
  *
  * A serialized trie is an array of nodes. Each node represents a matching character, except for the
  * last child node, which denotes the end of the children list. Children of a node are stored
- * contiguously. The `children_offset` member is the offset between the node and its first child, or
- * negative if the node has no children. Matching is successful if all characters are matched and
- * the final node is the last character of a word (i.e. `is_leaf` is true).
+ * contiguously, in ascending order of their characters compared as unsigned bytes. The
+ * `children_offset` member is the offset between the node and its first child, or negative if the
+ * node has no children. Matching is successful if all characters are matched and the final node is
+ * the last character of a word (i.e. `is_leaf` is true).
  *
  * Node indexes and offsets are stored as `int16_t`, so `children_offset` is only meaningful for
  * tries of at most `std::numeric_limits<int16_t>::max()` nodes.

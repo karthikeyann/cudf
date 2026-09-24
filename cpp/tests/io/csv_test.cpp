@@ -3094,6 +3094,32 @@ TEST_F(CsvReaderTest, NaValuesDoNotMatchLongerFields)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(custom_na_expected, custom_na_result.tbl->view().column(0));
 }
 
+TEST_F(CsvReaderTest, NonAsciiNaAndBooleanValues)
+{
+  // "é" and "í" are two-byte UTF-8 sequences whose bytes are negative as signed char
+  std::string const buffer = "a,sí\né,no\nb,no\néé,sí\naé,no\n";
+
+  cudf::io::csv_reader_options const in_opts =
+    cudf::io::csv_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+      .compression(cudf::io::compression_type::NONE)
+      .dtypes(std::vector<data_type>{dtype<cudf::string_view>(), dtype<bool>()})
+      .header(-1)
+      .keep_default_na(false)
+      .na_values({"a", "é"})
+      .true_values({"sí"})
+      .false_values({"no"});
+  auto const result = cudf::io::read_csv(in_opts);
+
+  auto const expected_strings =
+    cudf::test::strings_column_wrapper({"", "", "b", "éé", "aé"}, {false, false, true, true, true});
+  auto const expected_bools =
+    cudf::test::fixed_width_column_wrapper<bool>({true, false, false, true, false});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_strings, result.tbl->view().column(0));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bools, result.tbl->view().column(1));
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

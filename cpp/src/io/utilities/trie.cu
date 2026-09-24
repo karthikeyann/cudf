@@ -28,7 +28,9 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
 {
   if (keys.empty()) { return rmm::device_uvector<serial_trie_node>{0, stream}; }
 
-  static constexpr int alphabet_size = std::numeric_limits<char>::max() + 1;
+  // Children are indexed by the character's value as an unsigned byte, so they are serialized in
+  // the unsigned byte order that `serialized_trie_contains` relies on
+  static constexpr int alphabet_size = std::numeric_limits<unsigned char>::max() + 1;
   struct TreeTrieNode {
     using TrieNodePtr = std::unique_ptr<TreeTrieNode>;
     std::array<TrieNodePtr, alphabet_size> children;
@@ -43,10 +45,10 @@ rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::st
     auto* current_node = &tree_trie;
 
     for (char const character : key) {
-      if (current_node->children[character] == nullptr)
-        current_node->children[character] = std::make_unique<TreeTrieNode>();
+      auto& child = current_node->children[static_cast<unsigned char>(character)];
+      if (child == nullptr) { child = std::make_unique<TreeTrieNode>(); }
 
-      current_node = current_node->children[character].get();
+      current_node = child.get();
     }
 
     current_node->is_end_of_word = true;

@@ -44,8 +44,10 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
       curr_node += curr_node->children_offset;
     }
     // Search for the next character in the array of children nodes
-    // Nodes are sorted - terminate search if the node is larger or equal
-    while (curr_node->character != trie_terminating_character && curr_node->character < *curr_key) {
+    // Nodes are sorted as unsigned bytes - terminate search if the node is larger or equal
+    auto const key_char = static_cast<unsigned char>(*curr_key);
+    while (curr_node->character != trie_terminating_character &&
+           static_cast<unsigned char>(curr_node->character) < key_char) {
       ++curr_node;
     }
     // Could not find the next character, done with the search
