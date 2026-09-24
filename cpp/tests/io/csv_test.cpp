@@ -3032,6 +3032,35 @@ TEST_F(CsvReaderTest, TimestampsWithIncompleteDate)
     read_dates(true).tbl->view().column(0));
 }
 
+TEST_F(CsvReaderTest, DurationsAtEndOfInput)
+{
+  // Each duration ends where the input ends, so the parser must not look at the character after
+  // the last component. Run under compute-sanitizer with exact allocations (--rmm_mode=cuda) to
+  // detect such reads.
+  auto const read_last_duration = [](std::string const& buffer) {
+    cudf::io::csv_reader_options const in_opts =
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .dtypes({data_type{type_id::DURATION_MILLISECONDS}})
+        .header(-1);
+    return cudf::io::read_csv(in_opts);
+  };
+
+  using namespace cuda::std::chrono_literals;
+  auto const expect_duration = [&](std::string const& buffer, cudf::duration_ms expected) {
+    SCOPED_TRACE(buffer);
+    expect_column_data_equal(std::vector<cudf::duration_ms>{expected},
+                             read_last_duration(buffer).tbl->view().column(0));
+  };
+  expect_duration("1 days", cudf::duration_ms{24h});
+  expect_duration("1 days +", cudf::duration_ms{24h});
+  expect_duration("00:00:01", cudf::duration_ms{1s});
+  expect_duration("1 days 00:00:01", cudf::duration_ms{24h + 1s});
+  expect_duration("1 days 00:00:01.", cudf::duration_ms{24h + 1s});
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

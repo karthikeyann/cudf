@@ -273,7 +273,7 @@ __inline__ __device__ timestamp_type to_timestamp(char const* begin, char const*
 template <typename T>
 __inline__ __device__ T parse_integer(char const** begin, char const* end)
 {
-  bool const is_negative = (**begin == '-');
+  bool const is_negative = (*begin < end && **begin == '-');
   T value                = 0;
 
   auto cur = *begin + is_negative;
@@ -304,7 +304,7 @@ __inline__ __device__ T parse_integer(char const** begin, char const* end)
 template <typename T>
 __inline__ __device__ T parse_optional_integer(char const** begin, char const* end, char delimiter)
 {
-  if (**begin != delimiter) { return 0; }
+  if (*begin >= end || **begin != delimiter) { return 0; }
 
   ++(*begin);
   return parse_integer<T>(begin, end);
@@ -373,7 +373,7 @@ __inline__ __device__ duration_type to_duration(char const* begin, char const* e
   auto const after_days_sep     = skip_if_starts_with(cur, end, "days");
   auto const has_days_seperator = (after_days_sep != cur);
   cur                           = skip_spaces(after_days_sep, end);
-  cur += (*cur == '+');
+  cur += (cur < end && *cur == '+');
 
   duration_D d_d{0};
   duration_h d_h{0};
@@ -392,7 +392,7 @@ __inline__ __device__ duration_type to_duration(char const* begin, char const* e
 
   if constexpr (std::is_same_v<duration_type, cudf::duration_s>) { return output_d; }
 
-  auto const d_ns = (*cur != '.') ? duration_ns{0} : [&]() {
+  auto const d_ns = (cur >= end || *cur != '.') ? duration_ns{0} : [&]() {
     auto const start_subsecond     = ++cur;
     auto const unscaled_subseconds = parse_integer<int64_t>(&cur, end);
     auto const scale               = min(9L, cur - start_subsecond) - 9;
