@@ -155,6 +155,17 @@ uint32_t gather_row_offsets(cudf::io::parse_options_view const& options,
                             cuda::stream_ref stream);
 
 /**
+ * @brief Offsets of the rows of data, and whether the data may have escaped quotes.
+ */
+struct gathered_rows {
+  /// Offsets of the rows that are not blank or comment rows, followed by the size of the data
+  rmm::device_uvector<uint64_t> offsets;
+  /// Whether the data has two consecutive quote characters. Without them, no quoted field has an
+  /// escaped quote pair.
+  bool has_consecutive_quotes;
+};
+
+/**
  * @brief Gathers the offsets of all rows in the given data in a single pass.
  *
  * Produces the same row offsets as the two phases of `gather_row_offsets` over the whole data as a
@@ -164,16 +175,19 @@ uint32_t gather_row_offsets(cudf::io::parse_options_view const& options,
  * assumption is wrong are then processed again with their actual starting state, so each tile is
  * processed at most twice.
  *
+ * While it reads the data, it also finds whether the data has two consecutive quote characters,
+ * wherever they are, which tells whether decoding may unescape quoted fields.
+ *
  * @param options Options that control parsing of individual fields
  * @param data Character data; the first row starts at the beginning
  * @param stream CUDA stream used for device memory operations and kernel launches
  *
- * @return Offsets of the rows in `data` that are not blank or comment rows, followed by
- * `data.size()`
+ * @return The offsets of the rows in `data` that are not blank or comment rows, followed by
+ * `data.size()`, and whether `data` has two consecutive quote characters
  */
-rmm::device_uvector<uint64_t> gather_all_row_offsets(cudf::io::parse_options_view const& options,
-                                                     device_span<char const> data,
-                                                     cuda::stream_ref stream);
+gathered_rows gather_all_row_offsets(cudf::io::parse_options_view const& options,
+                                     device_span<char const> data,
+                                     cuda::stream_ref stream);
 
 /**
  * Count the number of blank rows in the given row offset array
@@ -256,7 +270,8 @@ std::vector<column_type_histogram> detect_column_types(
  * @param[in] data The row-column data
  * @param[out] unescape_buffer Memory of the size of `data` that receives the unescaped quoted
  * string fields, at the offsets of the fields in `data`; may be `data` itself, and may be empty if
- * `options.doublequote` is not set or no column is a string column
+ * `options.doublequote` is not set, if no column is a string column, or if `data` does not have two
+ * consecutive quote characters
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] dtypes List of dtype corresponding to each column

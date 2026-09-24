@@ -10,6 +10,7 @@
 #include "io/utilities/trie.cuh"
 
 #include <cudf/detail/utilities/cuda.cuh>
+#include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/getenv_or.hpp>
 #include <cudf/detail/utilities/grid_1d.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
@@ -807,11 +808,12 @@ __device__ __forceinline__ size_t unescape_doublequotes(
  * and must be updated if static shared memory is added.
  *
  * String pairs point into `data`, never into a staged copy. When `options.doublequote` is set, the
- * escaped quote pairs of each quoted string field are collapsed into `unescape_buffer`, at the
- * offset of the field in `data`, and the field's string pair points there instead. Each field is
- * written by the thread of its row only, so this is race-free when `unescape_buffer` is scratch
- * memory. When the reader owns `data`, `unescape_buffer` is `data` itself, and the fields are
- * unescaped in place, which relies on three invariants:
+ * escaped quote pairs of each quoted string field that has any are collapsed into
+ * `unescape_buffer`, at the offset of the field in `data`, and the field's string pair points there
+ * instead. Other fields are not written, so data without two consecutive quote characters needs no
+ * `unescape_buffer`. Each field is written by the thread of its row only, so this is race-free when
+ * `unescape_buffer` is scratch memory. When the reader owns `data`, `unescape_buffer` is `data`
+ * itself, and the fields are unescaped in place, which relies on three invariants:
  * - All bytes used for row `i` lie within its byte range `[row_offsets[i], row_offsets[i + 1])`,
  *   and the ranges of different rows do not overlap, so each byte is used by one thread only.
  *   Loads that cover bytes outside the row, such as the word loads of `seek_field_end_by_words`,
@@ -829,8 +831,8 @@ __device__ __forceinline__ size_t unescape_doublequotes(
  * @param[in] options A set of parsing options
  * @param[in] data The entire CSV data to read
  * @param[out] unescape_buffer Memory of the size of `data` that receives the unescaped quoted
- * string fields; may be `data` itself, and may be empty if `options.doublequote` is not set or no
- * column is a string column
+ * string fields; may be `data` itself, and may be empty if `options.doublequote` is not set, if no
+ * column is a string column, or if `data` does not have two consecutive quote characters
  * @param[in] column_flags Per-column parsing behavior flags
  * @param[in] row_offsets The start the CSV data of interest
  * @param[in] dtypes The data type of the column
@@ -1278,9 +1280,15 @@ __device__ __forceinline__ uint32_t match_bytes(uint32_t word, int c)
  * @param end_is_eof Whether `end` is the end of the data
  * @param c_prev Character before the slice, or the terminator at the start of the data
  * @param chars Characters that determine where rows start
+ * @param[in,out] has_consecutive_quotes Set if a quote character of the slice before `end`
+ * follows a quote character (`c_prev` included), left unchanged otherwise
  */
-__device__ uint4 slice_row_contexts(
-  char const* slice, char const* end, bool end_is_eof, int c_prev, row_parse_chars const& chars)
+__device__ uint4 slice_row_contexts(char const* slice,
+                                    char const* end,
+                                    bool end_is_eof,
+                                    int c_prev,
+                                    row_parse_chars const& chars,
+                                    bool& has_consecutive_quotes)
 {
   // Initial state is neutral context (no state transitions), zero rows
   uint4 ctx_map = {
@@ -1322,6 +1330,10 @@ __device__ uint4 slice_row_contexts(
         row_starts,
         (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_NONE << 4) | (ROW_CTX_EOF << 6)};
     }
+    // Quote characters that follow a quote character
+    if ((quotes & ((quotes << 1) | (c_prev == chars.quotechar ? 1u : 0u))) != 0) {
+      has_consecutive_quotes = true;
+    }
 
     // Only the characters that follow a terminator and the quote characters have transitions
     // other than the regular one (NONE->NONE, QUOTE->QUOTE, COMMENT->NONE, no row start). The
@@ -1347,6 +1359,7 @@ __device__ uint4 slice_row_contexts(
     if (cur < end) {
       c   = cur[0];
       ctx = char_row_context(c, c_prev, chars);
+      if (c == chars.quotechar && c_prev == chars.quotechar) { has_consecutive_quotes = true; }
     } else if (end_is_eof && cur == end) {
       // Add a newline at data end (need the extra row offset to infer length of previous row)
       ctx = make_char_context(ROW_CTX_EOF, ROW_CTX_EOF, ROW_CTX_EOF, 1, 1, 1);
@@ -1421,7 +1434,9 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * slice_chars;
   auto const cur   = start + block_pos;
   int const c_prev = (cur > start && cur <= end) ? cur[-1] : chars.terminator;
-  auto ctx_map     = slice_row_contexts(cur, end, end_is_eof, c_prev, chars);
+  // Only the single-pass row gathering reports consecutive quotes
+  bool has_consecutive_quotes = false;
+  auto ctx_map = slice_row_contexts(cur, end, end_is_eof, c_prev, chars, has_consecutive_quotes);
 
   // Eliminate rows that start before byte_range_start
   if (start_offset + block_pos < byte_range_start) {
@@ -1566,6 +1581,8 @@ __device__ __forceinline__ uint32_t apply_transition(state_transition transition
  * @param start_state Parser state at the start of the tile
  * @param[out] row_bitmaps Row start bitmap of every slice
  * @param[out] tile_row_counts Number of rows that start in each tile
+ * @param[in,out] has_consecutive_quotes Set if a quote character of the thread's slices follows a
+ * quote character, left unchanged otherwise
  * @return The state transition of the tile, in thread 0
  */
 __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data,
@@ -1574,7 +1591,8 @@ __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data
                                                     size_t tile,
                                                     uint32_t start_state,
                                                     uint32_t* row_bitmaps,
-                                                    uint64_t* tile_row_counts)
+                                                    uint64_t* tile_row_counts,
+                                                    bool& has_consecutive_quotes)
 {
   using block_scan   = cub::BlockScan<state_transition, rowofs_block_dim>;
   using block_reduce = cub::BlockReduce<uint32_t, rowofs_block_dim>;
@@ -1591,7 +1609,7 @@ __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data
   for (uint32_t j = 0; j < tile_slices_per_thread; ++j) {
     auto const slice = data.data() + (first_slice + j) * slice_chars;
     int const c_prev = (slice > data.data() && slice <= end) ? slice[-1] : chars.terminator;
-    ctx_maps[j]      = slice_row_contexts(slice, end, true, c_prev, chars);
+    ctx_maps[j]      = slice_row_contexts(slice, end, true, c_prev, chars, has_consecutive_quotes);
     thread_transition =
       compose_transitions{}(thread_transition, static_cast<state_transition>(ctx_maps[j].w));
   }
@@ -1628,6 +1646,11 @@ __device__ state_transition gather_tile_row_bitmaps(device_span<char const> data
  *
  * A tile starts in another state if a quoted field spans its start or ends right before it, so
  * the assumption fails for roughly the proportion of quoted characters in the data.
+ *
+ * This pass reads every character of the data once, and also finds whether the data has two
+ * consecutive quote characters, whatever the parser state (see `gather_all_row_offsets`).
+ *
+ * @param[out] has_consecutive_quotes Set to 1 if the data has two consecutive quote characters
  */
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   gather_speculative_row_bitmaps_gpu(device_span<char const> data,
@@ -1635,12 +1658,23 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                                      is_blank_row is_blank,
                                      uint32_t* row_bitmaps,
                                      uint64_t* tile_row_counts,
-                                     state_transition* tile_transitions)
+                                     state_transition* tile_transitions,
+                                     uint64_t* has_consecutive_quotes)
 {
-  auto const tile       = static_cast<size_t>(blockIdx.x);
-  auto const transition = gather_tile_row_bitmaps(
-    data, chars, is_blank, tile, ROW_CTX_NONE, row_bitmaps, tile_row_counts);
+  auto const tile                = static_cast<size_t>(blockIdx.x);
+  bool thread_consecutive_quotes = false;
+  auto const transition          = gather_tile_row_bitmaps(data,
+                                                  chars,
+                                                  is_blank,
+                                                  tile,
+                                                  ROW_CTX_NONE,
+                                                  row_bitmaps,
+                                                  tile_row_counts,
+                                                  thread_consecutive_quotes);
   if (threadIdx.x == 0) { tile_transitions[tile] = transition; }
+  if (__syncthreads_or(thread_consecutive_quotes) && threadIdx.x == 0) {
+    *has_consecutive_quotes = 1;
+  }
 }
 
 /**
@@ -1661,7 +1695,10 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   // The data starts in the NONE state
   auto const start_state = apply_transition(tile_start_transitions[tile], ROW_CTX_NONE);
   if (start_state == ROW_CTX_NONE) { return; }
-  gather_tile_row_bitmaps(data, chars, is_blank, tile, start_state, row_bitmaps, tile_row_counts);
+  // Already found by the speculative pass
+  bool has_consecutive_quotes = false;
+  gather_tile_row_bitmaps(
+    data, chars, is_blank, tile, start_state, row_bitmaps, tile_row_counts, has_consecutive_quotes);
 }
 
 /**
@@ -1836,9 +1873,9 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
-rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& options,
-                                                     device_span<char const> data,
-                                                     cuda::stream_ref stream)
+gathered_rows gather_all_row_offsets(parse_options_view const& options,
+                                     device_span<char const> data,
+                                     cuda::stream_ref stream)
 {
   // The last tile holds the row that ends the data, at data.size()
   auto const num_tiles = data.size() / tile_chars + 1;
@@ -1850,9 +1887,18 @@ rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& o
   rmm::device_uvector<uint64_t> tile_rows(num_tiles + 1, stream);
   tile_rows.set_element_to_zero_async(num_tiles, stream);
   rmm::device_uvector<state_transition> tile_transitions(num_tiles, stream);
+  // A word rather than a bool, so that it is copied to the host with the number of rows
+  auto d_has_consecutive_quotes = cudf::detail::make_zeroed_device_uvector_async<uint64_t>(
+    1, stream, cudf::get_current_device_resource_ref());
 
   gather_speculative_row_bitmaps_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
-    data, chars, is_blank, row_bitmaps.data(), tile_rows.data(), tile_transitions.data());
+    data,
+    chars,
+    is_blank,
+    row_bitmaps.data(),
+    tile_rows.data(),
+    tile_transitions.data(),
+    d_has_consecutive_quotes.data());
   CUDF_CUDA_TRY(cudaGetLastError());
 
   // Transition from the start of the data to the start of each tile
@@ -1874,12 +1920,22 @@ rmm::device_uvector<uint64_t> gather_all_row_offsets(parse_options_view const& o
                          tile_rows.begin(),
                          tile_rows.end(),
                          tile_rows.begin());
-  rmm::device_uvector<uint64_t> offsets(tile_rows.element(num_tiles, stream), stream);
+
+  // The number of rows sizes the offsets; the flag is copied with it
+  auto h_values = cudf::detail::make_pinned_vector_async<uint64_t>(2, stream);
+  cudf::detail::cuda_memcpy_async(cudf::host_span<uint64_t>{h_values}.subspan(0, 1),
+                                  device_span<uint64_t const>{tile_rows}.subspan(num_tiles, 1),
+                                  stream);
+  cudf::detail::cuda_memcpy_async(cudf::host_span<uint64_t>{h_values}.subspan(1, 1),
+                                  device_span<uint64_t const>{d_has_consecutive_quotes},
+                                  stream);
+  stream.sync();
+  rmm::device_uvector<uint64_t> offsets(h_values[0], stream);
 
   row_bitmaps_to_offsets_gpu<<<num_tiles, rowofs_block_dim, 0, stream.get()>>>(
     row_bitmaps.data(), tile_rows.data(), offsets);
   CUDF_CUDA_TRY(cudaGetLastError());
-  return offsets;
+  return {std::move(offsets), h_values[1] != 0};
 }
 
 uint32_t __host__ gather_row_offsets(parse_options_view const& options,

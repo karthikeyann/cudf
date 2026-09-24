@@ -294,6 +294,8 @@ struct data_and_row_offsets {
   selected_rows_offsets row_offsets;
   /// Shared memory size with which the decoding kernels stage the rows of each block
   size_t row_staging_size = 0;
+  /// Whether the data may have two consecutive quote characters, which escaped quote pairs need
+  bool has_consecutive_quotes = true;
 
   /// Returns the input data
   [[nodiscard]] device_span<char const> data() const
@@ -376,6 +378,8 @@ data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* sour
   rmm::device_uvector<char> d_data{0, stream};
   std::unique_ptr<datasource::buffer> source_data;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
+  // Only known when the rows are gathered in a single pass
+  bool has_consecutive_quotes = true;
   if (load_whole_file) {
     // Without row selection, the whole file is loaded and its rows gathered in a single pass. The
     // data of device sources that allow it is parsed where the source holds it, without a copy.
@@ -392,7 +396,9 @@ data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* sour
       source_data == nullptr
         ? device_span<char const>{d_data}
         : device_span<char const>{reinterpret_cast<char const*>(source_data->data()), read_size};
-    all_row_offsets = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(), input, stream);
+    auto rows       = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(), input, stream);
+    all_row_offsets = std::move(rows.offsets);
+    has_consecutive_quotes = rows.has_consecutive_quotes;
   } else {
     // Reading in chunks bounds the work done before reaching the end of the byte range or the
     // requested number of rows
@@ -568,7 +574,11 @@ data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* sour
       }
     }
   }
-  return {std::move(d_data), std::move(source_data), std::move(row_offsets), row_staging_size};
+  return {std::move(d_data),
+          std::move(source_data),
+          std::move(row_offsets),
+          row_staging_size,
+          has_consecutive_quotes};
 }
 
 data_and_row_offsets select_data_and_row_offsets(cudf::io::datasource* source,
@@ -1105,7 +1115,8 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   out_columns.reserve(column_types.size());
   if (num_records != 0) {
     // Quoted string fields with escaped quotes are unescaped in place in the reader's copy of the
-    // data, or into scratch memory when the data is the source's, which must not be modified
+    // data, or into scratch memory when the data is the source's, which must not be modified. The
+    // scratch memory is only needed if there can be such fields.
     rmm::device_uvector<char> unescape_scratch{0, stream};
     auto const unescape_buffer = [&]() -> device_span<char> {
       if (data_row_offsets.source_data == nullptr) { return data_row_offsets.owned_data; }
@@ -1113,7 +1124,8 @@ table_with_metadata read_csv(cudf::io::datasource* source,
         std::any_of(column_types.begin(), column_types.end(), [](auto const& type) {
           return type.id() == type_id::STRING;
         });
-      if (parse_opts.doublequote and has_string_columns) {
+      if (parse_opts.doublequote and has_string_columns and
+          data_row_offsets.has_consecutive_quotes) {
         unescape_scratch.resize(data.size(), stream);
       }
       return unescape_scratch;

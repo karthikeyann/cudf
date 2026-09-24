@@ -31,6 +31,7 @@
 #include <rmm/device_uvector.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
+#include <rmm/mr/statistics_resource_adaptor.hpp>
 
 #include <cuda/iterator>
 #include <thrust/execution_policy.h>
@@ -5143,6 +5144,96 @@ TEST_F(CsvReaderTest, DeviceBufferWithOtherQuoteCharacter)
     CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected, result.tbl->view().column(0));
     auto const h_after = cudf::detail::make_std_vector(d_buffer, cudf::get_default_stream());
     EXPECT_EQ(std::string(h_after.begin(), h_after.end()), std::string(offset, '"') + text);
+  }
+}
+
+TEST_F(CsvReaderTest, EscapedQuotesAtSliceBoundariesOfDeviceBuffers)
+{
+  // Parsing a device buffer in place, the reader only allocates memory for unescaped strings if the
+  // row gathering found two consecutive quote characters. The only escaped quote pair of each input
+  // starts at a position around the boundaries of the 32-character slices and 32KB tiles that the
+  // row gathering processes, in aligned data (loaded in 16-byte words) and unaligned data (loaded
+  // one character at a time).
+  for (size_t const pair_position :
+       {6ul, 30ul, 31ul, 32ul, 47ul, 63ul, 64ul, 32767ul, 32768ul, 32799ul, 65535ul}) {
+    // A header, a row of filler characters, the field "x""y" whose pair is at the position, and a
+    // long enough row for the slices after the pair to be loaded in words
+    auto const filler = std::string(pair_position - 5, 'a');
+    auto const last   = std::string(100, 'b');
+    auto const text   = "s\n" + filler + "\n\"x\"\"y\"\n" + last + "\n";
+    ASSERT_EQ(text.substr(pair_position, 2), "\"\"");
+    auto const expected = cudf::test::strings_column_wrapper({filler, "x\"y", last});
+    for (size_t const offset : {0, 3}) {
+      SCOPED_TRACE("pair at " + std::to_string(pair_position) + ", offset " +
+                   std::to_string(offset));
+      auto const d_buffer = device_copy_at_offset(text, offset);
+      auto const result   = cudf::io::read_csv(
+        cudf::io::csv_reader_options::builder(
+          cudf::io::source_info{cudf::device_span<std::byte const>{
+            reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}})
+          .compression(cudf::io::compression_type::NONE)
+          .dtypes({dtype<cudf::string_view>()})
+          .build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected, result.tbl->view().column(0));
+      expect_device_copy_unchanged(d_buffer, text, offset);
+    }
+  }
+}
+
+TEST_F(CsvReaderTest, DeviceBufferPairsOutsideOfRowQuotes)
+{
+  // With whitespace around quotes, a field that starts with whitespace is still unescaped, although
+  // the row gathering does not consider it quoted (its quote does not follow a delimiter). Its
+  // pair must still count as consecutive quote characters.
+  std::string const text = "a,b\n1, \"x\"\"y\" \n2,z\n";
+  for (size_t const offset : {0, 3}) {
+    SCOPED_TRACE("offset " + std::to_string(offset));
+    auto const d_buffer = device_copy_at_offset(text, offset);
+    auto const result   = cudf::io::read_csv(
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::device_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}})
+        .compression(cudf::io::compression_type::NONE)
+        .detect_whitespace_around_quotes(true)
+        .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()})
+        .build());
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(cudf::test::strings_column_wrapper({"x\"y", "z"}),
+                                        result.tbl->view().column(1));
+    expect_device_copy_unchanged(d_buffer, text, offset);
+  }
+}
+
+TEST_F(CsvReaderTest, UnescapeMemoryOfDeviceBuffers)
+{
+  // Parsing a device buffer in place, the reader allocates memory of the size of the data for the
+  // unescaped strings only if the data has two consecutive quote characters. Only a short string
+  // column is read, so that the other memory used is about a quarter of the size of the data.
+  for (bool const escaped : {false, true}) {
+    SCOPED_TRACE(escaped ? "escaped quotes" : "no escaped quotes");
+    std::string text = "s,filler\n";
+    for (int i = 0; i < 10'000; ++i) {
+      text +=
+        (escaped ? "\"q\"\"" : "\"q") + std::to_string(i) + "\"," + std::string(200, 'f') + "\n";
+    }
+    auto const d_buffer = device_copy_at_offset(text, 0);
+    auto const source   = cudf::io::source_info{cudf::device_span<std::byte const>{
+      reinterpret_cast<std::byte const*>(d_buffer.data()), text.size()}};
+
+    rmm::mr::statistics_resource_adaptor statistics{cudf::get_current_device_resource_ref()};
+    auto const result = [&] {
+      cudf::test::scoped_current_device_resource const scope{statistics};
+      return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                                  .compression(cudf::io::compression_type::NONE)
+                                  .use_cols_indexes({0})
+                                  .build());
+    }();
+    EXPECT_EQ(result.tbl->num_rows(), 10'000);
+    auto const peak = static_cast<size_t>(statistics.get_bytes_counter().peak);
+    if (escaped) {
+      EXPECT_GE(peak, text.size());
+    } else {
+      EXPECT_LT(peak, text.size());
+    }
   }
 }
 
