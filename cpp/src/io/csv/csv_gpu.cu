@@ -332,7 +332,10 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
 /**
  * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
  *
- * Data is processed one record at a time.
+ * Data is processed one record at a time. A fixed-width output is written wherever its field is
+ * valid, which is where the (zero-initialized) validity bit is set, so fixed-width outputs do not
+ * need to be initialized. String outputs do: a (pointer, length) pair is written for valid and NA
+ * fields, while fields missing from the end of a short row rely on the zeroed pair reading as null.
  *
  * When `options.doublequote` is set, the escaped quote pairs of quoted string fields are collapsed
  * in place in `data`, and the string pairs point to the unescaped content. This relies on two

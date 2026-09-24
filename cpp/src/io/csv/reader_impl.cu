@@ -646,7 +646,12 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
 
   for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
     if (column_flags[col] & column_parse::enabled) {
-      auto out_buffer = column_buffer(column_types[active_col], num_records, true, stream, mr);
+      // Only the string (pointer, length) pairs need zeroing, for the fields missing from short
+      // rows; the decode kernel writes the other data wherever it is valid (see
+      // decode_row_column_data)
+      auto const is_string = column_types[active_col].id() == type_id::STRING;
+      auto out_buffer      = column_buffer(column_types[active_col], true);
+      out_buffer.create(num_records, is_string, stream, mr);
 
       out_buffer.name = column_names[col];
       out_buffers.emplace_back(std::move(out_buffer));

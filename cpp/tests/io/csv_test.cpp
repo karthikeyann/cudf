@@ -3503,6 +3503,88 @@ TEST_F(CsvReaderTest, EscapedQuotePairsDeviceSourceUnchanged)
   EXPECT_EQ(std::string(h_after.begin(), h_after.end()), buffer);
 }
 
+TEST_F(CsvReaderTest, ShortRowsMissingFieldsAreNull)
+{
+  // Row i has 5 - i % 5 of the 5 fields (the first row has all of them, so that the number of
+  // columns is detected as 5); the missing fields and the NA fields are null. The row counts cover
+  // a partial warp, exact and partial multiples of 32 rows, and multiple blocks.
+  auto const dtypes = std::vector<data_type>{dtype<int32_t>(),
+                                             dtype<cudf::string_view>(),
+                                             dtype<double>(),
+                                             dtype<cudf::string_view>(),
+                                             dtype<bool>()};
+  for (int const num_rows : {1, 31, 32, 33, 129, 1000}) {
+    std::string buffer;
+    std::vector<int32_t> ints;
+    std::vector<std::string> strings_a;
+    std::vector<double> doubles;
+    std::vector<std::string> strings_b;
+    std::vector<bool> bools;
+    std::vector<std::vector<bool>> valid(dtypes.size());
+    for (int i = 0; i < num_rows; ++i) {
+      auto const num_fields = 5 - i % 5;
+      auto const text       = std::to_string(i);
+      auto const is_na      = [&](int col) { return (i + col) % 7 == 3; };
+      std::vector<std::string> fields;
+      fields.push_back(is_na(0) ? "NA" : text);
+      fields.push_back(is_na(1) ? "NA" : (i % 3 == 0 ? "\"q\"\"" + text + "\"" : "s" + text));
+      fields.push_back(is_na(2) ? "NA" : text + ".25");
+      fields.push_back(is_na(3) ? "NA" : "t" + text);
+      fields.push_back(is_na(4) ? "NA" : (i % 2 == 0 ? "true" : "false"));
+      for (int col = 0; col < num_fields; ++col) {
+        buffer += (col == 0 ? "" : ",") + fields[col];
+      }
+      buffer += '\n';
+
+      ints.push_back(i);
+      strings_a.push_back(i % 3 == 0 ? "q\"" + text : "s" + text);
+      doubles.push_back(i + 0.25);
+      strings_b.push_back("t" + text);
+      bools.push_back(i % 2 == 0);
+      for (int col = 0; col < static_cast<int>(dtypes.size()); ++col) {
+        valid[col].push_back(col < num_fields && not is_na(col));
+      }
+    }
+
+    auto in_opts = host_buffer_options(buffer)
+                     .names({"a", "b", "c", "d", "e"})
+                     .header(-1)
+                     .dtypes(dtypes)
+                     .build();
+    auto const result = cudf::io::read_csv(in_opts);
+    auto const view   = result.tbl->view();
+    ASSERT_EQ(view.num_rows(), num_rows);
+
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      view.column(0), column_wrapper<int32_t>(ints.begin(), ints.end(), valid[0].begin()));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      view.column(1),
+      cudf::test::strings_column_wrapper(strings_a.begin(), strings_a.end(), valid[1].begin()));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      view.column(2), column_wrapper<double>(doubles.begin(), doubles.end(), valid[2].begin()));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      view.column(3),
+      cudf::test::strings_column_wrapper(strings_b.begin(), strings_b.end(), valid[3].begin()));
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      view.column(4), column_wrapper<bool>(bools.begin(), bools.end(), valid[4].begin()));
+
+    // Missing fields of unselected columns don't affect the selected ones
+    in_opts.set_use_cols_indexes({1, 2, 4});
+    auto const selected = cudf::io::read_csv(in_opts);
+    CUDF_TEST_EXPECT_TABLES_EQUAL(view.select({1, 2, 4}), selected.tbl->view());
+
+    // Whitespace-delimited rows take the same path
+    std::replace(buffer.begin(), buffer.end(), ',', ' ');
+    auto ws_opts = host_buffer_options(buffer)
+                     .names({"a", "b", "c", "d", "e"})
+                     .header(-1)
+                     .dtypes(dtypes)
+                     .delim_whitespace(true)
+                     .build();
+    CUDF_TEST_EXPECT_TABLES_EQUAL(view, cudf::io::read_csv(ws_opts).tbl->view());
+  }
+}
+
 namespace {
 // Writer settings a round trip varies; the reader side follows from them
 struct csv_roundtrip_settings {

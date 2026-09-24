@@ -211,8 +211,10 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] dtypes List of dtype corresponding to each column
- * @param[out] columns Device memory output of column data
- * @param[out] valids Device memory output of column valids bitmap data
+ * @param[out] columns Device memory output of column data. Fixed-width data is only written where
+ * the field is valid and needs no initialization; string pairs must be zero-initialized, since
+ * fields missing from short rows are not written
+ * @param[out] valids Device memory output of column valids bitmap data; must be zero-initialized
  * @param[out] valid_counts Device memory output of the number of valid fields in each column
  * @param[in] stream CUDA stream to use
  */
