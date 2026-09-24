@@ -150,6 +150,113 @@ __device__ __inline__ bool is_floatingpoint(long len,
   return true;
 }
 
+namespace {
+
+/// Unit in which `seek_field_end_by_words` loads the characters of a row
+using char_word = uint64_t;
+/// Number of characters in a `char_word`
+constexpr int word_chars = sizeof(char_word);
+
+/// Returns a word with every byte set to `c`
+__device__ constexpr char_word repeat_char(char c)
+{
+  return char_word{0x0101'0101'0101'0101} * static_cast<uint8_t>(c);
+}
+
+/**
+ * @brief Flags the zero bytes of a word.
+ *
+ * Returns a word with the high bit set in each byte that is zero in `word`, and in no byte below
+ * the lowest zero byte. A byte above a zero byte may also be flagged (the subtraction borrows
+ * from a zero byte into the next one), so the flags are a superset of the zero bytes whose lowest
+ * flag is exact.
+ */
+__device__ constexpr char_word flag_zero_bytes(char_word word)
+{
+  constexpr char_word low_bits  = 0x0101'0101'0101'0101;
+  constexpr char_word high_bits = 0x8080'8080'8080'8080;
+  return (word - low_bits) & ~word & high_bits;
+}
+
+/**
+ * @brief Equivalent of `cudf::io::gpu::seek_field_end` (without escape characters) that loads the
+ * row in aligned 8-byte words rather than one character at a time.
+ *
+ * The decoding kernels use one thread per row, so the character loads of a warp are scattered over
+ * 32 rows and each of them is a separate memory transaction; word loads cut their number by up to
+ * 8x. In a field that does not start with a quote, only a delimiter, a terminator or a '\r' can end
+ * the field: the positions of these characters in a word are flagged with `flag_zero_bytes` and
+ * checked in increasing order with the exact test of `seek_field_end`, so the first position that
+ * passes it is the one `seek_field_end` returns (every occurrence is flagged, and false flags fail
+ * the test). The characters of a quoted field are checked one by one after the word is loaded.
+ *
+ * Only words that lie entirely within `[data_begin, end)` are loaded, whatever the alignment of
+ * the data, and the characters of the row outside of such words are read one at a time. The lower
+ * bound matters when `data_begin` is not the start of an aligned, reader-owned buffer (e.g. when
+ * parsing a caller's buffer in place). A word may start before `begin`, in the previous field or
+ * in the previous row; these characters are never used, as other threads may be modifying them.
+ *
+ * @param begin Pointer to the first character of the field
+ * @param end Pointer to the end of the row
+ * @param data_begin Pointer to the first character of the data that holds the row
+ * @param opts A set of parsing options
+ *
+ * @return Pointer to the character that ends the field, or `end`
+ */
+__device__ char const* seek_field_end_by_words(char const* begin,
+                                               char const* end,
+                                               char const* data_begin,
+                                               parse_options_view const& opts)
+{
+  if (opts.multi_delimiter) { return cudf::io::gpu::seek_field_end(begin, end, opts); }
+
+  bool const starts_with_quote = begin < end && *begin == opts.quotechar;
+  bool in_quotes               = false;
+  // Same test as `seek_field_end` for the character `c` at `pos`
+  auto const ends_field = [&](char c, char const* pos) {
+    if (starts_with_quote && c == opts.quotechar) {
+      in_quotes = !in_quotes;
+      return false;
+    }
+    return !in_quotes && (c == opts.delimiter || c == opts.terminator ||
+                          (c == '\r' && pos + 1 < end && pos[1] == '\n'));
+  };
+  auto const data_address = reinterpret_cast<uintptr_t>(data_begin);
+  auto const end_address  = reinterpret_cast<uintptr_t>(end);
+  auto current            = begin;
+  while (current < end) {
+    auto const offset       = static_cast<int>(reinterpret_cast<uintptr_t>(current) % word_chars);
+    auto const word_address = reinterpret_cast<uintptr_t>(current) - offset;
+    if (word_address < data_address || word_address + word_chars > end_address) {
+      if (ends_field(*current, current)) { return current; }
+      ++current;
+      continue;
+    }
+    auto const word_begin = current - offset;
+    auto const word       = *reinterpret_cast<char_word const*>(word_begin);
+    auto const char_at    = [word](int i) { return static_cast<char>(word >> (8 * i)); };
+    if (starts_with_quote) {
+      for (int i = offset; i < word_chars; ++i) {
+        if (ends_field(char_at(i), word_begin + i)) { return word_begin + i; }
+      }
+    } else {
+      auto candidates = (flag_zero_bytes(word ^ repeat_char(opts.delimiter)) |
+                         flag_zero_bytes(word ^ repeat_char(opts.terminator)) |
+                         flag_zero_bytes(word ^ repeat_char('\r'))) &
+                        (~char_word{0} << (8 * offset));
+      while (candidates != 0) {
+        auto const i = (__ffsll(static_cast<long long>(candidates)) - 1) / 8;
+        if (ends_field(char_at(i), word_begin + i)) { return word_begin + i; }
+        candidates &= candidates - 1;
+      }
+    }
+    current = word_begin + word_chars;
+  }
+  return current;
+}
+
+}  // namespace
+
 /*
  * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
  *
@@ -192,7 +299,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     // not produce empty fields (matches pandas behavior).
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, opts);
     if (field_start >= row_end) break;
-    auto next_delimiter = cudf::io::gpu::seek_field_end(field_start, row_end, opts);
+    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, opts);
 
     // Checking if this is a column that the user wants --- user can filter columns
     if (column_flags[col] & column_parse::inferred) {
@@ -341,10 +448,10 @@ __device__ __forceinline__ size_t unescape_doublequotes(char* content,
  * When `options.doublequote` is set, the escaped quote pairs of quoted string fields are collapsed
  * in place in `data`, and the string pairs point to the unescaped content. This relies on two
  * invariants:
- * - All accesses for row `i` stay within its byte range `[row_offsets[i], row_offsets[i + 1])`,
- *   and the ranges of different rows do not overlap, so each byte is accessed by one thread only.
- *   Code that loads bytes outside the row (e.g. aligned word loads) must not use them: other
- *   threads may be rewriting them.
+ * - All bytes used for row `i` lie within its byte range `[row_offsets[i], row_offsets[i + 1])`,
+ *   and the ranges of different rows do not overlap, so each byte is used by one thread only.
+ *   Loads that cover bytes outside the row, such as the word loads of `seek_field_end_by_words`,
+ *   must not use them: other threads may be rewriting them.
  * - Within a row, a field is rewritten only after its end (and therefore the start of the next
  *   field) has been found, and the rewrite stays within the field.
  * No other code reads `data` after this kernel, except to copy the strings it describes.
@@ -391,7 +498,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, options);
     if (field_start >= row_end) break;
     next_field          = field_start;
-    auto next_delimiter = cudf::io::gpu::seek_field_end(field_start, row_end, options);
+    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, options);
 
     if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
