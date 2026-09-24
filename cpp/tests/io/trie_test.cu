@@ -93,6 +93,36 @@ TEST_F(TrieTest, KeysThatArePrefixesOfOtherKeys)
   EXPECT_EQ(contains(trie, queries), expected);
 }
 
+TEST_F(TrieTest, KeysLongerThan32767Characters)
+{
+  // Each character of the key is a node, so the nodes of its end are more than 32767 nodes after
+  // the root
+  std::string const key(40'000, 'x');
+  auto const trie =
+    cudf::detail::create_serialized_trie({key, "y"}, cudf::test::get_default_stream());
+  auto const prefix = key.substr(0, key.size() - 1);
+  EXPECT_EQ(contains(trie, {key, prefix, key + "x", prefix + "y", "y"}),
+            std::vector<bool>({true, false, false, false, true}));
+}
+
+TEST_F(TrieTest, ChildrenMoreThan32767NodesAfterTheirParent)
+{
+  // 40000 keys of six characters. A node of the fifth level is followed by the rest of its level
+  // and by the children of the nodes before it, so the last ones are more than 32767 nodes before
+  // their children.
+  std::vector<std::string> keys;
+  for (int i = 0; i < 40'000; ++i) {
+    auto const digits = std::to_string(i);
+    keys.push_back("k" + std::string(5 - digits.size(), '0') + digits);
+  }
+  auto const trie = cudf::detail::create_serialized_trie(keys, cudf::test::get_default_stream());
+  auto queries    = keys;
+  queries.insert(queries.end(), {"k40000", "k3999", "k399990", "k0000", "k"});
+  auto expected = std::vector<bool>(keys.size(), true);
+  expected.insert(expected.end(), 5, false);
+  EXPECT_EQ(contains(trie, queries), expected);
+}
+
 TEST_F(TrieTest, NoKeys)
 {
   auto const trie = cudf::detail::create_serialized_trie({}, cudf::test::get_default_stream());

@@ -34,14 +34,11 @@ static constexpr char trie_terminating_character = '\n';
  * the last character of a word (i.e. `is_leaf` is true).
  *
  * The first node is the root, which matches the empty key. Its children are the nodes that follow
- * it, so its `children_offset` instead holds the length of the longest key, or -1 if that does not
- * fit, which lets lookups reject longer keys without searching the trie.
- *
- * Node indexes and offsets are stored as `int16_t`, so `children_offset` is only meaningful for
- * tries of at most `std::numeric_limits<int16_t>::max()` nodes.
+ * it, so its `children_offset` instead holds the length of the longest key, which lets lookups
+ * reject longer keys without searching the trie.
  */
 struct serial_trie_node {
-  int16_t children_offset{-1};
+  int32_t children_offset{-1};
   char character{trie_terminating_character};
   bool is_leaf{false};
   explicit serial_trie_node(char c, bool leaf = false) noexcept : character(c), is_leaf(leaf) {}

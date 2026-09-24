@@ -2517,6 +2517,31 @@ TEST_F(JsonReaderTest, NonAsciiNaValues)
                                  quoted.tbl->get_column(0));
 }
 
+TEST_F(JsonReaderTest, NaValuesOfLargeTries)
+{
+  // The trie of 40000 keys of six characters has more than 44000 nodes, and the children of the
+  // last nodes of its fifth level are more than 32767 nodes after them
+  std::vector<std::string> na_values;
+  for (int i = 0; i < 40000; ++i) {
+    auto const digits = std::to_string(i);
+    na_values.push_back("k" + std::string(5 - digits.size(), '0') + digits);
+  }
+  std::string const data =
+    "{\"a\": k00000}\n{\"a\": k39999}\n{\"a\": k3999}\n{\"a\": k399990}\n{\"a\": x}\n";
+
+  cudf::io::json_reader_options const in_options =
+    cudf::io::json_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+      .lines(true)
+      .na_values(na_values);
+  auto const result = cudf::io::read_json(in_options);
+
+  auto const expected = cudf::test::strings_column_wrapper({"", "", "k3999", "k399990", "x"},
+                                                           {false, false, true, true, true});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->get_column(0));
+}
+
 TEST_F(JsonReaderTest, MixedTypes)
 {
   using LCWS    = cudf::test::lists_column_wrapper<cudf::string_view>;

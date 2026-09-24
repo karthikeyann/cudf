@@ -4594,6 +4594,30 @@ TEST_F(CsvReaderTest, NaAndBooleanValuesWithCommonPrefixes)
   });
 }
 
+TEST_F(CsvReaderTest, NaValuesOfLargeTries)
+{
+  // The trie of 40000 keys of six characters has more than 44000 nodes, and the children of the
+  // last nodes of its fifth level are more than 32767 nodes after them
+  std::vector<std::string> na_values;
+  for (int i = 0; i < 40000; ++i) {
+    auto const digits = std::to_string(i);
+    na_values.push_back("k" + std::string(5 - digits.size(), '0') + digits);
+  }
+  std::string const buffer = "k00000\nk39999\nk31234\nk3999\nk399990\nk40000\nx\n";
+
+  auto const expected = cudf::test::strings_column_wrapper(
+    {"", "", "", "k3999", "k399990", "k40000", "x"}, {false, false, false, true, true, true, true});
+  with_each_row_staging_policy([&] {
+    auto const result = cudf::io::read_csv(host_buffer_options(buffer)
+                                             .header(-1)
+                                             .dtypes({dtype<cudf::string_view>()})
+                                             .keep_default_na(false)
+                                             .na_values(na_values)
+                                             .build());
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->view().column(0));
+  });
+}
+
 TEST_F(CsvReaderTest, TypeInferenceOfShortRows)
 {
   // Rows of fields of 1 to 3 characters, with the counts of each block in shared memory (up to 32

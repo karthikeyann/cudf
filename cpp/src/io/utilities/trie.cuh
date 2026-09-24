@@ -33,9 +33,8 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
 {
   if (trie.empty()) { return false; }
   if (key.empty()) { return trie.front().is_leaf; }
-  // The root holds the length of the longest key, if it fits
-  auto const max_key_length = trie.front().children_offset;
-  if (max_key_length >= 0 and key.size() > static_cast<size_t>(max_key_length)) { return false; }
+  // The root holds the length of the longest key
+  if (key.size() > static_cast<size_t>(trie.front().children_offset)) { return false; }
   auto curr_node = trie.begin() + 1;
   for (auto curr_key = key.begin(); curr_key < key.end(); ++curr_key) {
     // Don't jump away from root node
