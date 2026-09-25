@@ -205,6 +205,73 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
 __device__ constexpr bool is_digit(char c) { return c >= '0' and c <= '9'; }
 
 /**
+ * @brief Checks whether a timestamp string has the fixed ISO 8601 layout `YYYY-MM-DDTHH:MM:SS`,
+ * with 'T' or ' ' between date and time, followed by nothing, by 'Z', or by '.' and a fraction
+ * that does not end with 'M' or 'm' (which `to_timestamp` would take for an AM/PM suffix).
+ *
+ * The characters after the '.' are not checked: they are parsed as the milliseconds, as
+ * `to_timestamp` parses them.
+ *
+ * @param begin Pointer to the first element of the string
+ * @param end Pointer to the first element after the string
+ * @return Whether the string has the layout
+ */
+__inline__ __device__ bool has_fixed_iso_8601_layout(char const* begin, char const* end)
+{
+  auto const digit_at = [begin](int i) { return is_digit(begin[i]); };
+  return end - begin >= 19 and digit_at(0) and digit_at(1) and digit_at(2) and digit_at(3) and
+         begin[4] == '-' and digit_at(5) and digit_at(6) and begin[7] == '-' and digit_at(8) and
+         digit_at(9) and (begin[10] == 'T' or begin[10] == ' ') and digit_at(11) and
+         digit_at(12) and begin[13] == ':' and digit_at(14) and digit_at(15) and
+         begin[16] == ':' and digit_at(17) and digit_at(18) and
+         (end - begin == 19 or (end - begin == 20 and begin[19] == 'Z') or
+          (begin[19] == '.' and end[-1] != 'M' and end[-1] != 'm'));
+}
+
+/**
+ * @brief Parses a timestamp string of the layout accepted by `has_fixed_iso_8601_layout`.
+ *
+ * Gives the same result as the general parsing of `to_timestamp`, whose separator searches find
+ * the separators of such strings at their fixed positions:
+ * - The date ends at position 10: the search for its end sees no 'T' before it, and counts the
+ *   two '-' and the digit after the second one, so that a ' ' at position 10 also ends it.
+ * - `extract_date` finds no '/', so it splits the date at the first '-' (position 4, so the year
+ *   comes first whatever `dayfirst` is) and at the next one (position 7).
+ * - `extract_time_of_day` sees no AM/PM suffix. It finds the first ':' at position 13, the next
+ *   one at position 16, and the first '.' after it at position 19, if the string has one.
+ *   Otherwise it parses the seconds from position 17 to the end, where the only characters after
+ *   the two digits are an ignored 'Z', if any.
+ *
+ * The components are then parsed from the same digits, into the same types, and combined the same
+ * way.
+ *
+ * @tparam timestamp_type Type of output timestamp
+ * @param begin Pointer to the first element of the string
+ * @param end Pointer to the first element after the string
+ * @return Timestamp converted to `timestamp_type`
+ */
+template <typename timestamp_type>
+__inline__ __device__ timestamp_type parse_fixed_iso_8601_timestamp(char const* begin,
+                                                                    char const* end)
+{
+  using namespace cuda::std::chrono;
+  auto const ymd  = year_month_day{year{to_non_negative_integer<int32_t>(begin, begin + 4)},
+                                  month{to_non_negative_integer<uint32_t>(begin + 5, begin + 7)},
+                                  day{to_non_negative_integer<uint32_t>(begin + 8, begin + 10)}};
+  auto const d_h  = duration_h{to_non_negative_integer<int>(begin + 11, begin + 13)};
+  auto const d_m  = duration_m{to_non_negative_integer<int32_t>(begin + 14, begin + 16)};
+  auto const d_s  = duration_s{to_non_negative_integer<int64_t>(begin + 17, begin + 19)};
+  auto const d_ms = (end - begin > 19 and begin[19] == '.')
+                      ? duration_ms{to_non_negative_integer<int64_t>(begin + 20, end)}
+                      : duration_ms{0};
+
+  timestamp_type answer{sys_days{ymd}};
+  auto const t = hh_mm_ss<duration_ms>{d_h + d_m + d_s + d_ms};
+  answer += duration_cast<typename timestamp_type::duration>(t.to_duration());
+  return answer;
+}
+
+/**
  * @brief Parses a datetime string and computes the corresponding timestamp.
  *
  * Acceptable date formats are a combination of `YYYY`, `M`, `MM`, `D` and `DD` with `/` or `-` as
@@ -224,6 +291,12 @@ template <typename timestamp_type>
 __inline__ __device__ timestamp_type to_timestamp(char const* begin, char const* end, bool dayfirst)
 {
   using duration_type = typename timestamp_type::duration;
+
+  // The general parsing below searches for the separators, which strings of the fixed ISO 8601
+  // layout have at fixed positions
+  if (has_fixed_iso_8601_layout(begin, end)) {
+    return parse_fixed_iso_8601_timestamp<timestamp_type>(begin, end);
+  }
 
   auto sep_pos = end;
 

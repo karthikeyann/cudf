@@ -3,6 +3,8 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "io_test_utils.hpp"
+
 #include <cudf_test/base_fixture.hpp>
 #include <cudf_test/column_utilities.hpp>
 #include <cudf_test/column_wrapper.hpp>
@@ -37,6 +39,7 @@
 #include <thrust/execution_policy.h>
 
 #include <algorithm>
+#include <bit>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
@@ -5235,6 +5238,197 @@ TEST_F(CsvReaderTest, UnescapeMemoryOfDeviceBuffers)
       EXPECT_LT(peak, text.size());
     }
   }
+}
+
+namespace {
+
+/**
+ * @brief Reads `fields`, which hold no '|', as the rows of a single column of type `type`.
+ */
+cudf::io::table_with_metadata read_fields(std::vector<std::string> const& fields,
+                                          data_type type,
+                                          char thousands = '\0')
+{
+  std::string buffer;
+  for (auto const& field : fields) {
+    buffer += field + '\n';
+  }
+  auto const source = cudf::io::source_info{cudf::host_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}};
+  return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                              .compression(cudf::io::compression_type::NONE)
+                              .dtypes({type})
+                              .delimiter('|')
+                              .thousands(thousands)
+                              .header(-1)
+                              .build());
+}
+
+/**
+ * @brief Checks that the floating-point column `column` holds exactly the bits of `expected`,
+ * where empty elements are nulls.
+ */
+template <typename T>
+void expect_bitwise_equal(std::vector<std::optional<T>> const& expected,
+                          cudf::column_view const& column)
+{
+  using bits_type = std::conditional_t<sizeof(T) == 8, int64_t, int32_t>;
+  std::vector<bits_type> bits;
+  std::vector<bool> validity;
+  for (auto const& value : expected) {
+    bits.push_back(std::bit_cast<bits_type>(value.value_or(T{0})));
+    validity.push_back(value.has_value());
+  }
+  auto const expected_bits = column_wrapper<bits_type>(bits.begin(), bits.end(), validity.begin());
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bits, cudf::bit_cast(column, dtype<bits_type>()));
+}
+
+}  // namespace
+
+TEST_F(CsvReaderTest, FractionDigitPlaceValues)
+{
+  // A fraction digit's place value is 1 divided by 10 once per preceding digit and once more, each
+  // division rounded; it underflows to zero after the 323rd digit. Field `k` has its only nonzero
+  // digit at position `k`, so it parses to that digit times the place value.
+  std::vector<std::string> fields;
+  std::vector<std::optional<double>> expected_doubles;
+  std::vector<std::optional<float>> expected_floats;
+  double place_value = 1;
+  for (int k = 1; k <= 330; ++k) {
+    place_value /= 10;
+    for (int digit : {1, 7}) {
+      fields.push_back("0." + std::string(k - 1, '0') + std::to_string(digit));
+      expected_doubles.push_back(digit * place_value);
+      expected_floats.push_back(static_cast<float>(digit * place_value));
+    }
+  }
+  EXPECT_EQ(place_value, 0.0);
+  expect_bitwise_equal(expected_doubles, read_fields(fields, dtype<double>()).tbl->get_column(0));
+  expect_bitwise_equal(expected_floats, read_fields(fields, dtype<float>()).tbl->get_column(0));
+
+  // Thousands separators and '+' characters in a fraction are skipped, and have no place value
+  auto const thousandth = 1.0 / 10 / 10 / 10;
+  auto const expected   = std::vector<std::optional<double>>{thousandth, thousandth, thousandth};
+  expect_bitwise_equal(
+    expected,
+    read_fields({"0.0,01", "0.0+0+1", "0.,0,0,1"}, dtype<double>(), ',').tbl->get_column(0));
+}
+
+TEST_F(CsvReaderTest, WholeDigitsOfDoubles)
+{
+  // The whole part is accumulated as `value * 10 + digit`, rounded at each digit. Up to 15 digits
+  // every step is exact; from the 16th digit on, each step can round.
+  auto const fields   = std::vector<std::string>{"123456789012345",
+                                                 "1234567890123456",
+                                                 "9007199254740993",
+                                                 "90071992547409930",
+                                                 "-123456789012345.25",
+                                                 "000000000000000000000000001",
+                                                 "-0",
+                                                 "1+2",
+                                                 "12a4"};
+  auto const expected = std::vector<std::optional<double>>{
+    123456789012345.0,
+    1234567890123456.0,
+    9007199254740992.0,   // 2^53 + 1 rounds to even
+    90071992547409920.0,  // 10 * (2^53 + 1) rounds to 10 * 2^53 (the nearest double is ...936)
+    -123456789012345.25,
+    1.0,
+    -0.0,
+    12.0,  // '+' characters are skipped
+    std::nullopt};
+  expect_bitwise_equal(expected, read_fields(fields, dtype<double>()).tbl->get_column(0));
+
+  // Thousands separators are skipped
+  expect_bitwise_equal(
+    std::vector<std::optional<double>>{1234567890123456.0, 9007199254740992.0},
+    read_fields({"1,234,567,890,123,456", "9,007,199,254,740,993"}, dtype<double>(), ',')
+      .tbl->get_column(0));
+
+  // Floats are accumulated as floats: 2^24 + 1 rounds to even
+  expect_bitwise_equal(std::vector<std::optional<float>>{16777216.0f},
+                       read_fields({"16777217"}, dtype<float>()).tbl->get_column(0));
+
+  // The whole digits also end at an upper-case exponent, within and after the first 15 digits:
+  // each field parses as with a lower-case exponent
+  std::vector<std::string> const upper_case = {
+    "1E5", "-2.5E2", "-2.5E-3", "123456789012345678E-3", "1234567890123456789E2", "9.999E307"};
+  auto lower_case = upper_case;
+  for (auto& field : lower_case) {
+    std::replace(field.begin(), field.end(), 'E', 'e');
+  }
+  auto const upper_case_result = read_fields(upper_case, dtype<double>());
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+    cudf::bit_cast(read_fields(lower_case, dtype<double>()).tbl->get_column(0).view(),
+                   dtype<int64_t>()),
+    cudf::bit_cast(upper_case_result.tbl->get_column(0).view(), dtype<int64_t>()));
+  expect_bitwise_equal(std::vector<std::optional<double>>{100000.0, -250.0},
+                       cudf::slice(upper_case_result.tbl->get_column(0).view(), {0, 2}).front());
+}
+
+TEST_F(CsvReaderTest, FloatingPointSyntaxEdgeCases)
+{
+  // The whole digits end at a decimal point or an exponent, which may have no digits; exponents
+  // beyond the range of doubles give zero or infinity (0 * infinity is NaN, which is null)
+  auto const fields   = std::vector<std::string>{"1.",
+                                                 "-1.",
+                                                 ".5",
+                                                 "1e",
+                                                 "1e+",
+                                                 "1e-",
+                                                 "7e0",
+                                                 "-0",
+                                                 "-0e5",
+                                                 "1e-400",
+                                                 "1e0400",
+                                                 "1e309",
+                                                 "0e400"};
+  auto const infinity = std::numeric_limits<double>::infinity();
+  auto const expected = std::vector<std::optional<double>>{
+    1.0, -1.0, 0.5, 1.0, 1.0, 1.0, 7.0, -0.0, -0.0, 0.0, infinity, infinity, std::nullopt};
+  expect_bitwise_equal(expected, read_fields(fields, dtype<double>()).tbl->get_column(0));
+}
+
+TEST_F(CsvReaderTest, FixedLayoutIsoTimestamps)
+{
+  // Timestamps with the layout `YYYY-MM-DD[T ]HH:MM:SS[Z|.fraction]` are parsed without searching
+  // for their separators. Each must parse as the same string with '/' as date separator, which
+  // takes the general parsing. So must near misses of the layout, which take it too.
+  std::string buffer;
+  for (auto const& field : cudf::test::iso_8601_timestamp_test_strings()) {
+    buffer += field + '|' + cudf::test::with_slash_date_separators(field) + '\n';
+  }
+  auto const source = cudf::io::source_info{cudf::host_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}};
+
+  for (auto const type : {type_id::TIMESTAMP_DAYS,
+                          type_id::TIMESTAMP_SECONDS,
+                          type_id::TIMESTAMP_MILLISECONDS,
+                          type_id::TIMESTAMP_MICROSECONDS,
+                          type_id::TIMESTAMP_NANOSECONDS}) {
+    for (bool const dayfirst : {false, true}) {
+      auto const result =
+        cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                             .compression(cudf::io::compression_type::NONE)
+                             .dtypes(std::vector<data_type>{data_type{type}, data_type{type}})
+                             .delimiter('|')
+                             .dayfirst(dayfirst)
+                             .header(-1)
+                             .build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), result.tbl->get_column(0));
+    }
+  }
+
+  // Pins the current behavior, which the fast path keeps: the digits of the fraction are parsed as
+  // a number of milliseconds whatever their count, so ".5" is 5 ms and not 500 ms
+  auto const result = read_fields({"2024-02-29T13:45:59.123", "2024-02-29 13:45:59.5"},
+                                  data_type{type_id::TIMESTAMP_MILLISECONDS});
+  using namespace cuda::std::chrono_literals;
+  auto constexpr leap_day = 1709164800000ms;  // 2024-02-29T00:00:00
+  expect_column_data_equal(
+    std::vector<cudf::timestamp_ms>{cudf::timestamp_ms{leap_day + 13h + 45min + 59s + 123ms},
+                                    cudf::timestamp_ms{leap_day + 13h + 45min + 59s + 5ms}},
+    result.tbl->get_column(0));
 }
 
 namespace {
