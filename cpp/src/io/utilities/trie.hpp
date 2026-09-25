@@ -33,6 +33,9 @@ static constexpr char trie_terminating_character = '\n';
  * node has no children. Matching is successful if all characters are matched and the final node is
  * the last character of a word (i.e. `is_leaf` is true).
  *
+ * The first node is the root, whose children are the nodes that follow it. Its `children_offset`
+ * is instead the length of the longest key, or negative if that does not fit in an `int16_t`.
+ *
  * Node indexes and offsets are stored as `int16_t`, so `children_offset` is only meaningful for
  * tries of at most `std::numeric_limits<int16_t>::max()` nodes.
  */

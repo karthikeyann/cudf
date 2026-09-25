@@ -197,14 +197,17 @@ class device_buffer_source final : public datasource {
   {
   }
 
+  // Host reads copy with a plain cudaMemcpyAsync rather than cudf::detail::cuda_memcpy, which uses
+  // cudaMemcpyBatchAsync on non-default streams: with it, synchronizing the stream after a copy of
+  // a few bytes (e.g. a reader checking the leading bytes of the data) was measured to take ~200us
+  // longer, leaving the GPU idle for a large share of a fast device read.
   size_t host_read(size_t offset, size_t size, uint8_t* dst) override
   {
     auto const count  = std::min(size, this->size() - offset);
     auto const stream = cudf::detail::current_cuda_stream_pool().get_stream();
-    cudf::detail::cuda_memcpy(host_span<uint8_t>{dst, count},
-                              device_span<uint8_t const>{
-                                reinterpret_cast<uint8_t const*>(_d_buffer.data() + offset), count},
-                              stream);
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(dst, _d_buffer.data() + offset, count, cudaMemcpyDefault, stream.get()));
+    stream.sync();
     return count;
   }
 
@@ -212,8 +215,9 @@ class device_buffer_source final : public datasource {
   {
     auto const count  = std::min(size, this->size() - offset);
     auto const stream = cudf::detail::current_cuda_stream_pool().get_stream();
-    auto h_data       = cudf::detail::make_host_vector_async(
-      cudf::device_span<std::byte const>{_d_buffer.data() + offset, count}, stream);
+    auto h_data       = cudf::detail::make_host_vector<std::byte>(count, stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      h_data.data(), _d_buffer.data() + offset, count, cudaMemcpyDefault, stream.get()));
     stream.sync();
     return std::make_unique<owning_buffer<cudf::detail::host_vector<std::byte>>>(std::move(h_data));
   }

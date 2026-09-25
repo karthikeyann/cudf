@@ -200,27 +200,35 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
 /**
  * @brief Launches kernel for decoding row-column data
  *
+ * String columns are output as (pointer, length) pairs that point into `data`. When
+ * `options.doublequote` is set, the quoted string fields that hold escaped quote pairs are written
+ * with the pairs collapsed to `unescaped`, at their offsets in `data`, and their string pairs point
+ * there. `unescaped` has the size of `data`; it may be `data` itself when the reader owns it (the
+ * unescaping is then in place), in which case decoding must be its last use other than building
+ * the string columns from the pairs.
+ *
  * @param[in] options Options that control individual field data conversion
  * @param[in] data The row-column data
+ * @param[out] unescaped Destination of the unescaped quoted string fields
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] dtypes List of dtype corresponding to each column
- * @param[out] columns Device memory output of column data
- * @param[out] valids Device memory output of column valids bitmap data
+ * @param[out] columns Device memory output of column data. Fixed-width data is only written where
+ * the field is valid and needs no initialization; string pairs must be zero-initialized, since
+ * fields missing from short rows are not written
+ * @param[out] valids Device memory output of column valids bitmap data; must be zero-initialized
  * @param[out] valid_counts Device memory output of the number of valid fields in each column
- * @param[out] is_quoted Per-column boolean arrays indicating which rows were quoted fields
- *                          (nullptr entries mean the column doesn't need quote tracking)
  * @param[in] stream CUDA stream to use
  */
 void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<char const> data,
+                            device_span<char> unescaped,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
-                            device_span<bool* const> is_quoted,
                             cuda::stream_ref stream);
 
 }  // namespace gpu
