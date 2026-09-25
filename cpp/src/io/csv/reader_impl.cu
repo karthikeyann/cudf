@@ -372,6 +372,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // need not support), or such host input copied on another stream, is read in chunks, and the row
   // offsets of each chunk are gathered once it has been read, while the next ones are read.
   // Pageable host input is staged through two alternating pinned chunks (see copy_host_to_device).
+  // Host reads of other sources (e.g. user datasources, which may copy) read a chunk at a time.
   // Other whole inputs are parsed as one chunk.
   auto const input_size            = max_input_size - input_pos;
   bool const whole_source          = load_whole_file && !data.has_value() && !read_whole_input;
@@ -379,13 +380,15 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   bool const read_in_chunks        = device_read_preferred && input_size > max_chunk_bytes &&
                               reader_opts.get_source().type() == io_type::FILEPATH;
   std::unique_ptr<datasource::buffer> host_input;
-  if (whole_source && !device_read_preferred) {
+  if (whole_source && !device_read_preferred &&
+      reader_opts.get_source().type() == io_type::HOST_BUFFER) {
     host_input = source->host_read(input_pos, input_size);
   }
   bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes;
   bool const is_pinned      = copy_in_chunks && is_device_accessible(host_input->data());
-  auto const chunk_bytes =
-    load_whole_file && !read_in_chunks && !copy_in_chunks ? data_size : max_chunk_bytes;
+  bool const single_chunk   = load_whole_file && !read_in_chunks && !copy_in_chunks &&
+                            (host_input != nullptr || !whole_source || device_read_preferred);
+  auto const chunk_bytes = single_chunk ? data_size : max_chunk_bytes;
   auto const buffer_size = std::min(chunk_bytes, data_size);
 
   device_input input{rmm::device_uvector<char>{0, stream}, nullptr};
@@ -464,18 +467,19 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         }
         stream.wait(chunks.copies[chunk]);
       } else if (read_in_chunks) {
-        // All chunks are requested at the first one, into the capacity of `d_data` (as above);
-        // the source completes them in order (kvikio's thread pool runs its tasks first come,
-        // first served) and synchronizes `stream` before reading into device memory.
-        for (size_t offset = chunks.reads.empty() ? 0 : input_size; offset < input_size;
-             offset += chunk_bytes) {
+        // Reads run one chunk ahead, into the capacity of `d_data` (as above); the source
+        // completes them in order (kvikio's thread pool runs its tasks first come, first served)
+        // and synchronizes `stream` before reading into device memory.
+        auto const chunk = previous_data_size / chunk_bytes;
+        while (chunks.reads.size() < chunk + 2 && chunks.reads.size() * chunk_bytes < input_size) {
+          auto const offset = chunks.reads.size() * chunk_bytes;
           chunks.reads.push_back(
             source->device_read_async(input_pos + offset,
                                       std::min(chunk_bytes, input_size - offset),
                                       reinterpret_cast<uint8_t*>(d_data.data() + offset),
                                       stream));
         }
-        chunks.reads[previous_data_size / chunk_bytes].get();
+        chunks.reads[chunk].get();
       } else if (source->is_device_read_preferred(read_size)) {
         source->device_read(read_offset,
                             read_size,

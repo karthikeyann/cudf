@@ -6793,4 +6793,32 @@ TEST_F(CsvReaderTest, RowOffsetsOfMidRowCommentAndNonAsciiQuoteChars)
   CUDF_TEST_EXPECT_TABLES_EQUAL(aligned.tbl->view(), unaligned.tbl->view());
 }
 
+TEST_F(CsvReaderTest, UserSourceWholeFileHostReadsInChunks)
+{
+  // A user datasource that does not prefer device reads may copy on each host read, so a whole-file
+  // read of it reads a 64MB chunk at a time rather than the whole input at once
+  struct max_read_source : public copying_host_source {
+    using copying_host_source::copying_host_source;
+    std::unique_ptr<buffer> host_read(size_t offset, size_t size) override
+    {
+      max_read_size = std::max(max_read_size, size);
+      return copying_host_source::host_read(offset, size);
+    }
+    size_t max_read_size = 0;
+  };
+  std::string text;
+  for (int i = 0; text.size() < 64u * 1024 * 1024 + 4096; ++i) {
+    text += std::to_string(i) + ",\"" + std::string(100 + i % 13, 'a' + i % 26) + "\n\"\n";
+  }
+  max_read_source source{text};
+  auto const read = [](cudf::io::source_info const& info) {
+    return cudf::io::read_csv(cudf::io::csv_reader_options::builder(info).header(-1).build());
+  };
+  auto const result = read(cudf::io::source_info{&source});
+  EXPECT_LE(source.max_read_size, 64u * 1024 * 1024);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(
+    result.tbl->view(),
+    read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}}).tbl->view());
+}
+
 CUDF_TEST_PROGRAM_MAIN()
