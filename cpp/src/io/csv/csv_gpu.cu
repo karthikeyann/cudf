@@ -799,8 +799,8 @@ __device__ __forceinline__ size_t unescape_doublequotes(
  *
  * Data is processed one record at a time. A fixed-width output is written wherever its field is
  * valid, which is where the (zero-initialized) validity bit is set, so fixed-width outputs do not
- * need to be initialized. String outputs do: a (pointer, length) pair is written for valid and NA
- * fields, while fields missing from the end of a short row rely on the zeroed pair reading as null.
+ * need to be initialized. Neither do string outputs (`decoded_strings`): the string of every row is
+ * written, and set to null for NA fields and for the fields missing from the end of a short row.
  *
  * With `stage_rows`, each block first copies its rows into dynamic shared memory, which must be
  * large enough for the rows of every block, and its threads parse the copy (see
@@ -808,9 +808,9 @@ __device__ __forceinline__ size_t unescape_doublequotes(
  * staged rows can use all of the default limit; the `RowsAroundStagingLimit` test relies on this,
  * and must be updated if static shared memory is added.
  *
- * String pairs point into `data`, never into a staged copy. When `options.doublequote` is set, the
+ * Strings point into `data`, never into a staged copy. When `options.doublequote` is set, the
  * escaped quote pairs of each quoted string field that has any are collapsed into
- * `unescape_buffer`, at the offset of the field in `data`, and the field's string pair points there
+ * `unescape_buffer`, at the offset of the field in `data`, and the field's string points there
  * instead. Other fields are not written, so data without two consecutive quote characters needs no
  * `unescape_buffer`. Each field is written by the thread of its row only, so this is race-free when
  * `unescape_buffer` is scratch memory. When the reader owns `data`, `unescape_buffer` is `data`
@@ -836,6 +836,7 @@ __device__ __forceinline__ size_t unescape_doublequotes(
  * column is a string column, or if `data` does not have two consecutive quote characters
  * @param[in] column_flags Per-column parsing behavior flags
  * @param[in] row_offsets The start the CSV data of interest
+ * @param[in] num_rows Number of rows, `row_offsets.size() - 1`, and of the decoded strings
  * @param[in] dtypes The data type of the column
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether the fields of non-string columns are valid
@@ -848,6 +849,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<char> unescape_buffer,
                       device_span<column_parse::flags const> column_flags,
                       device_span<uint64_t const> row_offsets,
+                      size_type num_rows,
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
                       device_span<cudf::bitmask_type* const> valids,
@@ -869,7 +871,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   auto const rec_id_next = rec_id + 1;
 
   // we can have more threads than data, make sure we are not past the end of the data
-  if (rec_id_next >= row_offsets.size()) return;
+  if (rec_id >= num_rows) return;
 
   auto field_start   = chars.at(row_offsets[rec_id]);
   auto const row_end = chars.at(row_offsets[rec_id_next]);
@@ -886,14 +888,18 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     next_field          = field_start;
     auto next_delimiter = seek_field_end_by_words(field_start, row_end, chars.begin, options);
 
-    if (column_flags[col] & column_parse::enabled) {
+    // The column's flags and type are loaded once per field: the column stores below go through
+    // untyped pointers, which could alias them, so they would otherwise be reloaded after each one
+    auto const flags = column_flags[col];
+    if (flags & column_parse::enabled) {
+      auto const dtype = dtypes[actual_col];
       // check if the entire field is a NaN string - consistent with pandas
       auto const is_valid = !serialized_trie_contains(
         options.trie_na, {field_start, static_cast<size_t>(next_delimiter - field_start)});
 
       // Modify field_start & end to ignore whitespace and quotechars
       auto field_end = next_delimiter;
-      if (is_valid && dtypes[actual_col].id() != cudf::type_id::STRING) {
+      if (is_valid && dtype.id() != cudf::type_id::STRING) {
         auto const trimmed_field =
           trim_whitespaces_quotes(field_start, field_end, options.quotechar);
         field_start = trimmed_field.first;
@@ -901,7 +907,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
       }
       if (is_valid) {
         // Type dispatcher does not handle STRING
-        if (dtypes[actual_col].id() == cudf::type_id::STRING) {
+        if (dtype.id() == cudf::type_id::STRING) {
           auto end        = next_delimiter;
           bool was_quoted = false;
           if (not options.keepquotes) {
@@ -946,33 +952,40 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
               length = unescaped_length;
             }
           }
-          auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-          str_list[rec_id].first  = str;
-          str_list[rec_id].second = length;
+          decoded_strings{columns[actual_col], num_rows}.set(rec_id, str, length);
         } else {
-          if (cudf::type_dispatcher(dtypes[actual_col],
+          if (cudf::type_dispatcher(dtype,
                                     ConvertFunctor{},
                                     field_start,
                                     field_end,
                                     columns[actual_col],
                                     rec_id,
-                                    dtypes[actual_col],
+                                    dtype,
                                     options,
-                                    column_flags[col] & column_parse::as_hexadecimal)) {
+                                    flags & column_parse::as_hexadecimal)) {
             // set the valid bitmap - all bits were set to 0 to start
             set_valid_warp_aggregated(valids[actual_col], actual_col, rec_id);
           }
         }
-      } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
-        auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-        str_list[rec_id].first  = nullptr;
-        str_list[rec_id].second = 0;
+      } else if (dtype.id() == cudf::type_id::STRING) {
+        decoded_strings{columns[actual_col], num_rows}.set_null(rec_id);
       }
       ++actual_col;
     }
     next_field  = next_delimiter + 1;
     field_start = next_field;
     ++col;
+  }
+
+  // The fields missing from the end of a short row are null: their validity bits stay unset, and
+  // their strings are set to null
+  for (; col < column_flags.size(); ++col) {
+    if (column_flags[col] & column_parse::enabled) {
+      if (dtypes[actual_col].id() == cudf::type_id::STRING) {
+        decoded_strings{columns[actual_col], num_rows}.set_null(rec_id);
+      }
+      ++actual_col;
+    }
   }
 }
 
@@ -1860,23 +1873,33 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<char> unescape_buffer,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
+                            size_type num_rows,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             size_t staging_size,
                             cuda::stream_ref stream)
 {
+  CUDF_EXPECTS(row_offsets.size() == static_cast<size_t>(num_rows) + 1,
+               "The number of rows must be that of the row offsets");
   // Calculate actual block count to use based on records count
   auto const block_size = csvparse_block_dim;
-  auto const num_rows   = row_offsets.size() - 1;
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
 
   auto const stage_rows =
     is_row_staging_used(convert_csv_to_cudf<true>, convert_csv_to_cudf<false>, staging_size, 0);
   auto const kernel    = stage_rows ? convert_csv_to_cudf<true> : convert_csv_to_cudf<false>;
   auto const smem_size = stage_rows ? staging_size : 0;
-  kernel<<<grid_size, block_size, smem_size, stream.get()>>>(
-    options, data, unescape_buffer, column_flags, row_offsets, dtypes, columns, valids, smem_size);
+  kernel<<<grid_size, block_size, smem_size, stream.get()>>>(options,
+                                                             data,
+                                                             unescape_buffer,
+                                                             column_flags,
+                                                             row_offsets,
+                                                             num_rows,
+                                                             dtypes,
+                                                             columns,
+                                                             valids,
+                                                             smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 

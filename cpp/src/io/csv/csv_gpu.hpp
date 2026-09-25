@@ -5,12 +5,15 @@
 
 #pragma once
 
+#include "csv_common.hpp"
 #include "io/utilities/parsing_utils.cuh"
 
 #include <cudf/types.hpp>
 
+#include <rmm/aligned.hpp>
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/std/limits>
 #include <cuda/stream>
 
 #include <vector>
@@ -30,6 +33,68 @@ namespace gpu {
  * EOF: End state (EOF reached)
  */
 enum { ROW_CTX_NONE = 0, ROW_CTX_QUOTE = 1, ROW_CTX_COMMENT = 2, ROW_CTX_EOF = 3 };
+
+/**
+ * @brief The strings of a string column, as decoded by `decode_row_column_data`.
+ *
+ * The memory of a column of `num_rows` rows holds a pointer to the characters of each row's string,
+ * followed by the size of each row's string, or `null_size` for a null row (whose pointer is not
+ * written). The sizes are apart from the pointers so that the validity and the sizes of the rows
+ * are read with 4 bytes per row, and the pointers only for non-empty strings. Where the sizes start
+ * depends on `num_rows`, so every view of the memory must be created with the number of rows that
+ * the memory was sized for.
+ */
+class decoded_strings {
+ public:
+  static constexpr size_type null_size = -1;  ///< Size of the string of a null row
+  /// Size of a string field longer than a string can be, which the reader rejects
+  static constexpr size_type oversized_size = -2;
+
+  /**
+   * @brief Size of the memory of a column of `num_rows` rows, a multiple of the alignment of
+   * device allocations, so that the columns can share an allocation
+   */
+  static size_t size_bytes(size_type num_rows)
+  {
+    return rmm::align_up(static_cast<size_t>(num_rows) * (sizeof(char const*) + sizeof(size_type)),
+                         rmm::CUDA_ALLOCATION_ALIGNMENT);
+  }
+
+  /**
+   * @brief Creates a view of the strings of a column in memory of `size_bytes(num_rows)` bytes,
+   * aligned like device allocations.
+   */
+  __host__ __device__ decoded_strings(void* data, size_type num_rows)
+    : _chars{static_cast<char const**>(data)},
+      _sizes{reinterpret_cast<size_type*>(static_cast<char const**>(data) + num_rows)}
+  {
+  }
+
+  /**
+   * @brief Sets the string of row `row` to the `length` characters at `chars`, or marks it as
+   * oversized if `length` exceeds the size limit of a string.
+   */
+  __device__ void set(size_type row, char const* chars, size_t length) const
+  {
+    _chars[row] = chars;
+    _sizes[row] = length <= static_cast<size_t>(cuda::std::numeric_limits<size_type>::max())
+                    ? static_cast<size_type>(length)
+                    : oversized_size;
+  }
+
+  /// Sets row `row` to null
+  __device__ void set_null(size_type row) const { _sizes[row] = null_size; }
+
+  /// Size of the string of row `row`, `null_size` if the row is null, or `oversized_size`
+  [[nodiscard]] __device__ size_type size(size_type row) const { return _sizes[row]; }
+
+  /// Characters of the string of row `row`, which must not be null
+  [[nodiscard]] __device__ char const* chars(size_type row) const { return _chars[row]; }
+
+ private:
+  char const** _chars;
+  size_type* _sizes;
+};
 
 constexpr uint32_t rowofs_block_dim = 512;
 /// Character block size for gather_row_offsets
@@ -258,13 +323,13 @@ std::vector<column_type_histogram> detect_column_types(
 /**
  * @brief Launches kernel for decoding row-column data
  *
- * String columns are output as (pointer, length) pairs that point into `data`, except for the
- * quoted fields with escaped quote pairs when `options.doublequote` is set: the pairs are
- * collapsed into `unescape_buffer`, at the offsets of the fields in `data`, and the (pointer,
- * length) pairs describe the unescaped strings there. `unescape_buffer` is either scratch memory or
- * `data` itself, in which case the fields are unescaped in place. It must be owned by the reader
- * (never a caller's buffer), and when it is `data`, decoding must be the last use of `data` other
- * than building the string columns from the pairs.
+ * String columns are output as `decoded_strings` that point into `data`, except for the quoted
+ * fields with escaped quote pairs when `options.doublequote` is set: the pairs are collapsed into
+ * `unescape_buffer`, at the offsets of the fields in `data`, and the strings point there.
+ * `unescape_buffer` is either scratch memory or `data` itself, in which case the fields are
+ * unescaped in place. It must be owned by the reader (never a caller's buffer), and when it is
+ * `data`, decoding must be the last use of `data` other than building the string columns from the
+ * decoded strings.
  *
  * @param[in] options Options that control individual field data conversion
  * @param[in] data The row-column data
@@ -274,10 +339,11 @@ std::vector<column_type_histogram> detect_column_types(
  * consecutive quote characters
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
+ * @param[in] num_rows Number of rows, which must be `row_offsets.size() - 1`
  * @param[in] dtypes List of dtype corresponding to each column
- * @param[out] columns Device memory output of column data. Fixed-width data is only written where
- * the field is valid and needs no initialization; string pairs must be zero-initialized, since
- * fields missing from short rows are not written
+ * @param[out] columns Device memory output of column data: the memory of `decoded_strings` of
+ * `num_rows` rows for string columns. Fixed-width data is only written where the field is valid,
+ * and every row of the decoded strings is written, so neither needs initialization
  * @param[in,out] valids Validity bitmaps of the columns; must be zero-initialized. The bits of the
  * valid fields of non-string columns are set
  * @param[in] staging_size Shared memory size needed to stage the rows of every thread block, as
@@ -289,6 +355,7 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<char> unescape_buffer,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
+                            size_type num_rows,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
