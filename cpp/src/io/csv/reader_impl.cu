@@ -239,6 +239,9 @@ void copy_to_pinned(char* dst, host_span<char const> src)
 /**
  * @brief Copies host data to the device, returning once the copy has completed.
  *
+ * It copies at most one chunk of the reader (64MB) at a time: whole host inputs of more than one
+ * chunk are copied in chunks by load_data_and_gather_row_offsets instead, staged the same way.
+ *
  * The driver copies pageable memory through its own pinned buffers with one thread, which is only
  * slightly faster than a single-threaded memcpy into pinned memory (measured on an x86 host with a
  * PCIe GPU; platforms where the GPU accesses pageable memory directly may not benefit). Pageable
@@ -338,9 +341,10 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   cuda::stream_ref stream)
 {
   // Reads with row selection parse chunks of at most this size, so that they can stop early. Whole
-  // files and pinned host inputs larger than this are parsed in chunks too, overlapping reading
-  // with parsing (see below). Other reads parse the whole input as one chunk: every chunk
-  // synchronizes the stream to gather its row offsets and regrows the offsets.
+  // files and host inputs larger than this are parsed in chunks too, overlapping reading with
+  // parsing, as are whole inputs host read from other sources (see below). Other reads parse the
+  // whole input as one chunk: every chunk synchronizes the stream to gather its row offsets and
+  // regrows the offsets.
   constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
 
   auto const data_size      = data.has_value() ? data->size() : source->size();
@@ -384,10 +388,11 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
       reader_opts.get_source().type() == io_type::HOST_BUFFER) {
     host_input = source->host_read(input_pos, input_size);
   }
-  bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes;
-  bool const is_pinned      = copy_in_chunks && is_device_accessible(host_input->data());
-  bool const single_chunk   = load_whole_file && !read_in_chunks && !copy_in_chunks &&
-                            (host_input != nullptr || !whole_source || device_read_preferred);
+  bool const copy_in_chunks       = host_input != nullptr && input_size > max_chunk_bytes;
+  bool const is_pinned            = copy_in_chunks && is_device_accessible(host_input->data());
+  bool const host_reads_in_chunks = whole_source && !device_read_preferred && host_input == nullptr;
+  bool const single_chunk =
+    load_whole_file && !read_in_chunks && !copy_in_chunks && !host_reads_in_chunks;
   auto const chunk_bytes = single_chunk ? data_size : max_chunk_bytes;
   auto const buffer_size = std::min(chunk_bytes, data_size);
 
@@ -397,13 +402,18 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                  : load_whole_file ? data_size
                                    : std::min(buffer_size * 2, max_input_size),
                  stream);
+  // Pageable chunks are staged in two alternating pinned chunks, which take up to 128MB of the
+  // pinned memory resource (see copy_host_to_device for the trade-offs)
+  auto staging = rmm::device_uvector<char>(
+    copy_in_chunks && !is_pinned ? std::min(2 * chunk_bytes, input_size) : 0,
+    stream,
+    cudf::get_pinned_memory_resource());
   // The copy stream is joined as `stream` waits for the copy of every chunk
   auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
-  auto staging           = rmm::device_uvector<char>(
-    copy_in_chunks && !is_pinned ? 2 * chunk_bytes : 0, stream, cudf::get_pinned_memory_resource());
   // Chunk copies and reads in flight when the loop exits with an exception still write into
-  // `d_data`, and copy from `host_input`, so they are waited for before those are freed; the
-  // destructor does not throw by design. The copies complete in order, on one stream.
+  // `d_data`, and copy from `host_input` or `staging`, so they are waited for before those are
+  // freed (they are declared first); the destructor does not throw by design. The copies complete
+  // in order, on one stream.
   struct in_flight_chunks {
     std::vector<cuda::event> copies;
     std::vector<std::future<size_t>> reads;
@@ -455,7 +465,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
           auto chunk_data   = reinterpret_cast<char const*>(host_input->data()) + offset;
           if (!is_pinned) {
             // The staging chunk was last copied from two chunks back, which must have completed
-            auto const window = staging.data() + chunks.copies.size() % 2 * chunk_bytes;
+            auto const window = staging.data() + (chunks.copies.size() % 2) * chunk_bytes;
             if (chunks.copies.size() >= 2) { chunks.copies[chunks.copies.size() - 2].sync(); }
             copy_to_pinned(window, {chunk_data, size});
             chunk_data = window;

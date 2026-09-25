@@ -6669,8 +6669,8 @@ TEST_F(CsvReaderTest, PinnedHostBufferAndFileAcrossChunks)
 {
   // Whole pinned host inputs and files are read and parsed in 64MB chunks (`max_chunk_bytes` in
   // load_data_and_gather_row_offsets). The first chunk ends inside a quoted field holding a line
-  // break and doubled quotes, so the second chunk starts inside quotes. Pageable host data is
-  // parsed as one chunk and must give the same table.
+  // break and doubled quotes, so the second chunk starts inside quotes. Pageable host data must
+  // give the same table.
   constexpr size_t chunk_bytes = 64 * 1024 * 1024;
   std::vector<std::string> expected;
   std::string text;
@@ -6708,7 +6708,7 @@ TEST_F(CsvReaderTest, BomPrefixedPinnedHostBuffersAndFiles)
 {
   // Whole pinned host inputs and files of more than one 64MB chunk are read in chunks, which start
   // after the UTF-8 BOM; inputs of the BOM alone hold no data to read. Results must match reading
-  // the same data from pageable memory, which is parsed as one chunk.
+  // the same data from pageable memory.
   std::string large = "\xEF\xBB\xBF";
   for (int i = 0; large.size() < 64u * 1024 * 1024 + 4096; ++i) {
     large +=
@@ -6848,6 +6848,42 @@ TEST_F(CsvReaderTest, FixedLayoutTimestampsParseAsGeneralLayouts)
                            .dtypes(std::vector<data_type>{data_type{type}, data_type{type}})
                            .build());
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), result.tbl->view().column(1));
+  }
+}
+
+TEST_F(CsvReaderTest, HostSourcesOfManyChunksMatchDeviceBuffer)
+{
+  // Whole inputs of more than two 64MB chunks refill the pinned staging chunks of pageable data
+  // and keep file reads one chunk ahead; every source must give the table of a device buffer,
+  // which is parsed in place as one chunk. Rows hold quoted line breaks and doubled quotes, and
+  // blank and comment rows.
+  std::string text = "\xEF\xBB\xBF";
+  for (int i = 0; text.size() < 3u * 64 * 1024 * 1024 + 12345; ++i) {
+    text += std::to_string(i) + ",\"" + std::string(90 + i % 17, 'a' + i % 26) + "\n\"\"x\"\n";
+    if (i % 1000 == 0) { text += "\n#comment\n"; }
+  }
+  auto const stream = cudf::get_default_stream();
+  auto pinned       = cudf::detail::make_pinned_vector<char>(text.size(), stream);
+  std::copy(text.begin(), text.end(), pinned.begin());
+  auto const filepath = temp_env->get_temp_filepath("HostSourcesOfManyChunks.csv");
+  std::ofstream(filepath, std::ios::binary) << text;
+  auto const d_text =
+    cudf::detail::make_device_uvector(cudf::host_span<char const>{text.data(), text.size()},
+                                      stream,
+                                      cudf::get_current_device_resource_ref());
+  copying_host_source user_source{text};
+  auto const read = [](cudf::io::source_info const& source) {
+    return cudf::io::read_csv(
+      cudf::io::csv_reader_options::builder(source).header(-1).comment('#').build());
+  };
+  auto const expected = read(cudf::io::source_info{cudf::device_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(d_text.data()), d_text.size()}});
+  for (auto const& source :
+       {cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}},
+        cudf::io::source_info{cudf::host_span<char const>{pinned.data(), pinned.size()}},
+        cudf::io::source_info{filepath},
+        cudf::io::source_info{&user_source}}) {
+    CUDF_TEST_EXPECT_TABLES_EQUAL(read(source).tbl->view(), expected.tbl->view());
   }
 }
 
