@@ -5,7 +5,7 @@
 
 /**
  * @brief Serialized trie implementation for C++/CUDA
- * @file trie.cuh
+ * @file trie.hpp
  */
 
 #pragma once
@@ -28,13 +28,17 @@ static constexpr char trie_terminating_character = '\n';
  *
  * A serialized trie is an array of nodes. Each node represents a matching character, except for the
  * last child node, which denotes the end of the children list. Children of a node are stored
- * contiguously. The `children_offset` member is the offset between the node and its first child.
- * Matching is successful if all characters are matched and the final node is the last character of
- * a word (i.e. `is_leaf` is true).
+ * contiguously, in ascending order of their characters compared as unsigned bytes. The
+ * `children_offset` member is the offset between the node and its first child, or negative if the
+ * node has no children. Matching is successful if all characters are matched and the final node is
+ * the last character of a word (i.e. `is_leaf` is true).
  *
+ * The first node is the root, which matches the empty key. Its children are the nodes that follow
+ * it, so its `children_offset` instead holds the length of the longest key, which lets lookups
+ * reject longer keys without searching the trie.
  */
 struct serial_trie_node {
-  int16_t children_offset{-1};
+  int32_t children_offset{-1};
   char character{trie_terminating_character};
   bool is_leaf{false};
   explicit serial_trie_node(char c, bool leaf = false) noexcept : character(c), is_leaf(leaf) {}
@@ -59,10 +63,24 @@ inline trie_view make_trie_view(optional_trie const& t)
  * @param keys Array of strings to insert into the trie
  * @param stream CUDA stream used for device memory operations and kernel launches.
  *
- * @return A host vector of nodes representing the serialized trie
+ * @return The nodes of the serialized trie in device memory; empty if `keys` is empty
  */
 CUDF_EXPORT trie create_serialized_trie(std::vector<std::string> const& keys,
                                         cuda::stream_ref stream);
+
+/**
+ * @brief Creates the serialized tries of several sets of keys.
+ *
+ * Like `create_serialized_trie` for each set of keys, but the tries are uploaded to the device with
+ * a single synchronization of `stream` instead of one per trie.
+ *
+ * @param key_sets Sets of strings, each to insert into its own trie
+ * @param stream CUDA stream used for device memory operations
+ *
+ * @return The serialized trie of each set of keys, in order; empty for an empty set
+ */
+CUDF_EXPORT std::vector<trie> create_serialized_tries(
+  host_span<std::vector<std::string> const> key_sets, cuda::stream_ref stream);
 
 }  // namespace detail
 }  // namespace cudf

@@ -320,6 +320,8 @@ ConfigureTest(
 ConfigureTest(COMPRESSION_TEST io/comp/comp_test.cpp)
 ConfigureTest(ROW_SELECTION_TEST io/row_selection_test.cpp)
 ConfigureTest(FILEPATH_SOURCE_TEST io/filepath_source_test.cpp)
+ConfigureTest(DATASOURCE_TEST io/datasource_test.cpp)
+ConfigureTest(TRIE_TEST io/trie_test.cu)
 
 ConfigureTest(
   CSV_TEST io/csv_test.cpp
@@ -624,6 +626,7 @@ ConfigureTest(
   LARGE_STRINGS_TEST
   large_strings/concatenate_tests.cpp
   large_strings/case_tests.cpp
+  large_strings/csv_tests.cpp
   large_strings/json_tests.cpp
   large_strings/large_strings_fixture.cpp
   large_strings/merge_tests.cpp

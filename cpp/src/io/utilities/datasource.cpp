@@ -220,6 +220,8 @@ class device_buffer_source final : public datasource {
 
   [[nodiscard]] bool supports_device_read() const override { return true; }
 
+  [[nodiscard]] bool supports_zero_copy_device_read() const override { return true; }
+
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
@@ -314,6 +316,11 @@ class user_datasource_wrapper : public datasource {
   [[nodiscard]] bool is_device_read_preferred(size_t size) const override
   {
     return source->is_device_read_preferred(size);
+  }
+
+  [[nodiscard]] bool supports_zero_copy_device_read() const override
+  {
+    return source->supports_zero_copy_device_read();
   }
 
   size_t device_read(size_t offset, size_t size, uint8_t* dst, cuda::stream_ref stream) override

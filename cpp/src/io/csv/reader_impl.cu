@@ -13,17 +13,13 @@
 #include "io/utilities/column_buffer.hpp"
 #include "io/utilities/hostdevice_vector.hpp"
 #include "io/utilities/parsing_utils.cuh"
+#include "string_columns.hpp"
 
-#include <cudf/column/column_device_view.cuh>
 #include <cudf/column/column_factories.hpp>
-#include <cudf/column/column_stream.hpp>
 #include <cudf/copying.hpp>
-#include <cudf/detail/iterator.cuh>
+#include <cudf/detail/utilities/batched_memset.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
-#include <cudf/detail/utilities/host_worker_pool.hpp>
-#include <cudf/detail/utilities/integer_utils.hpp>
-#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/detail/utilities/visitor_overload.hpp>
 #include <cudf/io/csv.hpp>
@@ -32,23 +28,17 @@
 #include <cudf/io/detail/csv.hpp>
 #include <cudf/io/types.hpp>
 #include <cudf/logger.hpp>
-#include <cudf/strings/detail/copy_if_else.cuh>
-#include <cudf/strings/detail/replace.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/table/table.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
-#include <rmm/exec_policy.hpp>
-
-#include <cuda/functional>
 #include <cuda/iterator>
 #include <cuda/stream>
-#include <thrust/count.h>
 #include <thrust/host_vector.h>
 
 #include <algorithm>
-#include <future>
 #include <memory>
 #include <string>
 #include <string_view>
@@ -62,7 +52,6 @@ using std::vector;
 
 using cudf::device_span;
 using cudf::host_span;
-using cudf::detail::make_device_uvector_async;
 
 namespace cudf {
 namespace io {
@@ -103,7 +92,6 @@ class selected_rows_offsets {
     selected = selected.subspan(n, selected.size() - n);
   }
   auto size() const { return selected.size(); }
-  auto data() const { return selected.data(); }
 };
 
 /**
@@ -211,6 +199,113 @@ void erase_except_last(C& container, cuda::stream_ref stream)
   container.resize(1, stream);
 }
 
+/// Size of the chunks in which the input is read and parsed when only some of the rows are selected
+constexpr size_t max_row_selection_chunk_bytes = 64 * 1024 * 1024;  // 64MB
+
+/// Size of the reads from sources that do not prefer device reads
+constexpr size_t max_host_read_bytes = 32 * 1024 * 1024;  // 32MB
+
+/**
+ * @brief Reads a range of the source into device memory.
+ *
+ * Sources that prefer device reads are read directly into `dst`. Other sources are read in chunks
+ * of at most `max_host_read_bytes`, so that the host memory used stays bounded regardless of the
+ * size of the range: at most two chunks are held at a time, the one being copied to the device and
+ * the next one, whose read is requested before the copy so that it overlaps with it.
+ *
+ * @param source The source to read from
+ * @param offset Position of the range in the source
+ * @param dst Device memory that receives the range, and whose size is the size of the range
+ * @param stream CUDA stream used for the copies
+ */
+void read_source_to_device(datasource* source,
+                           size_t offset,
+                           device_span<char> dst,
+                           cuda::stream_ref stream)
+{
+  if (dst.empty()) { return; }
+  if (source->is_device_read_preferred(dst.size())) {
+    source->device_read(offset, dst.size(), reinterpret_cast<uint8_t*>(dst.data()), stream);
+    return;
+  }
+  auto const chunk_size = [&](size_t pos) {
+    return std::min(max_host_read_bytes, dst.size() - pos);
+  };
+  auto next_chunk = source->host_read_async(offset, chunk_size(0));
+  try {
+    for (size_t pos = 0; pos < dst.size();) {
+      auto const chunk = next_chunk.get();
+      auto const size  = chunk_size(pos);
+      CUDF_EXPECTS(chunk->size() == size, "Unexpected end of the CSV source data");
+      if (pos + size < dst.size()) {
+        next_chunk = source->host_read_async(offset + pos + size, chunk_size(pos + size));
+      }
+      // Synchronous, so that the chunk can be released
+      cudf::detail::cuda_memcpy(
+        dst.subspan(pos, size),
+        host_span<char const>{reinterpret_cast<char const*>(chunk->data()), size},
+        stream);
+      pos += size;
+    }
+  } catch (...) {
+    // The pending read uses the source, which may be destroyed once the exception propagates
+    if (next_chunk.valid()) { next_chunk.wait(); }
+    throw;
+  }
+}
+
+/**
+ * @brief Returns a view of a range of the source in device memory, if the source holds it there.
+ *
+ * The data of sources whose device reads return views of their memory (see
+ * `datasource::supports_zero_copy_device_read`) can be parsed where it is, without a copy. This
+ * does not depend on whether the source prefers device reads: a view involves no read.
+ *
+ * @param source The source to read from
+ * @param offset Position of the range in the source
+ * @param size Size of the range
+ * @param stream CUDA stream of the read
+ * @return The view, or nullptr if the range must be copied (or is empty, which needs no read)
+ */
+std::unique_ptr<datasource::buffer> view_source_on_device(datasource* source,
+                                                          size_t offset,
+                                                          size_t size,
+                                                          cuda::stream_ref stream)
+{
+  if (size == 0 or not source->supports_device_read() or
+      not source->supports_zero_copy_device_read()) {
+    return nullptr;
+  }
+  auto view = source->device_read(offset, size, stream);
+  CUDF_EXPECTS(view->size() == size, "Unexpected end of the CSV source data");
+  return view;
+}
+
+/**
+ * @brief Input data in device memory, and the rows of it to read.
+ *
+ * The data is either a copy owned by the reader, or a view of the source's device memory, which the
+ * reader must not modify.
+ */
+struct data_and_row_offsets {
+  /// Copy of the input data, unless it is viewed in the source
+  rmm::device_uvector<char> owned_data;
+  /// View of the input data in the source's device memory, if it is not copied
+  std::unique_ptr<datasource::buffer> source_data;
+  selected_rows_offsets row_offsets;
+  /// Shared memory size with which the decoding kernels stage the rows of each block
+  size_t row_staging_size = 0;
+  /// Whether the data may have two consecutive quote characters, which escaped quote pairs need
+  bool has_consecutive_quotes = true;
+
+  /// Returns the input data
+  [[nodiscard]] device_span<char const> data() const
+  {
+    if (source_data == nullptr) { return owned_data; }
+    return {reinterpret_cast<char const*>(source_data->data()), source_data->size()};
+  }
+};
+
 constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 [[nodiscard]] bool has_utf8_bom(host_span<char const> data)
 {
@@ -235,28 +330,26 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
  * data size if all data after byte_range_offset needs to be read
  *  @param[in] skip_rows Number of rows to skip from the start
  *  @param[in] num_rows Number of rows to read; -1 means all
+ *  @param[in] skip_end_rows Number of rows to skip from the end
  *  @param[in] load_whole_file Indicates if the whole file should be read
  *  @param[in] stream CUDA stream used for device memory operations and kernel launches
- *  @return Input data and row offsets in the device memory
+ *  @return Input data and the offsets of the rows to read in the device memory
  */
-std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather_row_offsets(
-  cudf::io::datasource* source,
-  csv_reader_options const& reader_opts,
-  parse_options const& parse_opts,
-  std::vector<char>& header,
-  std::optional<host_span<char const>> data,
-  size_t byte_range_offset,
-  size_t range_begin,
-  size_t range_end,
-  size_t skip_rows,
-  int64_t num_rows,
-  bool load_whole_file,
-  cuda::stream_ref stream)
+data_and_row_offsets load_data_and_gather_row_offsets(cudf::io::datasource* source,
+                                                      csv_reader_options const& reader_opts,
+                                                      parse_options const& parse_opts,
+                                                      std::vector<char>& header,
+                                                      std::optional<host_span<char const>> data,
+                                                      size_t byte_range_offset,
+                                                      size_t range_begin,
+                                                      size_t range_end,
+                                                      size_t skip_rows,
+                                                      int64_t num_rows,
+                                                      size_t skip_end_rows,
+                                                      bool load_whole_file,
+                                                      cuda::stream_ref stream)
 {
-  constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
-
   auto const data_size      = data.has_value() ? data->size() : source->size();
-  auto const buffer_size    = std::min(max_chunk_bytes, data_size);
   auto const max_input_size = [&] {
     if (range_end == data_size) {
       return data_size - byte_range_offset;
@@ -274,178 +367,226 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> load_data_and_gather
   auto pos = range_begin;
   // When using byte range, need the line terminator of last line before the range
   auto input_pos = byte_range_offset == 0 ? pos : pos - 1;
-  uint64_t ctx   = 0;
+
+  auto const load_input = [&](size_t offset, device_span<char> dst) {
+    if (data.has_value()) {
+      cudf::detail::cuda_memcpy_async(dst, data->subspan(offset, dst.size()), stream);
+    } else {
+      read_source_to_device(source, offset, dst, stream);
+    }
+  };
 
   rmm::device_uvector<char> d_data{0, stream};
-  d_data.reserve((load_whole_file) ? data_size : std::min(buffer_size * 2, max_input_size), stream);
+  std::unique_ptr<datasource::buffer> source_data;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
-
-  auto const max_blocks =
-    std::max<size_t>((buffer_size / cudf::io::csv::gpu::rowofs_block_bytes) + 1, 2);
-  cudf::detail::hostdevice_vector<uint64_t> row_ctx(max_blocks, stream);
-  do {
-    auto const target_pos = std::min(pos + max_chunk_bytes, max_input_size);
-    auto const chunk_size = target_pos - pos;
-
-    auto const previous_data_size = d_data.size();
-    d_data.resize(target_pos - input_pos, stream);
-
-    auto const read_offset = byte_range_offset + input_pos + previous_data_size;
-    auto const read_size   = target_pos - input_pos - previous_data_size;
-    if (data.has_value()) {
-      cudf::detail::cuda_memcpy_async(
-        device_span<char>{d_data.data() + previous_data_size, read_size},
-        data->subspan(read_offset, read_size),
-        stream);
-    } else {
-      if (source->is_device_read_preferred(read_size)) {
-        source->device_read(read_offset,
-                            read_size,
-                            reinterpret_cast<uint8_t*>(d_data.data() + previous_data_size),
-                            stream);
-      } else {
-        auto const buffer = source->host_read(read_offset, read_size);
-        // Use sync version to prevent buffer going out of scope before we copy the data.
-        cudf::detail::cuda_memcpy(
-          device_span<char>{d_data.data() + previous_data_size, read_size},
-          host_span<char const>{reinterpret_cast<char const*>(buffer->data()), buffer->size()},
-          stream);
-      }
+  // Only known when the rows are gathered in a single pass
+  bool has_consecutive_quotes = true;
+  if (load_whole_file) {
+    // Without row selection, the whole file is loaded and its rows gathered in a single pass. The
+    // data of device sources that allow it is parsed where the source holds it, without a copy.
+    auto const read_offset = byte_range_offset + input_pos;
+    auto const read_size   = max_input_size - input_pos;
+    if (not data.has_value()) {
+      source_data = view_source_on_device(source, read_offset, read_size, stream);
     }
-
-    // Pass 1: Count the potential number of rows in each character block for each
-    // possible parser state at the beginning of the block.
-    auto const num_blocks = cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
-                                                                   row_ctx.device_ptr(),
-                                                                   device_span<uint64_t>(),
-                                                                   d_data,
-                                                                   chunk_size,
-                                                                   pos,
-                                                                   input_pos,
-                                                                   max_input_size,
-                                                                   range_begin,
-                                                                   range_end,
-                                                                   skip_rows,
-                                                                   stream);
-
-    cudf::detail::cuda_memcpy(
-      host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
-      device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
-      stream);
-
-    // Sum up the rows in each character block, selecting the row count that
-    // corresponds to the current input context. Also stores the now known input
-    // context per character block that will be needed by the second pass.
-    for (uint32_t i = 0; i < num_blocks; i++) {
-      uint64_t ctx_next = cudf::io::csv::gpu::select_row_context(ctx, row_ctx[i]);
-      row_ctx[i]        = ctx;
-      ctx               = ctx_next;
+    if (source_data == nullptr) {
+      d_data.resize(read_size, stream);
+      load_input(read_offset, d_data);
     }
-    size_t total_rows = ctx >> 2;
-    if (total_rows > skip_rows) {
-      // At least one row in range in this batch
-      all_row_offsets.resize(total_rows - skip_rows, stream);
+    auto const input =
+      source_data == nullptr
+        ? device_span<char const>{d_data}
+        : device_span<char const>{reinterpret_cast<char const*>(source_data->data()), read_size};
+    auto rows       = cudf::io::csv::gpu::gather_all_row_offsets(parse_opts.view(), input, stream);
+    all_row_offsets = std::move(rows.offsets);
+    has_consecutive_quotes = rows.has_consecutive_quotes;
+  } else {
+    // Reading in chunks bounds the work done before reaching the end of the byte range or the
+    // requested number of rows
+    auto const buffer_size = std::min(max_row_selection_chunk_bytes, data_size);
+    d_data.reserve(std::min(buffer_size * 2, max_input_size), stream);
 
-      cudf::detail::cuda_memcpy_async(
-        device_span<uint64_t>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
-        host_span<uint64_t const>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
+    auto const max_blocks =
+      std::max<size_t>((buffer_size / cudf::io::csv::gpu::rowofs_block_bytes) + 1, 2);
+    cudf::detail::hostdevice_vector<uint64_t> row_ctx(max_blocks, stream);
+    uint64_t ctx = 0;
+    do {
+      auto const target_pos = std::min(pos + max_row_selection_chunk_bytes, max_input_size);
+      auto const chunk_size = target_pos - pos;
+
+      auto const previous_data_size = d_data.size();
+      d_data.resize(target_pos - input_pos, stream);
+
+      auto const read_offset = byte_range_offset + input_pos + previous_data_size;
+      auto const read_size   = target_pos - input_pos - previous_data_size;
+      auto const read_dst    = device_span<char>{d_data.data() + previous_data_size, read_size};
+      load_input(read_offset, read_dst);
+
+      // Pass 1: Count the potential number of rows in each character block for each
+      // possible parser state at the beginning of the block.
+      auto const num_blocks = cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
+                                                                     row_ctx.device_ptr(),
+                                                                     device_span<uint64_t>(),
+                                                                     d_data,
+                                                                     chunk_size,
+                                                                     pos,
+                                                                     input_pos,
+                                                                     max_input_size,
+                                                                     range_begin,
+                                                                     range_end,
+                                                                     skip_rows,
+                                                                     stream);
+
+      cudf::detail::cuda_memcpy(
+        host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
+        device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
         stream);
 
-      // Pass 2: Output row offsets
-      cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
-                                             row_ctx.device_ptr(),
-                                             all_row_offsets,
-                                             d_data,
-                                             chunk_size,
-                                             pos,
-                                             input_pos,
-                                             max_input_size,
-                                             range_begin,
-                                             range_end,
-                                             skip_rows,
-                                             stream);
-      // With byte range, we want to keep only one row out of the specified range
-      if (range_end < data_size) {
-        cudf::detail::cuda_memcpy(
-          host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
-          device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
+      // Sum up the rows in each character block, selecting the row count that
+      // corresponds to the current input context. Also stores the now known input
+      // context per character block that will be needed by the second pass.
+      for (uint32_t i = 0; i < num_blocks; i++) {
+        uint64_t ctx_next = cudf::io::csv::gpu::select_row_context(ctx, row_ctx[i]);
+        row_ctx[i]        = ctx;
+        ctx               = ctx_next;
+      }
+      size_t total_rows = ctx >> 2;
+      if (total_rows > skip_rows) {
+        // At least one row in range in this batch
+        all_row_offsets.resize(total_rows - skip_rows, stream);
+
+        cudf::detail::cuda_memcpy_async(
+          device_span<uint64_t>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
+          host_span<uint64_t const>(row_ctx.host_ptr(), row_ctx.size(), true)
+            .subspan(0, num_blocks),
           stream);
 
-        size_t rows_out_of_range = 0;
-        for (uint32_t i = 0; i < num_blocks; i++) {
-          rows_out_of_range += row_ctx[i];
-        }
-        if (rows_out_of_range != 0) {
-          // Keep one row out of range (used to infer length of previous row)
-          auto new_row_offsets_size =
-            all_row_offsets.size() - std::min(rows_out_of_range - 1, all_row_offsets.size());
-          all_row_offsets.resize(new_row_offsets_size, stream);
-          // Implies we reached the end of the range
-          break;
-        }
-      }
-      // num_rows does not include blank rows
-      if (num_rows >= 0) {
-        if (all_row_offsets.size() > header_rows + static_cast<size_t>(num_rows)) {
-          size_t num_blanks = cudf::io::csv::gpu::count_blank_rows(
-            parse_opts.view(), d_data, all_row_offsets, stream);
-          if (all_row_offsets.size() - num_blanks > header_rows + static_cast<size_t>(num_rows)) {
-            // Got the desired number of rows
+        // Pass 2: Output row offsets
+        cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
+                                               row_ctx.device_ptr(),
+                                               all_row_offsets,
+                                               d_data,
+                                               chunk_size,
+                                               pos,
+                                               input_pos,
+                                               max_input_size,
+                                               range_begin,
+                                               range_end,
+                                               skip_rows,
+                                               stream);
+        // With byte range, we want to keep only one row out of the specified range
+        if (range_end < data_size) {
+          cudf::detail::cuda_memcpy(
+            host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
+            device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size())
+              .subspan(0, num_blocks),
+            stream);
+
+          size_t rows_out_of_range = 0;
+          for (uint32_t i = 0; i < num_blocks; i++) {
+            rows_out_of_range += row_ctx[i];
+          }
+          if (rows_out_of_range != 0) {
+            // Keep one row out of range (used to infer length of previous row)
+            auto new_row_offsets_size =
+              all_row_offsets.size() - std::min(rows_out_of_range - 1, all_row_offsets.size());
+            all_row_offsets.resize(new_row_offsets_size, stream);
+            // Implies we reached the end of the range
             break;
           }
         }
+        // num_rows does not include blank rows
+        if (num_rows >= 0) {
+          if (all_row_offsets.size() > header_rows + static_cast<size_t>(num_rows)) {
+            size_t num_blanks = cudf::io::csv::gpu::count_blank_rows(
+              parse_opts.view(), d_data, all_row_offsets, stream);
+            if (all_row_offsets.size() - num_blanks > header_rows + static_cast<size_t>(num_rows)) {
+              // Got the desired number of rows
+              break;
+            }
+          }
+        }
+      } else {
+        // Discard data (all rows below skip_rows), keeping one character for history
+        size_t discard_bytes = std::max(d_data.size(), sizeof(char)) - sizeof(char);
+        if (discard_bytes != 0) {
+          erase_except_last(d_data, stream);
+          input_pos += discard_bytes;
+        }
       }
-    } else {
-      // Discard data (all rows below skip_rows), keeping one character for history
-      size_t discard_bytes = std::max(d_data.size(), sizeof(char)) - sizeof(char);
-      if (discard_bytes != 0) {
-        erase_except_last(d_data, stream);
-        input_pos += discard_bytes;
-      }
-    }
-    pos = target_pos;
-  } while (pos < max_input_size);
+      pos = target_pos;
+    } while (pos < max_input_size);
+  }
 
+  // The single-pass gathering of the whole file already excludes blank rows
   auto const non_blank_row_offsets =
-    io::csv::gpu::remove_blank_rows(parse_opts.view(), d_data, all_row_offsets, stream);
+    load_whole_file
+      ? device_span<uint64_t>{all_row_offsets}
+      : io::csv::gpu::remove_blank_rows(parse_opts.view(), d_data, all_row_offsets, stream);
   auto row_offsets = selected_rows_offsets{std::move(all_row_offsets), non_blank_row_offsets};
 
-  // Remove header rows and extract header
+  // The row that holds the header, or the first row that names the columns without a header
   auto const header_row_index = std::max<size_t>(header_rows, 1) - 1;
-  if (header_row_index + 1 < row_offsets.size()) {
-    cudf::detail::cuda_memcpy(host_span<uint64_t>{row_ctx}.subspan(0, 2),
-                              device_span<uint64_t const>{row_offsets.data() + header_row_index, 2},
-                              stream);
+  bool const has_header_row   = header_row_index + 1 < row_offsets.size();
+  auto const header_offsets =
+    has_header_row ? device_span<uint64_t const>{row_offsets}.subspan(header_row_index, 2)
+                   : device_span<uint64_t const>{};
 
-    auto const header_start = input_pos + row_ctx[0];
-    auto const header_end   = input_pos + row_ctx[1];
-    CUDF_EXPECTS(header_start <= header_end && header_end <= max_input_size,
-                 "Invalid csv header location");
-    header.resize(header_end - header_start);
-    if (data.has_value()) {
-      std::copy(data->begin() + byte_range_offset + header_start,
-                data->begin() + byte_range_offset + header_end,
-                header.begin());
-    } else {
-      source->host_read(header_start + byte_range_offset,
-                        header_end - header_start,
-                        reinterpret_cast<uint8_t*>(header.data()));
-    }
-    if (header_rows > 0) { row_offsets.erase_first_n(header_rows); }
-  }
-  // Apply num_rows limit
+  // Remove the header rows, and the rows past the num_rows and skip_end_rows limits
+  if (has_header_row && header_rows > 0) { row_offsets.erase_first_n(header_rows); }
   if (num_rows >= 0 && static_cast<size_t>(num_rows) < row_offsets.size() - 1) {
     row_offsets.shrink(num_rows + 1);
   }
-  return {std::move(d_data), std::move(row_offsets)};
+  if (skip_end_rows > 0 && skip_end_rows < row_offsets.size()) {
+    row_offsets.shrink(row_offsets.size() - skip_end_rows);
+  }
+
+  // The location of the header and the staging size of the rows to read are copied to the host
+  // with a single synchronization
+  size_t row_staging_size = 0;
+  if (has_header_row || row_offsets.size() > 1) {
+    rmm::device_uvector<uint64_t> d_row_staging_size(1, stream);
+    cudf::io::csv::gpu::compute_row_staging_size(row_offsets, d_row_staging_size.data(), stream);
+    // Staging size, followed by the header offsets
+    auto h_values =
+      cudf::detail::make_pinned_vector_async<uint64_t>(1 + header_offsets.size(), stream);
+    cudf::detail::cuda_memcpy_async(host_span<uint64_t>{h_values}.subspan(0, 1),
+                                    device_span<uint64_t const>{d_row_staging_size},
+                                    stream);
+    cudf::detail::cuda_memcpy_async(
+      host_span<uint64_t>{h_values}.subspan(1, header_offsets.size()), header_offsets, stream);
+    stream.sync();
+    row_staging_size = h_values[0];
+
+    if (has_header_row) {
+      auto const header_start = input_pos + h_values[1];
+      auto const header_end   = input_pos + h_values[2];
+      CUDF_EXPECTS(header_start <= header_end && header_end <= max_input_size,
+                   "Invalid csv header location");
+      header.resize(header_end - header_start);
+      if (data.has_value()) {
+        std::copy(data->begin() + byte_range_offset + header_start,
+                  data->begin() + byte_range_offset + header_end,
+                  header.begin());
+      } else {
+        source->host_read(header_start + byte_range_offset,
+                          header_end - header_start,
+                          reinterpret_cast<uint8_t*>(header.data()));
+      }
+    }
+  }
+  return {std::move(d_data),
+          std::move(source_data),
+          std::move(row_offsets),
+          row_staging_size,
+          has_consecutive_quotes};
 }
 
-std::pair<rmm::device_uvector<char>, selected_rows_offsets> select_data_and_row_offsets(
-  cudf::io::datasource* source,
-  csv_reader_options const& reader_opts,
-  std::vector<char>& header,
-  parse_options const& parse_opts,
-  cuda::stream_ref stream)
+data_and_row_offsets select_data_and_row_offsets(cudf::io::datasource* source,
+                                                 csv_reader_options const& reader_opts,
+                                                 std::vector<char>& header,
+                                                 parse_options const& parse_opts,
+                                                 cuda::stream_ref stream)
 {
   auto range_offset  = reader_opts.get_byte_range_offset();
   auto range_size    = reader_opts.get_byte_range_size();
@@ -465,7 +606,7 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> select_data_and_row_
                "byte_range offset with header not supported");
 
   if (source->is_empty()) {
-    return {rmm::device_uvector<char>{0, stream}, selected_rows_offsets{stream}};
+    return {rmm::device_uvector<char>{0, stream}, nullptr, selected_rows_offsets{stream}};
   }
 
   std::optional<host_span<char const>> h_data;
@@ -514,25 +655,19 @@ std::pair<rmm::device_uvector<char>, selected_rows_offsets> select_data_and_row_
 
   // Transfer source data to GPU and gather row offsets
   auto const uncomp_size = h_data.has_value() ? h_data->size() : source->size();
-  auto data_row_offsets  = load_data_and_gather_row_offsets(source,
-                                                           reader_opts,
-                                                           parse_opts,
-                                                           header,
-                                                           h_data,
-                                                           range_offset,
-                                                           data_start_offset - range_offset,
-                                                           (range_size) ? range_size : uncomp_size,
-                                                           (skip_rows > 0) ? skip_rows : 0,
-                                                           num_rows,
-                                                           load_whole_file,
-                                                           stream);
-  auto& row_offsets      = data_row_offsets.second;
-  // Exclude the rows that are to be skipped from the end
-  if (skip_end_rows > 0 && static_cast<size_t>(skip_end_rows) < row_offsets.size()) {
-    row_offsets.shrink(row_offsets.size() - skip_end_rows);
-  }
-
-  return data_row_offsets;
+  return load_data_and_gather_row_offsets(source,
+                                          reader_opts,
+                                          parse_opts,
+                                          header,
+                                          h_data,
+                                          range_offset,
+                                          data_start_offset - range_offset,
+                                          (range_size) ? range_size : uncomp_size,
+                                          (skip_rows > 0) ? skip_rows : 0,
+                                          num_rows,
+                                          (skip_end_rows > 0) ? skip_end_rows : 0,
+                                          load_whole_file,
+                                          stream);
 }
 
 void select_data_types(host_span<data_type const> user_dtypes,
@@ -578,6 +713,7 @@ void infer_column_types(parse_options const& parse_opts,
                         host_span<column_parse::flags const> column_flags,
                         device_span<char const> data,
                         device_span<uint64_t const> row_offsets,
+                        size_t row_staging_size,
                         int32_t num_records,
                         data_type timestamp_type,
                         host_span<data_type> column_types,
@@ -598,14 +734,13 @@ void infer_column_types(parse_options const& parse_opts,
     });
   if (num_inferred_columns == 0) { return; }
 
-  auto const column_stats = cudf::io::csv::gpu::detect_column_types(
-    parse_opts.view(),
-    data,
-    make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
-    row_offsets,
-    num_inferred_columns,
-    stream);
-  stream.sync();
+  auto const column_stats = cudf::io::csv::gpu::detect_column_types(parse_opts.view(),
+                                                                    data,
+                                                                    column_flags,
+                                                                    row_offsets,
+                                                                    num_inferred_columns,
+                                                                    row_staging_size,
+                                                                    stream);
 
   auto inf_col_idx = 0;
   for (auto col_idx = 0u; col_idx < column_flags.size(); ++col_idx) {
@@ -636,91 +771,116 @@ void infer_column_types(parse_options const& parse_opts,
 }
 
 /**
- * @brief Result of decode_data containing column buffers and quoted field tracking
+ * @brief Decodes the selected rows into the active columns.
+ *
+ * Quoted string fields with escaped quotes are unescaped into `unescape_buffer`, which may be
+ * `data` itself (see `decode_row_column_data`), before the strings are copied into the columns.
  */
-struct decode_result {
-  std::vector<column_buffer> buffers;
-  std::vector<rmm::device_uvector<bool>> is_quoted_flags;
-};
-
-decode_result decode_data(parse_options const& parse_opts,
-                          host_span<column_parse::flags const> column_flags,
-                          std::vector<std::string> const& column_names,
-                          device_span<char const> data,
-                          device_span<uint64_t const> row_offsets,
-                          host_span<data_type const> column_types,
-                          int32_t num_records,
-                          int32_t num_actual_columns,
-                          int32_t num_active_columns,
-                          cuda::stream_ref stream,
-                          rmm::device_async_resource_ref mr)
+std::vector<std::unique_ptr<column>> decode_data(parse_options const& parse_opts,
+                                                 host_span<column_parse::flags const> column_flags,
+                                                 device_span<char const> data,
+                                                 device_span<char> unescape_buffer,
+                                                 device_span<uint64_t const> row_offsets,
+                                                 size_t row_staging_size,
+                                                 host_span<data_type const> column_types,
+                                                 int32_t num_records,
+                                                 int32_t num_active_columns,
+                                                 cuda::stream_ref stream,
+                                                 rmm::device_async_resource_ref mr)
 {
-  // Alloc output; columns' data memory is still expected for empty dataframe
-  std::vector<column_buffer> out_buffers;
-  out_buffers.reserve(column_types.size());
+  using cudf::io::csv::gpu::decoded_strings;
+  auto const is_string = [&](int col) { return column_types[col].id() == type_id::STRING; };
 
-  for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
-    if (column_flags[col] & column_parse::enabled) {
-      auto out_buffer = column_buffer(column_types[active_col], num_records, true, stream, mr);
+  // The per-column inputs of the decode kernel, uploaded with a single copy. They are allocated
+  // first, while the stream is idle, since allocating pinned host memory synchronizes it.
+  auto inputs =
+    cudf::detail::hostdevice_arrays<column_parse::flags, data_type, void*, bitmask_type*>(
+      {column_flags.size(), column_types.size(), column_types.size(), column_types.size()}, stream);
+  auto const [flags, types, columns, masks] = inputs.spans();
+  std::copy(column_flags.begin(), column_flags.end(), flags.host_begin());
+  std::copy(column_types.begin(), column_types.end(), types.host_begin());
 
-      out_buffer.name = column_names[col];
-      out_buffers.emplace_back(std::move(out_buffer));
-      active_col++;
+  // The decoded strings of all string columns, one after the other, and the buffers of the other
+  // columns, in column order. Neither needs initialization: the decode kernel writes every row of
+  // the decoded strings, and the fixed-width data wherever it is valid (see
+  // decode_row_column_data). The string columns get their null masks when they are built from the
+  // decoded strings; the null masks of the other columns are all zeroed with a single batched
+  // memset.
+  auto const num_string_columns =
+    std::count_if(column_types.begin(), column_types.end(), [](auto const& type) {
+      return type.id() == type_id::STRING;
+    });
+  auto const string_column_bytes = decoded_strings::size_bytes(num_records);
+  rmm::device_buffer decoded_strings_memory(
+    num_string_columns * string_column_bytes, stream, cudf::get_current_device_resource_ref());
+  std::vector<decoded_strings> string_columns_strings;
+  std::vector<column_buffer> fixed_width_buffers;
+  std::vector<device_span<bitmask_type>> null_masks;
+  auto const mask_words = bitmask_allocation_size_bytes(num_records) / sizeof(bitmask_type);
+  for (int col = 0; col < num_active_columns; ++col) {
+    if (is_string(col)) {
+      columns[col] = static_cast<char*>(decoded_strings_memory.data()) +
+                     string_columns_strings.size() * string_column_bytes;
+      masks[col] = nullptr;
+      string_columns_strings.emplace_back(columns[col], num_records);
+    } else {
+      auto& buffer = fixed_width_buffers.emplace_back(column_types[col], true);
+      buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, false, stream, mr);
+      null_masks.emplace_back(buffer.null_mask(), mask_words);
+      columns[col] = buffer.data();
+      masks[col]   = buffer.null_mask();
     }
   }
-
-  auto h_data  = cudf::detail::make_host_vector<void*>(num_active_columns, stream);
-  auto h_valid = cudf::detail::make_host_vector<bitmask_type*>(num_active_columns, stream);
-
-  for (int i = 0; i < num_active_columns; ++i) {
-    h_data[i]  = out_buffers[i].data();
-    h_valid[i] = out_buffers[i].null_mask();
+  if (not null_masks.empty()) {
+    cudf::detail::batched_memset<bitmask_type>(null_masks, bitmask_type{0}, stream);
   }
+  inputs.host_to_device_async(stream);
 
-  // Allocate is_quoted_flags arrays for string columns to track which fields were quoted
-  std::vector<rmm::device_uvector<bool>> is_quoted_flags_storage;
-  auto h_is_quoted_flags = cudf::detail::make_host_vector<bool*>(num_active_columns, stream);
-  for (int i = 0; i < num_active_columns; ++i) {
-    if (column_types[i].id() == type_id::STRING) {
-      is_quoted_flags_storage.emplace_back(cudf::detail::make_zeroed_device_uvector_async<bool>(
-        num_records, stream, cudf::get_current_device_resource_ref()));
-      h_is_quoted_flags[i] = is_quoted_flags_storage.back().data();
+  cudf::io::csv::gpu::decode_row_column_data(parse_opts.view(),
+                                             data,
+                                             unescape_buffer,
+                                             flags,
+                                             row_offsets,
+                                             num_records,
+                                             types,
+                                             columns,
+                                             masks,
+                                             row_staging_size,
+                                             stream);
+
+  // The validity of the fixed-width columns is decoded into their masks; the string columns get
+  // theirs (and their null counts) when they are built from the decoded strings
+  std::vector<bitmask_type const*> fixed_width_masks;
+  for (auto const& mask : null_masks) {
+    fixed_width_masks.push_back(mask.data());
+  }
+  auto const null_counts = cudf::batch_null_count(fixed_width_masks, 0, num_records, stream);
+  auto string_columns =
+    cudf::io::csv::gpu::make_strings_columns(string_columns_strings, num_records, stream, mr);
+
+  std::vector<std::unique_ptr<column>> out_columns;
+  for (int col = 0, string_col = 0, fixed_width_col = 0; col < num_active_columns; ++col) {
+    if (is_string(col)) {
+      out_columns.emplace_back(std::move(string_columns[string_col++]));
+    } else {
+      auto& buffer        = fixed_width_buffers[fixed_width_col];
+      buffer.null_count() = null_counts[fixed_width_col++];
+      out_columns.emplace_back(make_column(buffer, nullptr, std::nullopt, stream));
     }
   }
-
-  auto d_valid_counts = cudf::detail::make_zeroed_device_uvector_async<size_type>(
-    num_active_columns, stream, cudf::get_current_device_resource_ref());
-
-  cudf::io::csv::gpu::decode_row_column_data(
-    parse_opts.view(),
-    data,
-    make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
-    row_offsets,
-    make_device_uvector_async(column_types, stream, cudf::get_current_device_resource_ref()),
-    make_device_uvector_async(h_data, stream, cudf::get_current_device_resource_ref()),
-    make_device_uvector_async(h_valid, stream, cudf::get_current_device_resource_ref()),
-    d_valid_counts,
-    make_device_uvector_async(h_is_quoted_flags, stream, cudf::get_current_device_resource_ref()),
-    stream);
-
-  auto const h_valid_counts = cudf::detail::make_host_vector(d_valid_counts, stream);
-  for (int i = 0; i < num_active_columns; ++i) {
-    out_buffers[i].null_count() = num_records - h_valid_counts[i];
-  }
-
-  return {std::move(out_buffers), std::move(is_quoted_flags_storage)};
+  return out_columns;
 }
 
-cudf::detail::host_vector<data_type> determine_column_types(
-  csv_reader_options const& reader_opts,
-  parse_options const& parse_opts,
-  host_span<std::string const> column_names,
-  device_span<char const> data,
-  device_span<uint64_t const> row_offsets,
-  int32_t num_records,
-  host_span<column_parse::flags> column_flags,
-  cudf::size_type num_active_columns,
-  cuda::stream_ref stream)
+std::vector<data_type> determine_column_types(csv_reader_options const& reader_opts,
+                                              parse_options const& parse_opts,
+                                              host_span<std::string const> column_names,
+                                              device_span<char const> data,
+                                              device_span<uint64_t const> row_offsets,
+                                              size_t row_staging_size,
+                                              int32_t num_records,
+                                              host_span<column_parse::flags> column_flags,
+                                              cudf::size_type num_active_columns,
+                                              cuda::stream_ref stream)
 {
   std::vector<data_type> column_types(column_flags.size());
 
@@ -738,14 +898,15 @@ cudf::detail::host_vector<data_type> determine_column_types(
                      column_flags,
                      data,
                      row_offsets,
+                     row_staging_size,
                      num_records,
                      reader_opts.get_timestamp_type(),
                      column_types,
                      stream);
 
   // compact column_types to only include active columns
-  auto active_col_types =
-    cudf::detail::make_empty_host_vector<data_type>(num_active_columns, stream);
+  std::vector<data_type> active_col_types;
+  active_col_types.reserve(num_active_columns);
   std::copy_if(column_types.cbegin(),
                column_types.cend(),
                std::back_inserter(active_col_types),
@@ -765,11 +926,11 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 {
   std::vector<char> header;
 
-  auto const data_row_offsets =
+  auto data_row_offsets =
     select_data_and_row_offsets(source, reader_opts, header, parse_opts, stream);
 
-  auto const& data        = data_row_offsets.first;
-  auto const& row_offsets = data_row_offsets.second;
+  auto const data         = data_row_offsets.data();
+  auto const& row_offsets = data_row_offsets.row_offsets;
 
   auto const unique_use_cols_indexes = std::set(reader_opts.get_use_cols_indexes().cbegin(),
                                                 reader_opts.get_use_cols_indexes().cend());
@@ -789,10 +950,11 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 
   auto const num_actual_columns = static_cast<int32_t>(column_names.size());
   auto num_active_columns       = num_actual_columns;
-  auto column_flags =
-    cudf::detail::make_host_vector<column_parse::flags>(num_actual_columns, stream);
-  std::fill(
-    column_flags.begin(), column_flags.end(), column_parse::enabled | column_parse::inferred);
+  auto const is_column_index    = [num_actual_columns](int index) {
+    return index >= 0 && index < num_actual_columns;
+  };
+  auto column_flags = std::vector<column_parse::flags>(
+    num_actual_columns, column_parse::enabled | column_parse::inferred);
 
   // User did not pass column names to override names in the file
   // Process names from the file to remove empty and duplicated strings
@@ -880,12 +1042,34 @@ table_with_metadata read_csv(cudf::io::datasource* source,
                    reader_opts.get_names().size() == unique_use_cols_indexes.size(),
                  "Specify names of all columns in the file, or names of all selected columns");
 
+    // The columns of the input are named by its header or first row. Input without rows (an empty
+    // input or a byte range without a row start) has no data to read, and its columns are those
+    // named by the user, if any: as many names as selected columns name the selected columns (were
+    // they the names of all columns, all columns would be selected), other names name all columns.
+    auto const are_selected_columns_named =
+      detected_column_names.empty() and
+      reader_opts.get_names().size() == unique_use_cols_indexes.size();
     for (auto const index : unique_use_cols_indexes) {
-      column_flags[index] = column_parse::enabled | column_parse::inferred;
-      if (are_opts_col_names_used) {
-        column_names[index] = reader_opts.get_names()[num_active_columns];
+      CUDF_EXPECTS(index >= 0 and
+                     (is_column_index(index) or are_selected_columns_named or column_names.empty()),
+                   "Selected column index is out of range",
+                   std::out_of_range);
+    }
+
+    if (are_selected_columns_named) {
+      std::fill(
+        column_flags.begin(), column_flags.end(), column_parse::enabled | column_parse::inferred);
+      num_active_columns = num_actual_columns;
+    } else {
+      for (auto const index : unique_use_cols_indexes) {
+        // Without rows or names, no column is known and none is selected
+        if (not is_column_index(index)) { continue; }
+        column_flags[index] = column_parse::enabled | column_parse::inferred;
+        if (are_opts_col_names_used) {
+          column_names[index] = reader_opts.get_names()[num_active_columns];
+        }
+        ++num_active_columns;
       }
-      ++num_active_columns;
     }
   }
 
@@ -905,8 +1089,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   // User can specify which columns should be read as datetime
   if (!reader_opts.get_parse_dates_indexes().empty() ||
       !reader_opts.get_parse_dates_names().empty()) {
+    // Like names that match no column, indexes that match no column are ignored
     for (auto const index : reader_opts.get_parse_dates_indexes()) {
-      column_flags[index] |= column_parse::as_datetime;
+      if (is_column_index(index)) { column_flags[index] |= column_parse::as_datetime; }
     }
 
     for (auto const& name : reader_opts.get_parse_dates_names()) {
@@ -919,8 +1104,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 
   // User can specify which columns should be parsed as hexadecimal
   if (!reader_opts.get_parse_hex_indexes().empty() || !reader_opts.get_parse_hex_names().empty()) {
+    // Like names that match no column, indexes that match no column are ignored
     for (auto const index : reader_opts.get_parse_hex_indexes()) {
-      column_flags[index] |= column_parse::as_hexadecimal;
+      if (is_column_index(index)) { column_flags[index] |= column_parse::as_hexadecimal; }
     }
 
     for (auto const& name : reader_opts.get_parse_hex_names()) {
@@ -941,6 +1127,7 @@ table_with_metadata read_csv(cudf::io::datasource* source,
                                                    column_names,
                                                    data,
                                                    row_offsets,
+                                                   data_row_offsets.row_staging_size,
                                                    num_records,
                                                    column_flags,
                                                    num_active_columns,
@@ -950,161 +1137,51 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   auto out_columns = std::vector<std::unique_ptr<cudf::column>>();
   out_columns.reserve(column_types.size());
   if (num_records != 0) {
-    auto decode_result = decode_data(  //
-      parse_opts,
-      column_flags,
-      column_names,
-      data,
-      row_offsets,
-      column_types,
-      num_records,
-      num_actual_columns,
-      num_active_columns,
-      stream,
-      mr);
-
-    out_columns.resize(column_types.size());
-
-    auto& out_buffers     = decode_result.buffers;
-    auto& is_quoted_flags = decode_result.is_quoted_flags;
-
-    bool const doublequote_enabled = (parse_opts.quotechar != '\0' && parse_opts.doublequote);
-
-    // Identify string columns that need doublequote processing
-    std::vector<size_t> string_col_indices;
-    if (doublequote_enabled) {
-      for (size_t i = 0; i < column_types.size(); ++i) {
-        if (column_types[i].id() == type_id::STRING) { string_col_indices.push_back(i); }
+    // Quoted string fields with escaped quotes are unescaped in place in the reader's copy of the
+    // data, or into scratch memory when the data is the source's, which must not be modified. The
+    // scratch memory is only needed if there can be such fields.
+    rmm::device_uvector<char> unescape_scratch{0, stream};
+    auto const unescape_buffer = [&]() -> device_span<char> {
+      if (data_row_offsets.source_data == nullptr) { return data_row_offsets.owned_data; }
+      auto const has_string_columns =
+        std::any_of(column_types.begin(), column_types.end(), [](auto const& type) {
+          return type.id() == type_id::STRING;
+        });
+      if (parse_opts.doublequote and has_string_columns and
+          data_row_offsets.has_consecutive_quotes) {
+        unescape_scratch.resize(data.size(), stream);
       }
-    }
-
-    // Process string columns with doublequote handling in parallel using thread pool
-    auto const num_string_cols = string_col_indices.size();
-    if (num_string_cols > 0) {
-      auto const quotechar = parse_opts.quotechar;
-      cudf::string_scalar quotechar_scalar(
-        std::string(1, quotechar), true, stream, cudf::get_current_device_resource_ref());
-      cudf::string_scalar dblquotechar_scalar(
-        std::string(2, quotechar), true, stream, cudf::get_current_device_resource_ref());
-      constexpr size_t max_tasks = 4;
-      auto const cols_per_task   = cudf::util::div_rounding_up_safe(num_string_cols, max_tasks);
-      auto const num_tasks       = cudf::util::div_rounding_up_safe(num_string_cols, cols_per_task);
-      auto streams               = cudf::detail::fork_streams(stream, num_tasks);
-
-      auto process_string_column = [&](size_t str_col_idx, cuda::stream_ref col_stream) {
-        auto const col_idx   = string_col_indices[str_col_idx];
-        auto const is_quoted = device_span<bool>(is_quoted_flags[str_col_idx]);
-        auto* buffer         = &out_buffers[col_idx];
-
-        // Count how many rows were quoted to determine the fast path
-        auto const num_quoted = thrust::count(
-          rmm::exec_policy_nosync(col_stream, cudf::get_current_device_resource_ref()),
-          is_quoted.begin(),
-          is_quoted.end(),
-          true);
-        if (num_quoted == 0) {
-          // Fast path: no rows were quoted, skip replacement entirely
-          out_columns[col_idx] = make_column(*buffer, nullptr, std::nullopt, col_stream);
-        } else {
-          auto replaced_all_col = cudf::strings::detail::replace(
-            cudf::make_strings_column(
-              *buffer->_strings, col_stream, cudf::get_current_device_resource_ref())
-              ->view(),
-            dblquotechar_scalar,
-            quotechar_scalar,
-            -1,
-            col_stream,
-            mr);
-          if (std::cmp_equal(num_quoted, num_records)) {
-            // Fast path: all rows were quoted, apply replacement to all
-            out_columns[col_idx] = std::move(replaced_all_col);
-          } else {
-            // Need to replace only the quoted rows
-            auto const replaced_all_view =
-              cudf::column_device_view::create(replaced_all_col->view(), col_stream);
-            auto const replaced_all_iter = cudf::detail::make_optional_iterator<cudf::string_view>(
-              *replaced_all_view, cudf::nullate::DYNAMIC{replaced_all_col->nullable()});
-
-            auto const original_iter = cuda::transform_iterator(
-              buffer->_strings->data(),
-              cuda::proclaim_return_type<cuda::std::optional<cudf::string_view>>(
-                [] __device__(auto const& pair) -> cuda::std::optional<cudf::string_view> {
-                  return pair.first != nullptr
-                           ? cuda::std::optional<cudf::string_view>{cudf::string_view{pair.first,
-                                                                                      pair.second}}
-                           : cuda::std::nullopt;
-                }));
-
-            out_columns[col_idx] = cudf::strings::detail::copy_if_else(
-              replaced_all_iter,
-              replaced_all_iter + num_records,
-              original_iter,
-              [is_quoted] __device__(size_type idx) { return is_quoted[idx]; },
-              col_stream,
-              mr);
-          }
-        }
-      };
-
-      std::vector<std::future<void>> tasks;
-      tasks.reserve(num_tasks);
-
-      for (size_t task_id = 0; task_id < num_tasks; ++task_id) {
-        auto const start_col  = task_id * cols_per_task;
-        auto const end_col    = std::min(start_col + cols_per_task, num_string_cols);
-        auto const col_stream = streams[task_id];
-        tasks.emplace_back(
-          cudf::detail::host_worker_pool().submit_task([&, start_col, end_col, col_stream]() {
-            for (size_t str_col_idx = start_col; str_col_idx < end_col; ++str_col_idx) {
-              process_string_column(str_col_idx, col_stream);
-            }
-          }));
-      }
-
-      for (auto& task : tasks) {
-        task.get();
-      }
-
-      cudf::detail::join_streams(streams, stream);
-
-      for (auto const col_idx : string_col_indices) {
-        if (out_columns[col_idx]) {
-          out_columns[col_idx] = cudf::rebind_stream(std::move(*out_columns[col_idx]), stream);
-        }
-      }
-    }
-
-    // Create output columns for the columns that were not processed in the parallel loop
-    for (size_t i = 0; i < column_types.size(); ++i) {
-      if (!out_columns[i]) {
-        out_columns[i] = make_column(out_buffers[i], nullptr, std::nullopt, stream);
-      }
-    }
-
-    for (size_t i = 0; i < column_types.size(); ++i) {
-      metadata.schema_info.emplace_back(out_buffers[i].name);
-    }
+      return unescape_scratch;
+    }();
+    out_columns = decode_data(parse_opts,
+                              column_flags,
+                              data,
+                              unescape_buffer,
+                              row_offsets,
+                              data_row_offsets.row_staging_size,
+                              column_types,
+                              num_records,
+                              num_active_columns,
+                              stream,
+                              mr);
   } else {
     // Create empty columns
     for (auto column_type : column_types) {
       out_columns.emplace_back(make_empty_column(column_type));
     }
-    // Handle empty metadata
-    for (int col = 0; col < num_actual_columns; ++col) {
-      if (column_flags[col] & column_parse::enabled) {
-        metadata.schema_info.emplace_back(column_names[col]);
-      }
+  }
+  for (int col = 0; col < num_actual_columns; ++col) {
+    if (column_flags[col] & column_parse::enabled) {
+      metadata.schema_info.emplace_back(column_names[col]);
     }
   }
   return {std::make_unique<table>(std::move(out_columns)), std::move(metadata)};
 }
 
 /**
- * @brief Create a serialized trie for N/A value matching, based on the options.
+ * @brief Returns the values to match as N/A values, based on the options.
  */
-cudf::detail::trie create_na_trie(char quotechar,
-                                  csv_reader_options const& reader_opts,
-                                  cuda::stream_ref stream)
+std::vector<std::string> get_na_values(char quotechar, csv_reader_options const& reader_opts)
 {
   // Default values to recognize as null values
   static std::vector<std::string> const default_na_values{"",
@@ -1126,7 +1203,7 @@ cudf::detail::trie create_na_trie(char quotechar,
                                                           "nan",
                                                           "null"};
 
-  if (!reader_opts.is_enabled_na_filter()) { return cudf::detail::trie(0, stream); }
+  if (!reader_opts.is_enabled_na_filter()) { return {}; }
 
   std::vector<std::string> na_values = reader_opts.get_na_values();
   if (reader_opts.is_enabled_keep_default_na()) {
@@ -1138,7 +1215,7 @@ cudf::detail::trie create_na_trie(char quotechar,
     na_values.emplace_back(2, quotechar);
   }
 
-  return cudf::detail::create_serialized_trie(na_values, stream);
+  return na_values;
 }
 
 parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::stream_ref stream)
@@ -1178,22 +1255,15 @@ parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::st
   CUDF_EXPECTS(parse_opts.thousands != parse_opts.delimiter,
                "Thousands separator cannot be the same as the delimiter");
 
-  // Handle user-defined true values, whereby field data is substituted with a
-  // boolean true or numeric `1` value
-  if (not reader_opts.get_true_values().empty()) {
-    parse_opts.trie_true =
-      cudf::detail::create_serialized_trie(reader_opts.get_true_values(), stream);
-  }
-
-  // Handle user-defined false values, whereby field data is substituted with a
-  // boolean false or numeric `0` value
-  if (not reader_opts.get_false_values().empty()) {
-    parse_opts.trie_false =
-      cudf::detail::create_serialized_trie(reader_opts.get_false_values(), stream);
-  }
-
-  // Handle user-defined N/A values, whereby field data is treated as null
-  parse_opts.trie_na = create_na_trie(parse_opts.quotechar, reader_opts, stream);
+  // Fields that match the true (false) values are substituted with a boolean true (false) or a
+  // numeric 1 (0) value, and fields that match the N/A values are null
+  auto const key_sets   = std::vector{reader_opts.get_true_values(),
+                                    reader_opts.get_false_values(),
+                                    get_na_values(parse_opts.quotechar, reader_opts)};
+  auto tries            = cudf::detail::create_serialized_tries(key_sets, stream);
+  parse_opts.trie_true  = std::move(tries[0]);
+  parse_opts.trie_false = std::move(tries[1]);
+  parse_opts.trie_na    = std::move(tries[2]);
 
   return parse_opts;
 }

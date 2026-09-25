@@ -18,7 +18,14 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/cmath>
 #include <cuda/stream>
+
+#include <array>
+#include <cstddef>
+#include <tuple>
+#include <type_traits>
+#include <utility>
 
 namespace cudf::detail {
 
@@ -219,6 +226,100 @@ class hostdevice_2dvector {
  private:
   hostdevice_vector<T> _data;
   typename host_2dspan<T>::size_type _size;
+};
+
+/**
+ * @brief Arrays of different element types, stored together in one `hostdevice_vector`.
+ *
+ * Kernels often take several small arrays, such as per-column pointers, types and flags. Storing
+ * them together copies them between the host and the device with one copy instead of one per
+ * array, and allocates their pinned host memory, which synchronizes the stream, once.
+ *
+ * Each array starts at an offset of the storage that is aligned for its element type. The arrays
+ * are copied between the host and the device together, with `host_to_device_async` and
+ * `device_to_host`, which, like those of `hostdevice_vector`, skip the copies when the device
+ * accesses the host memory directly (the integrated memory optimization). The copy functions of
+ * the returned spans always copy, and should not be used instead.
+ *
+ * The spans refer to the storage of the object, which must outlive the work on the stream that
+ * uses them.
+ *
+ * @tparam Ts The element types of the arrays, which must be trivially copyable
+ */
+template <typename... Ts>
+class hostdevice_arrays {
+  static_assert((std::is_trivially_copyable_v<Ts> and ...),
+                "Only arrays of trivially copyable types can be copied as bytes");
+  static_assert(((alignof(Ts) <= alignof(std::max_align_t)) and ...),
+                "The storage is only aligned for fundamental types");
+
+  static constexpr std::size_t num_arrays = sizeof...(Ts);
+
+ public:
+  /**
+   * @brief Allocates the arrays, without initializing them.
+   *
+   * @param sizes The number of elements of each array
+   * @param stream CUDA stream used for the allocations
+   */
+  hostdevice_arrays(std::array<std::size_t, num_arrays> const& sizes, cuda::stream_ref stream)
+    : _sizes{sizes}, _offsets{byte_offsets(sizes)}, _storage{storage_size(_offsets), stream}
+  {
+  }
+
+  /**
+   * @brief Returns the arrays, in the order of their element types.
+   */
+  [[nodiscard]] std::tuple<hostdevice_span<Ts>...> spans()
+  {
+    return spans(std::index_sequence_for<Ts...>{});
+  }
+
+  /**
+   * @brief Copies all arrays from the host to the device.
+   */
+  void host_to_device_async(cuda::stream_ref stream) { _storage.host_to_device_async(stream); }
+
+  /**
+   * @brief Copies all arrays from the device to the host, and synchronizes `stream`.
+   */
+  void device_to_host(cuda::stream_ref stream) { _storage.device_to_host(stream); }
+
+ private:
+  using storage_type = std::max_align_t;
+
+  /// Offset in bytes of each array, followed by the end of the last array
+  static std::array<std::size_t, num_arrays + 1> byte_offsets(
+    std::array<std::size_t, num_arrays> const& sizes)
+  {
+    constexpr std::array<std::size_t, num_arrays> alignments{alignof(Ts)...};
+    constexpr std::array<std::size_t, num_arrays> element_sizes{sizeof(Ts)...};
+    std::array<std::size_t, num_arrays + 1> offsets{};
+    for (std::size_t i = 0; i < num_arrays; ++i) {
+      offsets[i]     = cuda::round_up(offsets[i], alignments[i]);
+      offsets[i + 1] = offsets[i] + sizes[i] * element_sizes[i];
+    }
+    return offsets;
+  }
+
+  static std::size_t storage_size(std::array<std::size_t, num_arrays + 1> const& offsets)
+  {
+    return cuda::ceil_div(offsets.back(), sizeof(storage_type));
+  }
+
+  template <std::size_t... Is>
+  std::tuple<hostdevice_span<Ts>...> spans(std::index_sequence<Is...>)
+  {
+    auto* const host   = reinterpret_cast<std::byte*>(_storage.host_ptr());
+    auto* const device = reinterpret_cast<std::byte*>(_storage.device_ptr());
+    return {hostdevice_span<Ts>{
+      host_span<Ts>{reinterpret_cast<Ts*>(host + _offsets[Is]), _sizes[Is], true},
+      reinterpret_cast<Ts*>(device + _offsets[Is])}...};
+  }
+
+  std::array<std::size_t, num_arrays> _sizes;
+  std::array<std::size_t, num_arrays + 1> _offsets;
+  hostdevice_vector<storage_type> _storage;
 };
 
 }  // namespace cudf::detail

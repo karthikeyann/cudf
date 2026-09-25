@@ -10,90 +10,124 @@
 
 #include "trie.cuh"
 
+#include <cudf/detail/utilities/cuda.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/utilities/error.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
-#include <cuda_runtime.h>
-
-#include <deque>
+#include <algorithm>
+#include <limits>
+#include <queue>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace cudf {
 namespace detail {
+namespace {
+
+/**
+ * @brief Serializes the trie of a non-empty set of keys on the host.
+ *
+ * The distinct keys are sorted, and the trie is built breadth-first from the sorted keys: the keys
+ * below a node (the keys that start with its prefix) are consecutive, the key equal to the prefix,
+ * if any, comes first, and the others are grouped by their next character in ascending order. So
+ * each group is a child of the node, listed in the order that `serialized_trie_contains` relies on,
+ * and a child is the end of a key if the first key of its group ends with it.
+ *
+ * `std::string_view` compares characters with `std::char_traits<char>::lt`, which compares them as
+ * `unsigned char`, the order of the children in the serialized trie.
+ */
+std::vector<serial_trie_node> serialize_trie(std::vector<std::string> const& keys)
+{
+  std::vector<std::string_view> sorted_keys(keys.begin(), keys.end());
+  std::sort(sorted_keys.begin(), sorted_keys.end());
+  sorted_keys.erase(std::unique(sorted_keys.begin(), sorted_keys.end()), sorted_keys.end());
+
+  // The root matches the empty key, which sorts first. Its children follow it, where lookups start,
+  // so its `children_offset` holds the length of the longest key instead.
+  auto const max_key_length =
+    std::max_element(sorted_keys.begin(), sorted_keys.end(), [](auto const& lhs, auto const& rhs) {
+      return lhs.size() < rhs.size();
+    })->size();
+  CUDF_EXPECTS(max_key_length <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+               "Trie keys are too long",
+               std::overflow_error);
+  std::vector<serial_trie_node> nodes;
+  nodes.emplace_back(trie_terminating_character, sorted_keys.front().empty());
+  nodes.front().children_offset = static_cast<int32_t>(max_key_length);
+
+  // A node whose children are yet to be serialized: the keys [first_key, last_key) are the keys
+  // below it, whose first `depth` characters are its prefix
+  struct pending_node {
+    size_t first_key;
+    size_t last_key;
+    size_t depth;
+    size_t index;
+  };
+  std::queue<pending_node> to_visit;
+  to_visit.push({0, sorted_keys.size(), 0, 0});
+  while (not to_visit.empty()) {
+    auto const node = to_visit.front();
+    to_visit.pop();
+
+    auto key = node.first_key;
+    if (sorted_keys[key].size() == node.depth) { ++key; }
+    // A node without children has no children list, and keeps a negative `children_offset`
+    if (key == node.last_key) { continue; }
+
+    if (node.index != 0) {
+      auto const offset = nodes.size() - node.index;
+      CUDF_EXPECTS(offset <= static_cast<size_t>(std::numeric_limits<int32_t>::max()),
+                   "Too many keys to build a serialized trie",
+                   std::overflow_error);
+      nodes[node.index].children_offset = static_cast<int32_t>(offset);
+    }
+    while (key < node.last_key) {
+      auto const character = sorted_keys[key][node.depth];
+      auto const group_end =
+        std::find_if(sorted_keys.begin() + key + 1,
+                     sorted_keys.begin() + node.last_key,
+                     [&](auto const& other) { return other[node.depth] != character; }) -
+        sorted_keys.begin();
+      nodes.emplace_back(character, sorted_keys[key].size() == node.depth + 1);
+      to_visit.push({key, static_cast<size_t>(group_end), node.depth + 1, nodes.size() - 1});
+      key = group_end;
+    }
+    nodes.emplace_back(trie_terminating_character);
+  }
+  return nodes;
+}
+
+}  // namespace
 
 rmm::device_uvector<serial_trie_node> create_serialized_trie(std::vector<std::string> const& keys,
                                                              cuda::stream_ref stream)
 {
   if (keys.empty()) { return rmm::device_uvector<serial_trie_node>{0, stream}; }
+  return cudf::detail::make_device_uvector(
+    serialize_trie(keys), stream, cudf::get_current_device_resource_ref());
+}
 
-  static constexpr int alphabet_size = std::numeric_limits<char>::max() + 1;
-  struct TreeTrieNode {
-    using TrieNodePtr = std::unique_ptr<TreeTrieNode>;
-    std::array<TrieNodePtr, alphabet_size> children;
-    bool is_end_of_word = false;
-  };
-
-  // Construct a tree-structured trie
-  // The trie takes a lot of memory, but the lookup is fast:
-  // allows direct addressing of children nodes
-  TreeTrieNode tree_trie;
-  for (auto const& key : keys) {
-    auto* current_node = &tree_trie;
-
-    for (char const character : key) {
-      if (current_node->children[character] == nullptr)
-        current_node->children[character] = std::make_unique<TreeTrieNode>();
-
-      current_node = current_node->children[character].get();
-    }
-
-    current_node->is_end_of_word = true;
+std::vector<rmm::device_uvector<serial_trie_node>> create_serialized_tries(
+  host_span<std::vector<std::string> const> key_sets, cuda::stream_ref stream)
+{
+  std::vector<std::vector<serial_trie_node>> host_tries;
+  std::vector<rmm::device_uvector<serial_trie_node>> tries;
+  host_tries.reserve(key_sets.size());
+  tries.reserve(key_sets.size());
+  for (auto const& keys : key_sets) {
+    host_tries.push_back(keys.empty() ? std::vector<serial_trie_node>{} : serialize_trie(keys));
+    tries.push_back(cudf::detail::make_device_uvector_async(
+      host_tries.back(), stream, cudf::get_current_device_resource_ref()));
   }
-
-  struct IndexedTrieNode {
-    TreeTrieNode const* const pnode;
-    int16_t const idx;
-    IndexedTrieNode(TreeTrieNode const* const node, int16_t index) : pnode(node), idx(index) {}
-  };
-
-  // Serialize the tree trie
-  std::deque<IndexedTrieNode> to_visit;
-  std::vector<serial_trie_node> nodes;
-
-  // If the Tree trie matches empty strings, the root node is marked as 'end of word'.
-  // The first node in the serialized trie is also used to match empty strings, so we're
-  // initializing it using the `is_end_of_word` value from the root node.
-  nodes.push_back(serial_trie_node(trie_terminating_character, tree_trie.is_end_of_word));
-
-  // Add root node to queue. this node is not included to the serialized trie
-  to_visit.emplace_back(&tree_trie, -1);
-  while (!to_visit.empty()) {
-    auto const node_and_idx = to_visit.front();
-    auto const node         = node_and_idx.pnode;
-    auto const idx          = node_and_idx.idx;
-    to_visit.pop_front();
-
-    bool has_children = false;
-    for (size_t i = 0; i < node->children.size(); ++i) {
-      if (node->children[i] != nullptr) {
-        // Update the children offset of the parent node, unless at the root
-        if (idx >= 0 && nodes[idx].children_offset < 0) {
-          nodes[idx].children_offset = static_cast<uint16_t>(nodes.size() - idx);
-        }
-        // Add node to the trie
-        nodes.emplace_back(static_cast<char>(i), node->children[i]->is_end_of_word);
-        // Add to the queue, with the index within the new trie
-        to_visit.emplace_back(node->children[i].get(), static_cast<uint16_t>(nodes.size()) - 1);
-
-        has_children = true;
-      }
-    }
-    // Only add the terminating character if any nodes were added
-    if (has_children) { nodes.emplace_back(trie_terminating_character); }
-  }
-  return cudf::detail::make_device_uvector(nodes, stream, cudf::get_current_device_resource_ref());
+  // The copies may read the host nodes only when the stream reaches them (see
+  // `cudf::detail::memcpy_batch_async`), so the nodes must stay alive until the stream is
+  // synchronized: once for all tries, instead of once per trie as in `create_serialized_trie`
+  cudf::detail::sync_stream(stream);
+  return tries;
 }
 
 }  // namespace detail

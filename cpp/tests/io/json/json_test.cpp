@@ -16,6 +16,7 @@
 #include <cudf_test/testing_main.hpp>
 #include <cudf_test/type_lists.hpp>
 
+#include <cudf/copying.hpp>
 #include <cudf/detail/iterator.cuh>
 #include <cudf/dictionary/dictionary_column_view.hpp>
 #include <cudf/io/detail/codec.hpp>
@@ -29,8 +30,10 @@
 
 #include <cuda/iterator>
 
+#include <bit>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <memory>
 #include <type_traits>
 
@@ -2356,6 +2359,187 @@ TEST_F(JsonReaderTest, ValueValidation)
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), b_column);
     CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(2), c_column);
   }
+}
+
+TEST_F(JsonReaderTest, FloatingPointBits)
+{
+  // Floating-point parsing is shared with the CSV reader; these values are checked bit for bit
+  auto const read_values = [](std::vector<std::string> const& values, type_id type) {
+    std::string data;
+    for (auto const& value : values) {
+      data += "{\"a\": " + value + "}\n";
+    }
+    cudf::io::json_reader_options const in_options =
+      cudf::io::json_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+        .lines(true)
+        .dtypes(std::map<std::string, data_type>{{"a", data_type{type}}});
+    return cudf::io::read_json(in_options);
+  };
+  auto const expect_bits = []<typename T>(std::vector<T> const& expected,
+                                          cudf::io::table_with_metadata const& result) {
+    using bits_type = std::conditional_t<sizeof(T) == 8, int64_t, int32_t>;
+    std::vector<bits_type> bits;
+    for (auto const value : expected) {
+      bits.push_back(std::bit_cast<bits_type>(value));
+    }
+    CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+      wrapper<bits_type>(bits.begin(), bits.end()),
+      cudf::bit_cast(result.tbl->get_column(0).view(), data_type{type_to_id<bits_type>()}));
+  };
+
+  // A single nonzero fraction digit: its place value is 1 divided by 10 once per preceding digit
+  // and once more, each division rounded, and underflows to zero after the 323rd digit
+  std::vector<std::string> fractions{"-0"};
+  std::vector<double> doubles{-0.0};
+  std::vector<float> floats{-0.0f};
+  double place_value = 1;
+  for (int position = 1; position <= 324; ++position) {
+    place_value /= 10;
+    if (position <= 2 or position >= 322) {
+      fractions.push_back("0." + std::string(position - 1, '0') + "7");
+      doubles.push_back(7 * place_value);
+      floats.push_back(static_cast<float>(7 * place_value));
+    }
+  }
+  expect_bits(doubles, read_values(fractions, type_id::FLOAT64));
+  expect_bits(floats, read_values(fractions, type_id::FLOAT32));
+
+  // Whole digits of doubles: exact up to 16 digits, rounded at the 16th (2^53 + 1 rounds to even);
+  // they end at an upper-case exponent too
+  expect_bits(
+    std::vector<double>{1234567890123456.0, 9007199254740992.0, 100000.0, -250.0},
+    read_values({"1234567890123456", "9007199254740993", "1E5", "-2.5E2"}, type_id::FLOAT64));
+}
+
+TEST_F(JsonReaderTest, TimestampsWithIncompleteTimeOfDay)
+{
+  auto const read_timestamps = [](std::string const& data) {
+    cudf::io::json_reader_options const in_options =
+      cudf::io::json_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+        .lines(true)
+        .dtypes(
+          std::map<std::string, data_type>{{"a", data_type{type_id::TIMESTAMP_MILLISECONDS}}});
+    return cudf::io::read_json(in_options);
+  };
+
+  // Each value but the last lacks separators or digits in the time of day. The last row is
+  // well-formed and holds the separators that a parser reading past the end of the preceding
+  // values would find.
+  auto const result = read_timestamps(
+    "{\"a\": \"2024-01-01T10\"}\n"
+    "{\"a\": \"2024-01-01 \"}\n"
+    "{\"a\": \"2024-01-01T11:30:00.500\"}\n");
+  using namespace cuda::std::chrono_literals;
+  auto constexpr midnight = 1704067200000ms;  // 2024-01-01T00:00:00
+  auto const expected     = timestamp_ms_wrapper{
+    (midnight + 10h).count(), midnight.count(), (midnight + 11h + 30min + 500ms).count()};
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected, result.tbl->get_column(0));
+
+  // A time of day without a date has no date separators; the value parsed from it must not depend
+  // on the values that follow
+  auto const time_only_first = read_timestamps(
+    "{\"a\": \"10:30\"}\n"
+    "{\"a\": \"2001-02-03\"}\n");
+  auto const time_only_second = read_timestamps(
+    "{\"a\": \"10:30\"}\n"
+    "{\"a\": \"1999-12-31T23:59\"}\n");
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::slice(time_only_first.tbl->get_column(0), {0, 1}).front(),
+                                 cudf::slice(time_only_second.tbl->get_column(0), {0, 1}).front());
+}
+
+TEST_F(JsonReaderTest, FixedLayoutIsoTimestamps)
+{
+  // Timestamps with the layout `YYYY-MM-DD[T ]HH:MM:SS[Z|.fraction]` are parsed without searching
+  // for their separators. Each must parse as the same string with '/' as date separator, which
+  // takes the general parsing. So must near misses of the layout, which take it too.
+  std::string data;
+  for (auto const& value : cudf::test::iso_8601_timestamp_test_strings()) {
+    data += "{\"a\": \"" + value + "\", \"b\": \"" + cudf::test::with_slash_date_separators(value) +
+            "\"}\n";
+  }
+
+  for (auto const type : {type_id::TIMESTAMP_SECONDS, type_id::TIMESTAMP_NANOSECONDS}) {
+    for (bool const dayfirst : {false, true}) {
+      cudf::io::json_reader_options const in_options =
+        cudf::io::json_reader_options::builder(
+          cudf::io::source_info{cudf::host_span<std::byte const>{
+            reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+          .lines(true)
+          .dayfirst(dayfirst)
+          .dtypes(std::map<std::string, data_type>{{"a", data_type{type}}, {"b", data_type{type}}});
+      auto const result = cudf::io::read_json(in_options);
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->get_column(1), result.tbl->get_column(0));
+    }
+  }
+}
+
+TEST_F(JsonReaderTest, NaValuesDoNotMatchLongerValues)
+{
+  // The values that are not null extend an NA value with characters that occur in the NA values
+  std::string const data = "{\"a\": 1}\n{\"a\": 22}\n{\"a\": 2}\n{\"a\": 21}\n{\"a\": 12}\n";
+
+  cudf::io::json_reader_options const in_options =
+    cudf::io::json_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+      .lines(true)
+      .na_values({"1", "2"});
+  auto const result = cudf::io::read_json(in_options);
+
+  ASSERT_EQ(result.tbl->num_columns(), 1);
+  auto const expected = int64_wrapper{{0, 22, 0, 21, 12}, {false, true, false, true, true}};
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->get_column(0));
+}
+
+TEST_F(JsonReaderTest, NonAsciiNaValues)
+{
+  auto const read_json = [](std::string const& data, std::vector<std::string> na_values) {
+    cudf::io::json_reader_options const in_options =
+      cudf::io::json_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<std::byte const>{
+          reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+        .lines(true)
+        .na_values(std::move(na_values));
+    return cudf::io::read_json(in_options);
+  };
+
+  // "é" is a two-byte UTF-8 sequence whose bytes are negative as signed char. NA values are matched
+  // against the raw values, unquoted (accepted outside of strict mode) or including the quotes.
+  auto const unquoted = read_json("{\"a\": é}\n{\"a\": éé}\n", {"é"});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"", "éé"}, {false, true}),
+                                 unquoted.tbl->get_column(0));
+  auto const quoted = read_json("{\"a\": \"é\"}\n{\"a\": \"b\"}\n", {"\"é\""});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(cudf::test::strings_column_wrapper({"", "b"}, {false, true}),
+                                 quoted.tbl->get_column(0));
+}
+
+TEST_F(JsonReaderTest, NaValuesOfLargeTries)
+{
+  // The trie of 40000 keys of six characters has more than 44000 nodes, and the children of the
+  // last nodes of its fifth level are more than 32767 nodes after them
+  std::vector<std::string> na_values;
+  for (int i = 0; i < 40000; ++i) {
+    auto const digits = std::to_string(i);
+    na_values.push_back("k" + std::string(5 - digits.size(), '0') + digits);
+  }
+  std::string const data =
+    "{\"a\": k00000}\n{\"a\": k39999}\n{\"a\": k3999}\n{\"a\": k399990}\n{\"a\": x}\n";
+
+  cudf::io::json_reader_options const in_options =
+    cudf::io::json_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(data.data()), data.size()}})
+      .lines(true)
+      .na_values(na_values);
+  auto const result = cudf::io::read_json(in_options);
+
+  auto const expected = cudf::test::strings_column_wrapper({"", "", "k3999", "k399990", "x"},
+                                                           {false, false, true, true, true});
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->get_column(0));
 }
 
 TEST_F(JsonReaderTest, MixedTypes)

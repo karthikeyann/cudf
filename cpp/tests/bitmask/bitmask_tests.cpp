@@ -341,6 +341,27 @@ TEST_F(CountBitmaskTest, BatchNullCount)
               ::testing::ElementsAreArray(std::vector<cudf::size_type>{3, 3, 2, 1, 6, 0}));
 }
 
+TEST_F(CountBitmaskTest, BatchNullCountManyBitmasks)
+{
+  // More bitmasks than the second dimension of a grid can index
+  constexpr std::size_t num_bitmasks = 70'000;
+  constexpr cudf::size_type num_bits = 100;
+  // Masks with 0, 1 and 2 nulls
+  std::vector<rmm::device_buffer> masks;
+  for (int num_nulls = 0; num_nulls < 3; ++num_nulls) {
+    std::vector<bool> validity(num_bits, true);
+    std::fill_n(validity.begin(), num_nulls, false);
+    masks.push_back(cudf::test::detail::make_null_mask(validity.begin(), validity.end()).first);
+  }
+  std::vector<cudf::bitmask_type const*> bitmasks;
+  std::vector<cudf::size_type> expected;
+  for (std::size_t i = 0; i < num_bitmasks; ++i) {
+    bitmasks.push_back(static_cast<cudf::bitmask_type const*>(masks[i % masks.size()].data()));
+    expected.push_back(static_cast<cudf::size_type>(i % masks.size()));
+  }
+  EXPECT_EQ(cudf::batch_null_count(bitmasks, 0, num_bits), expected);
+}
+
 struct iofub_test_parameter {
   cudf::size_type size;
   cudf::size_type set_index;

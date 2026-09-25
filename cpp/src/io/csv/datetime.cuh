@@ -44,6 +44,22 @@ __inline__ __device__ T to_non_negative_integer(char const* begin, char const* e
 }
 
 /**
+ * @brief Returns the position that follows a separator found by searching a range ending at `end`.
+ *
+ * A search that finds no separator returns `end`; the position after it would lie outside the
+ * range, so `end` is returned instead. Every range that starts after a separator (to search for the
+ * next separator, or to parse the next component) is thus non-inverted and within the field.
+ *
+ * @param sep_pos Result of the separator search: the separator position, or `end` if not found
+ * @param end Pointer to the first element after the searched range
+ * @return Pointer to the first element after the separator, or `end` if no separator was found
+ */
+__inline__ __device__ char const* next_after(char const* sep_pos, char const* end)
+{
+  return sep_pos < end ? sep_pos + 1 : end;
+}
+
+/**
  * @brief Extracts the Day, Month, and Year from a string.
  *
  * This function takes a string and produces a `year_month_day` representation.
@@ -79,7 +95,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     y = year{to_non_negative_integer<int32_t>(begin, sep_pos)};  //  year is signed
 
     // Month
-    auto s2 = sep_pos + 1;
+    auto s2 = next_after(sep_pos, end);
     sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
     if (sep_pos == end) {
@@ -89,7 +105,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
 
     } else {
       m = month{to_non_negative_integer<uint32_t>(s2, sep_pos)};
-      d = day{to_non_negative_integer<uint32_t>((sep_pos + 1), end)};
+      d = day{to_non_negative_integer<uint32_t>(next_after(sep_pos, end), end)};
     }
 
   } else {
@@ -97,16 +113,16 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
     if (dayfirst) {
       d = day{to_non_negative_integer<uint32_t>(begin, sep_pos)};
 
-      auto s2 = sep_pos + 1;
+      auto s2 = next_after(sep_pos, end);
       sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
       m = month{to_non_negative_integer<uint32_t>(s2, sep_pos)};
-      y = year{to_non_negative_integer<int32_t>((sep_pos + 1), end)};
+      y = year{to_non_negative_integer<int32_t>(next_after(sep_pos, end), end)};
 
     } else {
       m = month{to_non_negative_integer<uint32_t>(begin, sep_pos)};
 
-      auto s2 = sep_pos + 1;
+      auto s2 = next_after(sep_pos, end);
       sep_pos = thrust::find(thrust::seq, s2, end, sep);
 
       if (sep_pos == end) {
@@ -116,7 +132,7 @@ __inline__ __device__ cuda::std::chrono::year_month_day extract_date(char const*
 
       } else {
         d = day{to_non_negative_integer<uint32_t>(s2, sep_pos)};
-        y = year{to_non_negative_integer<int32_t>((sep_pos + 1), end)};
+        y = year{to_non_negative_integer<int32_t>(next_after(sep_pos, end), end)};
       }
     }
   }
@@ -143,17 +159,16 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
 {
   constexpr char sep = ':';
 
-  // Adjust for AM/PM and any whitespace before
+  // Adjust for AM/PM and any whitespace before. The field can be shorter than the suffix (e.g. a
+  // lone "M"), so the checks never look before `begin`.
   duration_h d_h{0};
-  auto last = end - 1;
-  if (*last == 'M' || *last == 'm') {
-    if (*(last - 1) == 'P' || *(last - 1) == 'p') { d_h = duration_h{12}; }
-    last = last - 2;
-    while (*last == ' ') {
-      --last;
+  if (end > begin && (end[-1] == 'M' || end[-1] == 'm')) {
+    if (end - begin >= 2 && (end[-2] == 'P' || end[-2] == 'p')) { d_h = duration_h{12}; }
+    end = (end - begin >= 2) ? end - 2 : begin;
+    while (end > begin && end[-1] == ' ') {
+      --end;
     }
   }
-  end = last + 1;
 
   // Find hour-minute separator
   auto const hm_sep = thrust::find(thrust::seq, begin, end, sep);
@@ -165,11 +180,12 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
   duration_ms d_ms{0};
 
   // Find minute-second separator (if present)
-  auto const ms_sep = thrust::find(thrust::seq, hm_sep + 1, end, sep);
+  auto const minutes_begin = next_after(hm_sep, end);
+  auto const ms_sep        = thrust::find(thrust::seq, minutes_begin, end, sep);
   if (ms_sep == end) {
-    d_m = duration_m{to_non_negative_integer<int32_t>(hm_sep + 1, end)};
+    d_m = duration_m{to_non_negative_integer<int32_t>(minutes_begin, end)};
   } else {
-    d_m = duration_m{to_non_negative_integer<int32_t>(hm_sep + 1, ms_sep)};
+    d_m = duration_m{to_non_negative_integer<int32_t>(minutes_begin, ms_sep)};
 
     // Find second-millisecond separator (if present)
     auto const sms_sep = thrust::find(thrust::seq, ms_sep + 1, end, '.');
@@ -187,6 +203,73 @@ __inline__ __device__ cuda::std::chrono::hh_mm_ss<duration_ms> extract_time_of_d
  * @brief Checks whether `c` is decimal digit
  */
 __device__ constexpr bool is_digit(char c) { return c >= '0' and c <= '9'; }
+
+/**
+ * @brief Checks whether a timestamp string has the fixed ISO 8601 layout `YYYY-MM-DDTHH:MM:SS`,
+ * with 'T' or ' ' between date and time, followed by nothing, by 'Z', or by '.' and a fraction
+ * that does not end with 'M' or 'm' (which `to_timestamp` would take for an AM/PM suffix).
+ *
+ * The characters after the '.' are not checked: they are parsed as the milliseconds, as
+ * `to_timestamp` parses them.
+ *
+ * @param begin Pointer to the first element of the string
+ * @param end Pointer to the first element after the string
+ * @return Whether the string has the layout
+ */
+__inline__ __device__ bool has_fixed_iso_8601_layout(char const* begin, char const* end)
+{
+  auto const digit_at = [begin](int i) { return is_digit(begin[i]); };
+  return end - begin >= 19 and digit_at(0) and digit_at(1) and digit_at(2) and digit_at(3) and
+         begin[4] == '-' and digit_at(5) and digit_at(6) and begin[7] == '-' and digit_at(8) and
+         digit_at(9) and (begin[10] == 'T' or begin[10] == ' ') and digit_at(11) and
+         digit_at(12) and begin[13] == ':' and digit_at(14) and digit_at(15) and
+         begin[16] == ':' and digit_at(17) and digit_at(18) and
+         (end - begin == 19 or (end - begin == 20 and begin[19] == 'Z') or
+          (begin[19] == '.' and end[-1] != 'M' and end[-1] != 'm'));
+}
+
+/**
+ * @brief Parses a timestamp string of the layout accepted by `has_fixed_iso_8601_layout`.
+ *
+ * Gives the same result as the general parsing of `to_timestamp`, whose separator searches find
+ * the separators of such strings at their fixed positions:
+ * - The date ends at position 10: the search for its end sees no 'T' before it, and counts the
+ *   two '-' and the digit after the second one, so that a ' ' at position 10 also ends it.
+ * - `extract_date` finds no '/', so it splits the date at the first '-' (position 4, so the year
+ *   comes first whatever `dayfirst` is) and at the next one (position 7).
+ * - `extract_time_of_day` sees no AM/PM suffix. It finds the first ':' at position 13, the next
+ *   one at position 16, and the first '.' after it at position 19, if the string has one.
+ *   Otherwise it parses the seconds from position 17 to the end, where the only characters after
+ *   the two digits are an ignored 'Z', if any.
+ *
+ * The components are then parsed from the same digits, into the same types, and combined the same
+ * way.
+ *
+ * @tparam timestamp_type Type of output timestamp
+ * @param begin Pointer to the first element of the string
+ * @param end Pointer to the first element after the string
+ * @return Timestamp converted to `timestamp_type`
+ */
+template <typename timestamp_type>
+__inline__ __device__ timestamp_type parse_fixed_iso_8601_timestamp(char const* begin,
+                                                                    char const* end)
+{
+  using namespace cuda::std::chrono;
+  auto const ymd  = year_month_day{year{to_non_negative_integer<int32_t>(begin, begin + 4)},
+                                  month{to_non_negative_integer<uint32_t>(begin + 5, begin + 7)},
+                                  day{to_non_negative_integer<uint32_t>(begin + 8, begin + 10)}};
+  auto const d_h  = duration_h{to_non_negative_integer<int>(begin + 11, begin + 13)};
+  auto const d_m  = duration_m{to_non_negative_integer<int32_t>(begin + 14, begin + 16)};
+  auto const d_s  = duration_s{to_non_negative_integer<int64_t>(begin + 17, begin + 19)};
+  auto const d_ms = (end - begin > 19 and begin[19] == '.')
+                      ? duration_ms{to_non_negative_integer<int64_t>(begin + 20, end)}
+                      : duration_ms{0};
+
+  timestamp_type answer{sys_days{ymd}};
+  auto const t = hh_mm_ss<duration_ms>{d_h + d_m + d_s + d_ms};
+  answer += duration_cast<typename timestamp_type::duration>(t.to_duration());
+  return answer;
+}
 
 /**
  * @brief Parses a datetime string and computes the corresponding timestamp.
@@ -208,6 +291,12 @@ template <typename timestamp_type>
 __inline__ __device__ timestamp_type to_timestamp(char const* begin, char const* end, bool dayfirst)
 {
   using duration_type = typename timestamp_type::duration;
+
+  // The general parsing below searches for the separators, which strings of the fixed ISO 8601
+  // layout have at fixed positions
+  if (has_fixed_iso_8601_layout(begin, end)) {
+    return parse_fixed_iso_8601_timestamp<timestamp_type>(begin, end);
+  }
 
   auto sep_pos = end;
 
@@ -257,7 +346,7 @@ __inline__ __device__ timestamp_type to_timestamp(char const* begin, char const*
 template <typename T>
 __inline__ __device__ T parse_integer(char const** begin, char const* end)
 {
-  bool const is_negative = (**begin == '-');
+  bool const is_negative = (*begin < end && **begin == '-');
   T value                = 0;
 
   auto cur = *begin + is_negative;
@@ -288,7 +377,7 @@ __inline__ __device__ T parse_integer(char const** begin, char const* end)
 template <typename T>
 __inline__ __device__ T parse_optional_integer(char const** begin, char const* end, char delimiter)
 {
-  if (**begin != delimiter) { return 0; }
+  if (*begin >= end || **begin != delimiter) { return 0; }
 
   ++(*begin);
   return parse_integer<T>(begin, end);
@@ -357,7 +446,7 @@ __inline__ __device__ duration_type to_duration(char const* begin, char const* e
   auto const after_days_sep     = skip_if_starts_with(cur, end, "days");
   auto const has_days_seperator = (after_days_sep != cur);
   cur                           = skip_spaces(after_days_sep, end);
-  cur += (*cur == '+');
+  cur += (cur < end && *cur == '+');
 
   duration_D d_d{0};
   duration_h d_h{0};
@@ -376,7 +465,7 @@ __inline__ __device__ duration_type to_duration(char const* begin, char const* e
 
   if constexpr (std::is_same_v<duration_type, cudf::duration_s>) { return output_d; }
 
-  auto const d_ns = (*cur != '.') ? duration_ns{0} : [&]() {
+  auto const d_ns = (cur >= end || *cur != '.') ? duration_ns{0} : [&]() {
     auto const start_subsecond     = ++cur;
     auto const unscaled_subseconds = parse_integer<int64_t>(&cur, end);
     auto const scale               = min(9L, cur - start_subsecond) - 9;

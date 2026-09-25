@@ -20,6 +20,8 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/std/array>
+#include <cuda/std/cstddef>
 #include <cuda/std/iterator>
 #include <cuda/std/limits>
 #include <cuda/std/optional>
@@ -97,7 +99,7 @@ CUDF_HOST_DEVICE constexpr char to_lower(char const c)
  */
 CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
 {
-  if (*begin == '-' || *begin == '+') begin++;
+  if (begin < end && (*begin == '-' || *begin == '+')) begin++;
   char const* cinf = "infinity";
   auto index       = begin;
   while (index < end) {
@@ -107,6 +109,68 @@ CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
   }
   return ((index == begin + 3 || index == begin + 8) && index >= end);
 }
+
+namespace detail {
+
+/// Number of successive divisions of 1 by 10 with a nonzero double result
+inline constexpr cuda::std::size_t num_fraction_place_values = 323;
+
+/**
+ * @brief Computes the place values of the digits of a decimal fraction.
+ *
+ * Element `i` is 1 divided by 10 `i + 1` times, every division rounded to the nearest double (ties
+ * to even, with subnormals), as `parse_numeric` computes the place value that multiplies the
+ * `i`-th fraction digit.
+ */
+constexpr cuda::std::array<double, num_fraction_place_values> make_fraction_place_values()
+{
+  cuda::std::array<double, num_fraction_place_values> place_values{};
+  double place_value = 1;
+  for (auto& element : place_values) {
+    place_value /= 10;
+    element = place_value;
+  }
+  return place_values;
+}
+
+inline constexpr auto host_fraction_place_values = make_fraction_place_values();
+
+// A division of a double not above 5 * denorm_min by 10 rounds to zero, so every place value past
+// the table is zero
+static_assert(host_fraction_place_values.back() > 0 and
+                host_fraction_place_values.back() <=
+                  5 * cuda::std::numeric_limits<double>::denorm_min(),
+              "The fraction place value table must hold exactly the nonzero place values");
+
+/// Device copy of `host_fraction_place_values`, in constant memory: in the CSV reader, the threads
+/// of a warp parse the same column of different rows, so they mostly read the place value of the
+/// same fraction digit together, and constant memory broadcasts their reads. It has internal
+/// linkage: libcudf is built without relocatable device code, so every translation unit that
+/// parses floats has its own copy.
+static __constant__ cuda::std::array<double, num_fraction_place_values> const
+  fraction_place_values = host_fraction_place_values;
+
+/**
+ * @brief Returns the place value of the fraction digit at `index`, 0 being the first digit after
+ * the decimal point.
+ *
+ * The result is the value that dividing 1 by 10 `index + 1` times gives. It is looked up, which is
+ * much faster than a double division on GPUs.
+ *
+ * @param index Position of the digit in the fraction
+ * @return 1 divided by 10 `index + 1` times, every division rounded
+ */
+CUDF_HOST_DEVICE inline double fraction_place_value(cuda::std::size_t index)
+{
+  if (index >= num_fraction_place_values) { return 0.0; }
+#ifdef __CUDA_ARCH__
+  return fraction_place_values[index];
+#else
+  return host_fraction_place_values[index];
+#endif
+}
+
+}  // namespace detail
 
 /**
  * @brief Parses a character string and returns its numeric value.
@@ -128,19 +192,37 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
   constexpr bool as_hex = (base == 16);
 
   // Handle negative values if necessary
-  int32_t sign = (*begin == '-') ? -1 : 1;
+  int32_t sign = (begin < end && *begin == '-') ? -1 : 1;
 
   // Handle infinity
   if (cuda::std::is_floating_point_v<T> && is_infinity(begin, end)) {
     return sign * cuda::std::numeric_limits<T>::infinity();
   }
-  if (*begin == '-' || *begin == '+') begin++;
+  if (begin < end && (*begin == '-' || *begin == '+')) begin++;
 
   // Skip over the "0x" prefix for hex notation
   if (base == 16 && begin + 2 < end && *begin == '0' && *(begin + 1) == 'x') { begin += 2; }
 
   // Handle the whole part of the number
-  // auto index = begin;
+  if constexpr (cuda::std::is_same_v<T, double> and base == 10) {
+    // Accumulate the leading whole digits in an integer, which is much faster than in a double.
+    // The double accumulation below is exact while the value has at most `digits10` (15) digits:
+    // every intermediate value is an integer below 10^15 < 2^53, so `value * 10 + digit` is exact
+    // whether or not the multiply-add is fused. So it would reach the integer's value exactly, and
+    // continuing it from there gives the same result. The 16th digit can round: taking it in the
+    // integer would only give the same result if the compiler fuses the multiply-add.
+    uint64_t whole_digits_value = 0;
+    int num_whole_digits        = 0;
+    while (begin < end and num_whole_digits < cuda::std::numeric_limits<double>::digits10 and
+           *begin != opts.decimal and *begin != 'e' and *begin != 'E') {
+      if (*begin != opts.thousands && *begin != '+') {
+        whole_digits_value = whole_digits_value * base + decode_digit<T>(*begin, &all_digits_valid);
+        ++num_whole_digits;
+      }
+      ++begin;
+    }
+    value = static_cast<T>(whole_digits_value);
+  }
   while (begin < end) {
     if (*begin == opts.decimal) {
       ++begin;
@@ -155,13 +237,18 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
 
   if (cuda::std::is_floating_point_v<T>) {
     // Handle fractional part of the number if necessary
-    double divisor = 1;
+    double divisor                        = 1;
+    cuda::std::size_t num_fraction_digits = 0;
     while (begin < end) {
       if (*begin == 'e' || *begin == 'E') {
         ++begin;
         break;
       } else if (*begin != opts.thousands && *begin != '+') {
-        divisor /= base;
+        if constexpr (base == 10) {
+          divisor = detail::fraction_place_value(num_fraction_digits++);
+        } else {
+          divisor /= base;
+        }
         value += decode_digit<T, as_hex>(*begin, &all_digits_valid) * divisor;
       }
       ++begin;
@@ -284,6 +371,79 @@ __device__ __inline__ bool less_equal_than(char const* data, char const (&golden
 }
 
 /**
+ * @brief Classes of integers distinguished by type inference
+ */
+enum class integral_field_class {
+  NEGATIVE_SMALL_INT,  ///< Negative integer representable as int64
+  POSITIVE_SMALL_INT,  ///< Non-negative integer representable as int64
+  BIG_INT,             ///< Integer only representable as uint64
+  OUT_OF_RANGE         ///< Integer representable as neither int64 nor uint64
+};
+
+/**
+ * @brief Classifies a sequence of digits and a sign by the 64-bit integer types that can
+ * represent it.
+ *
+ * @param data_begin The pointer to beginning of character string
+ * @param data_end The pointer to end of character string
+ * @param is_negative Whether the number is negative
+ * @return The class of the integer
+ */
+__device__ __inline__ integral_field_class classify_integral_field(char const* data_begin,
+                                                                   char const* data_end,
+                                                                   bool is_negative)
+{
+  static constexpr char uint64_max_abs[] = "18446744073709551615";
+  static constexpr char int64_min_abs[]  = "9223372036854775808";
+  static constexpr char int64_max_abs[]  = "9223372036854775807";
+
+  auto digit_count = data_end - data_begin;
+
+  // Remove preceding zeros
+  if (digit_count >= (sizeof(int64_max_abs) - 1)) {
+    // Trim zeros at the beginning of raw_data
+    while (data_begin < data_end && *data_begin == '0') {
+      data_begin++;
+    }
+  }
+  digit_count = data_end - data_begin;
+
+  // After trimming the number of digits could be less than maximum
+  // int64 digit count
+  if (digit_count < (sizeof(int64_max_abs) - 1)) {  // CASE 0 : Accept validity
+    // If the length of the string representing the integer is smaller
+    // than string length of Int64Max then count this as an integer
+    // representable by int64
+    // If digit_count is 0 then ignore - sign, i.e. -000..00 should
+    // be treated as a positive small integer
+    return is_negative && (digit_count != 0) ? integral_field_class::NEGATIVE_SMALL_INT
+                                             : integral_field_class::POSITIVE_SMALL_INT;
+  } else if (digit_count > (sizeof(uint64_max_abs) - 1)) {  // CASE 1 : Reject validity
+    // If the length of the string representing the integer is greater
+    // than string length of UInt64Max then count this as a string
+    // since it cannot be represented as an int64 or uint64
+    return integral_field_class::OUT_OF_RANGE;
+  } else if (digit_count == (sizeof(uint64_max_abs) - 1) && is_negative) {
+    // A negative integer of length UInt64Max digit count cannot be represented
+    // as a 64 bit integer
+    return integral_field_class::OUT_OF_RANGE;
+  }
+
+  if (digit_count == (sizeof(int64_max_abs) - 1) && is_negative) {
+    return less_equal_than(data_begin, int64_min_abs) ? integral_field_class::NEGATIVE_SMALL_INT
+                                                      : integral_field_class::OUT_OF_RANGE;
+  } else if (digit_count == (sizeof(int64_max_abs) - 1) && !is_negative) {
+    return less_equal_than(data_begin, int64_max_abs) ? integral_field_class::POSITIVE_SMALL_INT
+                                                      : integral_field_class::BIG_INT;
+  } else if (digit_count == (sizeof(uint64_max_abs) - 1)) {
+    return less_equal_than(data_begin, uint64_max_abs) ? integral_field_class::BIG_INT
+                                                       : integral_field_class::OUT_OF_RANGE;
+  }
+
+  return integral_field_class::OUT_OF_RANGE;
+}
+
+/**
  * @brief Determine which counter to increment when a sequence of digits
  * and a parity sign is encountered.
  *
@@ -299,52 +459,12 @@ __device__ __inline__ cudf::size_type* infer_integral_field_counter(char const* 
                                                                     bool is_negative,
                                                                     column_type_histogram& stats)
 {
-  static constexpr char uint64_max_abs[] = "18446744073709551615";
-  static constexpr char int64_min_abs[]  = "9223372036854775808";
-  static constexpr char int64_max_abs[]  = "9223372036854775807";
-
-  auto digit_count = data_end - data_begin;
-
-  // Remove preceding zeros
-  if (digit_count >= (sizeof(int64_max_abs) - 1)) {
-    // Trim zeros at the beginning of raw_data
-    while (*data_begin == '0' && (data_begin < data_end)) {
-      data_begin++;
-    }
+  switch (classify_integral_field(data_begin, data_end, is_negative)) {
+    case integral_field_class::NEGATIVE_SMALL_INT: return &stats.negative_small_int_count;
+    case integral_field_class::POSITIVE_SMALL_INT: return &stats.positive_small_int_count;
+    case integral_field_class::BIG_INT: return &stats.big_int_count;
+    case integral_field_class::OUT_OF_RANGE: break;
   }
-  digit_count = data_end - data_begin;
-
-  // After trimming the number of digits could be less than maximum
-  // int64 digit count
-  if (digit_count < (sizeof(int64_max_abs) - 1)) {  // CASE 0 : Accept validity
-    // If the length of the string representing the integer is smaller
-    // than string length of Int64Max then count this as an integer
-    // representable by int64
-    // If digit_count is 0 then ignore - sign, i.e. -000..00 should
-    // be treated as a positive small integer
-    return is_negative && (digit_count != 0) ? &stats.negative_small_int_count
-                                             : &stats.positive_small_int_count;
-  } else if (digit_count > (sizeof(uint64_max_abs) - 1)) {  // CASE 1 : Reject validity
-    // If the length of the string representing the integer is greater
-    // than string length of UInt64Max then count this as a string
-    // since it cannot be represented as an int64 or uint64
-    return &stats.string_count;
-  } else if (digit_count == (sizeof(uint64_max_abs) - 1) && is_negative) {
-    // A negative integer of length UInt64Max digit count cannot be represented
-    // as a 64 bit integer
-    return &stats.string_count;
-  }
-
-  if (digit_count == (sizeof(int64_max_abs) - 1) && is_negative) {
-    return less_equal_than(data_begin, int64_min_abs) ? &stats.negative_small_int_count
-                                                      : &stats.string_count;
-  } else if (digit_count == (sizeof(int64_max_abs) - 1) && !is_negative) {
-    return less_equal_than(data_begin, int64_max_abs) ? &stats.positive_small_int_count
-                                                      : &stats.big_int_count;
-  } else if (digit_count == (sizeof(uint64_max_abs) - 1)) {
-    return less_equal_than(data_begin, uint64_max_abs) ? &stats.big_int_count : &stats.string_count;
-  }
-
   return &stats.string_count;
 }
 
@@ -360,16 +480,10 @@ __device__ __inline__ cudf::size_type* infer_integral_field_counter(char const* 
 __inline__ __device__ bool is_whitespace(char ch) { return ch == '\t' || ch == ' '; }
 
 /**
- * @brief Skips past the current character if it matches the given value.
- */
-template <typename It>
-__inline__ __device__ It skip_character(It const& it, char ch)
-{
-  return it + (*it == ch);
-}
-
-/**
  * @brief Adjusts the range to ignore starting/trailing whitespace and quotation characters.
+ *
+ * At most one quotation character is removed from each end. Only characters within the range are
+ * inspected, so a lone quotation character yields an empty range rather than an inverted one.
  *
  * @param begin Pointer to the first character in the parsing range
  * @param end Pointer to the first character after the parsing range
@@ -382,13 +496,16 @@ __inline__ __device__ cuda::std::pair<char const*, char const*> trim_whitespaces
 {
   auto not_whitespace = [] __device__(auto c) { return !is_whitespace(c); };
 
-  auto const trim_begin = thrust::find_if(thrust::seq, begin, end, not_whitespace);
-  auto const trim_end   = thrust::find_if(thrust::seq,
-                                        cuda::std::make_reverse_iterator(end),
-                                        cuda::std::make_reverse_iterator(trim_begin),
-                                        not_whitespace);
+  auto trim_begin = thrust::find_if(thrust::seq, begin, end, not_whitespace);
+  auto trim_end   = thrust::find_if(thrust::seq,
+                                  cuda::std::make_reverse_iterator(end),
+                                  cuda::std::make_reverse_iterator(trim_begin),
+                                  not_whitespace)
+                    .base();
 
-  return {skip_character(trim_begin, quotechar), skip_character(trim_end, quotechar).base()};
+  if (trim_begin < trim_end && *trim_begin == quotechar) { ++trim_begin; }
+  if (trim_begin < trim_end && *(trim_end - 1) == quotechar) { --trim_end; }
+  return {trim_begin, trim_end};
 }
 
 /**

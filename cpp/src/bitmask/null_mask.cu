@@ -490,13 +490,21 @@ std::vector<size_type> batch_count_set_bits(host_span<bitmask_type const* const>
 
   constexpr size_type block_size{256};
   // We use a 2D grid to launch the kernel, where the first dimension is to access elements in each
-  // single bitmask while the second dimension is to access the bitmask indices.
-  auto const grid = grid_1d{num_words, block_size};
-  auto const kernel_grid =
-    dim3{static_cast<unsigned int>(grid.num_blocks), static_cast<unsigned int>(num_bitmasks), 1};
-  count_set_bits_kernel<block_size><<<kernel_grid, block_size, 0, stream.get()>>>(
-    d_bitmasks, start, stop - 1, d_non_zero_count.data());
-  CUDF_CUDA_TRY(cudaGetLastError());
+  // single bitmask while the second dimension is to access the bitmask indices. The second
+  // dimension of a grid is limited, so the bitmasks are counted in batches of at most that many.
+  constexpr std::size_t max_bitmasks_per_launch = 65535;
+  auto const grid                               = grid_1d{num_words, block_size};
+  for (std::size_t first = 0; first < num_bitmasks; first += max_bitmasks_per_launch) {
+    auto const batch_size = std::min(max_bitmasks_per_launch, num_bitmasks - first);
+    auto const kernel_grid =
+      dim3{static_cast<unsigned int>(grid.num_blocks), static_cast<unsigned int>(batch_size), 1};
+    count_set_bits_kernel<block_size><<<kernel_grid, block_size, 0, stream.get()>>>(
+      device_span<bitmask_type const* const>{d_bitmasks}.subspan(first, batch_size),
+      start,
+      stop - 1,
+      d_non_zero_count.data() + first);
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
 
   // Use pinned memory to copy the result back to the host, then copy again to the output vector.
   auto h_non_zero_count = cudf::detail::make_pinned_vector<size_type>(num_bitmasks, stream);

@@ -564,6 +564,12 @@ class csv_reader_options {
   /**
    * @brief Sets indexes of columns to read.
    *
+   * `read_csv` throws `std::out_of_range` if an index is negative or does not match a column of the
+   * input. If the input (or byte range) contains no row, its columns are those named by `names`:
+   * if there are as many names as selected columns, the result has these columns, without rows;
+   * other names name all columns, and an index must match one of them; without names, the result
+   * has no columns.
+   *
    * @param col_indices Vector of column indices that are needed
    */
   void set_use_cols_indexes(std::vector<int> col_indices)
@@ -747,6 +753,8 @@ class csv_reader_options {
   /**
    * @brief Sets indexes of columns to read as datetime.
    *
+   * Indexes that do not match a column of the input are ignored.
+   *
    * @param col_indices Vector of column indices to infer as datetime
    */
   void set_parse_dates(std::vector<int> col_indices)
@@ -766,6 +774,8 @@ class csv_reader_options {
 
   /**
    * @brief Sets indexes of columns to parse as hexadecimal
+   *
+   * Indexes that do not match a column of the input are ignored.
    *
    * @param col_indices Vector of column indices to parse as hexadecimal
    */
@@ -958,6 +968,12 @@ class csv_reader_options_builder {
 
   /**
    * @brief Sets indexes of columns to read.
+   *
+   * `read_csv` throws `std::out_of_range` if an index is negative or does not match a column of the
+   * input. If the input (or byte range) contains no row, its columns are those named by `names`:
+   * if there are as many names as selected columns, the result has these columns, without rows;
+   * other names name all columns, and an index must match one of them; without names, the result
+   * has no columns.
    *
    * @param col_indices Vector of column indices that are needed
    * @return this for chaining
@@ -1192,6 +1208,8 @@ class csv_reader_options_builder {
   /**
    * @brief Sets indexes of columns to read as datetime.
    *
+   * Indexes that do not match a column of the input are ignored.
+   *
    * @param col_indices Vector of column indices to read as datetime
    * @return this for chaining
    */
@@ -1215,6 +1233,8 @@ class csv_reader_options_builder {
 
   /**
    * @brief Sets indexes of columns to parse as hexadecimal.
+   *
+   * Indexes that do not match a column of the input are ignored.
    *
    * @param col_indices Vector of column indices to parse as hexadecimal
    * @return this for chaining
@@ -1357,6 +1377,9 @@ class csv_reader_options_builder {
  *  auto options = cudf::io::csv_reader_options::builder(source);
  *  auto result  = cudf::io::read_csv(options);
  * @endcode
+ *
+ * @throw std::out_of_range if an index in `use_cols_indexes` is negative or does not match a column
+ * of the input
  *
  * @param options Settings for controlling reading behavior
  * @param stream CUDA stream used for device memory operations and kernel launches
