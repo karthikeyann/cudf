@@ -19,6 +19,7 @@
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/host_worker_pool.hpp>
+#include <cudf/detail/utilities/stream_pool.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
 #include <cudf/detail/utilities/visitor_overload.hpp>
 #include <cudf/io/csv.hpp>
@@ -208,6 +209,17 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 }
 
 /**
+ * @brief Returns whether the host memory at `ptr` is pinned or registered, so that the device can
+ * copy from it asynchronously.
+ */
+[[nodiscard]] bool is_device_accessible(void const* ptr)
+{
+  cudaPointerAttributes attributes;
+  CUDF_CUDA_TRY(cudaPointerGetAttributes(&attributes, ptr));
+  return attributes.type != cudaMemoryTypeUnregistered;
+}
+
+/**
  * @brief Copies host data to the device, returning once the copy has completed.
  *
  * The driver copies pageable memory through its own pinned buffers with one thread, which is only
@@ -241,9 +253,7 @@ void copy_host_to_device(device_span<char> dst, host_span<char const> src, cuda:
 {
   constexpr size_t slice_bytes  = 1024 * 1024;
   constexpr size_t window_bytes = 32 * slice_bytes;
-  cudaPointerAttributes attributes;
-  CUDF_CUDA_TRY(cudaPointerGetAttributes(&attributes, src.data()));
-  if (src.size() < window_bytes or attributes.type != cudaMemoryTypeUnregistered) {
+  if (src.size() < window_bytes or is_device_accessible(src.data())) {
     return cudf::detail::cuda_memcpy(dst, src, stream);
   }
   auto staging = rmm::device_uvector<char>(
@@ -323,8 +333,6 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
 
   auto const data_size      = data.has_value() ? data->size() : source->size();
-  auto const chunk_bytes    = load_whole_file ? data_size : max_chunk_bytes;
-  auto const buffer_size    = std::min(chunk_bytes, data_size);
   auto const max_input_size = [&] {
     if (range_end == data_size) {
       return data_size - byte_range_offset;
@@ -349,12 +357,26 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // The options describe `source` (see `cudf::io::read_csv`).
   bool const read_whole_input = load_whole_file && !data.has_value() &&
                                 reader_opts.get_source().type() == io_type::DEVICE_BUFFER;
+  // A whole pinned host input is copied in chunks on another stream, and the row offsets of each
+  // chunk are gathered once it has been copied, while the next one is copied. Other whole inputs
+  // are parsed as one chunk.
+  std::unique_ptr<datasource::buffer> host_input;
+  if (load_whole_file && !data.has_value() && !read_whole_input &&
+      !source->is_device_read_preferred(max_input_size - input_pos)) {
+    host_input = source->host_read(input_pos, max_input_size - input_pos);
+  }
+  bool const copy_in_chunks = host_input != nullptr && is_device_accessible(host_input->data());
+  auto const chunk_bytes    = load_whole_file && !copy_in_chunks ? data_size : max_chunk_bytes;
+  auto const buffer_size    = std::min(chunk_bytes, data_size);
+
   device_input input{rmm::device_uvector<char>{0, stream}, nullptr};
   auto& d_data = input.copy;
   d_data.reserve(read_whole_input  ? 0
                  : load_whole_file ? data_size
                                    : std::min(buffer_size * 2, max_input_size),
                  stream);
+  auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
+  std::vector<cuda::event> chunk_copies;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
 
   auto const max_blocks =
@@ -379,13 +401,31 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         // The whole input is one chunk, so this is the only read; a device buffer source returns
         // a view of exactly the requested bytes of the caller's buffer
         input.source_buffer = source->device_read(read_offset, read_size, stream);
+      } else if (copy_in_chunks) {
+        // Copies run one chunk ahead, into the capacity of `d_data`, which holds the whole input;
+        // with more ahead, the copies of this loop's row contexts would queue behind all of them.
+        // No data is discarded, so every chunk is parsed and waits for its copy.
+        auto const chunk = previous_data_size / chunk_bytes;
+        while (chunk_copies.size() < chunk + 2 &&
+               chunk_copies.size() * chunk_bytes < host_input->size()) {
+          auto const offset = chunk_copies.size() * chunk_bytes;
+          auto const size   = std::min(chunk_bytes, host_input->size() - offset);
+          cudf::detail::cuda_memcpy_async(
+            device_span<char>{d_data.data() + offset, size},
+            host_span<char const>{
+              reinterpret_cast<char const*>(host_input->data()) + offset, size, true},
+            copy_stream);
+          chunk_copies.push_back(copy_stream.record_event());
+        }
+        stream.wait(chunk_copies[chunk]);
       } else if (source->is_device_read_preferred(read_size)) {
         source->device_read(read_offset,
                             read_size,
                             reinterpret_cast<uint8_t*>(d_data.data() + previous_data_size),
                             stream);
       } else {
-        auto const buffer = source->host_read(read_offset, read_size);
+        auto const buffer =
+          host_input != nullptr ? std::move(host_input) : source->host_read(read_offset, read_size);
         // Use sync version to prevent buffer going out of scope before we copy the data.
         copy_host_to_device(
           device_span<char>{d_data.data() + previous_data_size, read_size},
@@ -427,14 +467,11 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
       // At least one row in range in this batch
       all_row_offsets.resize(total_rows - skip_rows, stream);
 
-      cudf::detail::cuda_memcpy_async(
-        device_span<uint64_t>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
-        host_span<uint64_t const>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
-        stream);
-
-      // Pass 2: Output row offsets
+      // Pass 2: Output row offsets. It reads the block contexts from, and writes the counts of
+      // rows out of range to, the pinned host memory of `row_ctx` directly: a copy to the device
+      // could wait for a copy of the next chunk on the copy engine.
       cudf::io::csv::gpu::gather_row_offsets(parse_opts.view(),
-                                             row_ctx.device_ptr(),
+                                             row_ctx.host_ptr(),
                                              all_row_offsets,
                                              input.view(),
                                              chunk_size,
@@ -447,10 +484,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                                              stream);
       // With byte range, we want to keep only one row out of the specified range
       if (range_end < data_size) {
-        cudf::detail::cuda_memcpy(
-          host_span<uint64_t>(row_ctx.host_ptr(), row_ctx.size(), true).subspan(0, num_blocks),
-          device_span<uint64_t const>(row_ctx.device_ptr(), row_ctx.size()).subspan(0, num_blocks),
-          stream);
+        stream.sync();
 
         size_t rows_out_of_range = 0;
         for (uint32_t i = 0; i < num_blocks; i++) {

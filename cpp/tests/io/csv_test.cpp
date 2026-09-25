@@ -6665,4 +6665,36 @@ TEST_F(CsvReaderTest, PageableHostBufferAcrossStagingWindows)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(skipped.tbl->view().column(0), expected_skipped);
 }
 
+TEST_F(CsvReaderTest, PinnedHostBufferAcrossChunks)
+{
+  // Whole pinned host inputs are copied and parsed in 64MB chunks (`max_chunk_bytes` in
+  // load_data_and_gather_row_offsets). The first chunk ends inside a quoted field holding a line
+  // break and doubled quotes, so the second chunk starts inside quotes. Pageable host data is
+  // parsed as one chunk and must give the same table.
+  constexpr size_t chunk_bytes = 64 * 1024 * 1024;
+  std::vector<std::string> expected;
+  std::string text;
+  for (int i = 0; text.size() < chunk_bytes + 4096; ++i) {
+    auto const field_size = text.size() + 1000 < chunk_bytes ? 100 + i % 13 : 1000;
+    expected.push_back(std::string(field_size, static_cast<char>('a' + i % 26)) + "\n\"x\"");
+    text += std::to_string(i) + ",\"" + std::string(field_size, static_cast<char>('a' + i % 26)) +
+            "\n\"\"x\"\"\"\n";
+  }
+  auto const stream = cudf::get_default_stream();
+  auto pinned       = cudf::detail::make_pinned_vector<char>(text.size(), stream);
+  std::copy(text.begin(), text.end(), pinned.begin());
+  auto const read = [](char const* data, size_t size) {
+    return cudf::io::read_csv(
+      cudf::io::csv_reader_options::builder(
+        cudf::io::source_info{cudf::host_span<char const>{data, size}})
+        .header(-1)
+        .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()})
+        .build());
+  };
+  auto const result = read(pinned.data(), pinned.size());
+  auto const expected_column = cudf::test::strings_column_wrapper(expected.begin(), expected.end());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(1), expected_column);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), read(text.data(), text.size()).tbl->view());
+}
+
 CUDF_TEST_PROGRAM_MAIN()

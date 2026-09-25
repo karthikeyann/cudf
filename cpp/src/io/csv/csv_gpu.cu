@@ -849,6 +849,8 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   // Offset of `parse_pos` inside the local `data` window, clamped to avoid underflow
   auto const parse_off = parse_pos > start_offset ? parse_pos - start_offset : 0;
   uint32_t const t     = threadIdx.x;
+  // Phase 2's initial block context is loaded first, as it may be in host memory
+  uint64_t const initial_ctx = (offsets_out.data() && t == 0) ? row_ctx[blockIdx.x] : 0;
   size_t block_pos     = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
   auto cur             = start + block_pos;
 
@@ -962,7 +964,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
 
   // If this is the second phase, get the block's initial parser state and row counter
   if (offsets_out.data()) {
-    if (t == 0) { bk_ctxtree[0] = row_ctx[blockIdx.x]; }
+    if (t == 0) { bk_ctxtree[0] = initial_ctx; }
     __syncthreads();
 
     // Walk back the transform tree with the known initial parser state
