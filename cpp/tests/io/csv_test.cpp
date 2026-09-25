@@ -6665,9 +6665,9 @@ TEST_F(CsvReaderTest, PageableHostBufferAcrossStagingWindows)
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(skipped.tbl->view().column(0), expected_skipped);
 }
 
-TEST_F(CsvReaderTest, PinnedHostBufferAcrossChunks)
+TEST_F(CsvReaderTest, PinnedHostBufferAndFileAcrossChunks)
 {
-  // Whole pinned host inputs are copied and parsed in 64MB chunks (`max_chunk_bytes` in
+  // Whole pinned host inputs and files are read and parsed in 64MB chunks (`max_chunk_bytes` in
   // load_data_and_gather_row_offsets). The first chunk ends inside a quoted field holding a line
   // break and doubled quotes, so the second chunk starts inside quotes. Pageable host data is
   // parsed as one chunk and must give the same table.
@@ -6683,18 +6683,25 @@ TEST_F(CsvReaderTest, PinnedHostBufferAcrossChunks)
   auto const stream = cudf::get_default_stream();
   auto pinned       = cudf::detail::make_pinned_vector<char>(text.size(), stream);
   std::copy(text.begin(), text.end(), pinned.begin());
-  auto const read = [](char const* data, size_t size) {
+  auto const read = [](cudf::io::source_info const& source) {
     return cudf::io::read_csv(
-      cudf::io::csv_reader_options::builder(
-        cudf::io::source_info{cudf::host_span<char const>{data, size}})
+      cudf::io::csv_reader_options::builder(source)
         .header(-1)
         .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()})
         .build());
   };
-  auto const result = read(pinned.data(), pinned.size());
+  auto const result =
+    read(cudf::io::source_info{cudf::host_span<char const>{pinned.data(), pinned.size()}});
   auto const expected_column = cudf::test::strings_column_wrapper(expected.begin(), expected.end());
   CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(1), expected_column);
-  CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), read(text.data(), text.size()).tbl->view());
+  auto const pageable =
+    read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}});
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), pageable.tbl->view());
+
+  auto const filepath = temp_env->get_temp_filepath("ChunkBoundaryInQuotes.csv");
+  std::ofstream(filepath, std::ios::binary) << text;
+  CUDF_TEST_EXPECT_TABLES_EQUAL(read(cudf::io::source_info{filepath}).tbl->view(),
+                                pageable.tbl->view());
 }
 
 CUDF_TEST_PROGRAM_MAIN()

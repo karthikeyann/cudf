@@ -357,16 +357,20 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // The options describe `source` (see `cudf::io::read_csv`).
   bool const read_whole_input = load_whole_file && !data.has_value() &&
                                 reader_opts.get_source().type() == io_type::DEVICE_BUFFER;
-  // A whole pinned host input is copied in chunks on another stream, and the row offsets of each
-  // chunk are gathered once it has been copied, while the next one is copied. Other whole inputs
-  // are parsed as one chunk.
+  // A whole file read on the device (asynchronously, which user datasources need not support), or
+  // pinned host input copied on another stream, is read in chunks, and the row offsets of each
+  // chunk are gathered once it has been read, while the next ones are read. Other whole inputs are
+  // parsed as one chunk.
+  bool const whole_source   = load_whole_file && !data.has_value() && !read_whole_input;
+  bool const read_in_chunks = whole_source && reader_opts.get_source().type() == io_type::FILEPATH &&
+                              source->is_device_read_preferred(max_input_size - input_pos);
   std::unique_ptr<datasource::buffer> host_input;
-  if (load_whole_file && !data.has_value() && !read_whole_input &&
-      !source->is_device_read_preferred(max_input_size - input_pos)) {
+  if (whole_source && !source->is_device_read_preferred(max_input_size - input_pos)) {
     host_input = source->host_read(input_pos, max_input_size - input_pos);
   }
   bool const copy_in_chunks = host_input != nullptr && is_device_accessible(host_input->data());
-  auto const chunk_bytes    = load_whole_file && !copy_in_chunks ? data_size : max_chunk_bytes;
+  auto const chunk_bytes =
+    load_whole_file && !read_in_chunks && !copy_in_chunks ? data_size : max_chunk_bytes;
   auto const buffer_size    = std::min(chunk_bytes, data_size);
 
   device_input input{rmm::device_uvector<char>{0, stream}, nullptr};
@@ -377,6 +381,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                  stream);
   auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
   std::vector<cuda::event> chunk_copies;
+  std::vector<std::future<size_t>> chunk_reads;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
 
   auto const max_blocks =
@@ -418,6 +423,20 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
           chunk_copies.push_back(copy_stream.record_event());
         }
         stream.wait(chunk_copies[chunk]);
+      } else if (read_in_chunks) {
+        // All chunks are requested at the first one, into the capacity of `d_data`; the source
+        // completes them in order (e.g. kvikio's thread pool runs its tasks first come, first
+        // served). No data is discarded, so every chunk is parsed and waits for its read.
+        auto const input_size = max_input_size - input_pos;
+        for (size_t offset = chunk_reads.empty() ? 0 : input_size; offset < input_size;
+             offset += chunk_bytes) {
+          chunk_reads.push_back(source->device_read_async(
+            input_pos + offset,
+            std::min(chunk_bytes, input_size - offset),
+            reinterpret_cast<uint8_t*>(d_data.data() + offset),
+            stream));
+        }
+        chunk_reads[previous_data_size / chunk_bytes].get();
       } else if (source->is_device_read_preferred(read_size)) {
         source->device_read(read_offset,
                             read_size,
