@@ -42,7 +42,6 @@
 #include <memory>
 #include <string>
 #include <string_view>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -789,6 +788,7 @@ std::vector<std::unique_ptr<column>> decode_data(parse_options const& parse_opts
                                                  cuda::stream_ref stream,
                                                  rmm::device_async_resource_ref mr)
 {
+  using cudf::io::csv::gpu::decoded_strings;
   auto const is_string = [&](int col) { return column_types[col].id() == type_id::STRING; };
 
   // The per-column inputs of the decode kernel, uploaded with a single copy. They are allocated
@@ -800,20 +800,36 @@ std::vector<std::unique_ptr<column>> decode_data(parse_options const& parse_opts
   std::copy(column_flags.begin(), column_flags.end(), flags.host_begin());
   std::copy(column_types.begin(), column_types.end(), types.host_begin());
 
-  // Only the string (pointer, length) pairs need zeroing, for the fields missing from short rows;
-  // the decode kernel writes the other data wherever it is valid (see decode_row_column_data).
-  // String columns get their null masks when they are built from the pairs, so their buffers have
-  // none. The null masks of the other columns are all zeroed with a single batched memset.
-  std::vector<column_buffer> out_buffers;
-  out_buffers.reserve(num_active_columns);
+  // The decoded strings of all string columns, one after the other, and the buffers of the other
+  // columns, in column order. Neither needs initialization: the decode kernel writes every row of
+  // the decoded strings, and the fixed-width data wherever it is valid (see
+  // decode_row_column_data). The string columns get their null masks when they are built from the
+  // decoded strings; the null masks of the other columns are all zeroed with a single batched
+  // memset.
+  auto const num_string_columns =
+    std::count_if(column_types.begin(), column_types.end(), [](auto const& type) {
+      return type.id() == type_id::STRING;
+    });
+  auto const string_column_bytes = decoded_strings::size_bytes(num_records);
+  rmm::device_buffer decoded_strings_memory(
+    num_string_columns * string_column_bytes, stream, cudf::get_current_device_resource_ref());
+  std::vector<decoded_strings> string_columns_strings;
+  std::vector<column_buffer> fixed_width_buffers;
   std::vector<device_span<bitmask_type>> null_masks;
   auto const mask_words = bitmask_allocation_size_bytes(num_records) / sizeof(bitmask_type);
   for (int col = 0; col < num_active_columns; ++col) {
-    auto& buffer = out_buffers.emplace_back(column_types[col], not is_string(col));
-    buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, is_string(col), stream, mr);
-    if (not is_string(col)) { null_masks.emplace_back(buffer.null_mask(), mask_words); }
-    columns[col] = buffer.data();
-    masks[col]   = buffer.null_mask();
+    if (is_string(col)) {
+      columns[col] = static_cast<char*>(decoded_strings_memory.data()) +
+                     string_columns_strings.size() * string_column_bytes;
+      masks[col] = nullptr;
+      string_columns_strings.emplace_back(columns[col], num_records);
+    } else {
+      auto& buffer = fixed_width_buffers.emplace_back(column_types[col], true);
+      buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, false, stream, mr);
+      null_masks.emplace_back(buffer.null_mask(), mask_words);
+      columns[col] = buffer.data();
+      masks[col]   = buffer.null_mask();
+    }
   }
   if (not null_masks.empty()) {
     cudf::detail::batched_memset<bitmask_type>(null_masks, bitmask_type{0}, stream);
@@ -825,38 +841,31 @@ std::vector<std::unique_ptr<column>> decode_data(parse_options const& parse_opts
                                              unescape_buffer,
                                              flags,
                                              row_offsets,
+                                             num_records,
                                              types,
                                              columns,
                                              masks,
                                              row_staging_size,
                                              stream);
 
-  // Only the validity of non-string columns is decoded into the masks; the string columns get
-  // theirs (and their null counts) when they are built from the decoded string pairs
-  std::vector<bitmask_type const*> decoded_masks(num_active_columns, nullptr);
-  static_assert(
-    std::is_same_v<cudf::io::csv::gpu::decoded_string, cudf::io::detail::string_index_pair>,
-    "The decoded strings are stored in the string buffers of column_buffer");
-  std::vector<device_span<cudf::io::csv::gpu::decoded_string const>> string_pairs;
-  for (int col = 0; col < num_active_columns; ++col) {
-    if (is_string(col)) {
-      string_pairs.emplace_back(
-        static_cast<cudf::io::csv::gpu::decoded_string const*>(out_buffers[col].data()),
-        num_records);
-    } else {
-      decoded_masks[col] = masks[col];
-    }
+  // The validity of the fixed-width columns is decoded into their masks; the string columns get
+  // theirs (and their null counts) when they are built from the decoded strings
+  std::vector<bitmask_type const*> fixed_width_masks;
+  for (auto const& mask : null_masks) {
+    fixed_width_masks.push_back(mask.data());
   }
-  auto const null_counts = cudf::batch_null_count(decoded_masks, 0, num_records, stream);
-  auto string_columns    = cudf::io::csv::gpu::make_strings_columns(string_pairs, stream, mr);
+  auto const null_counts = cudf::batch_null_count(fixed_width_masks, 0, num_records, stream);
+  auto string_columns =
+    cudf::io::csv::gpu::make_strings_columns(string_columns_strings, num_records, stream, mr);
 
   std::vector<std::unique_ptr<column>> out_columns;
-  for (int col = 0, string_col = 0; col < num_active_columns; ++col) {
+  for (int col = 0, string_col = 0, fixed_width_col = 0; col < num_active_columns; ++col) {
     if (is_string(col)) {
       out_columns.emplace_back(std::move(string_columns[string_col++]));
     } else {
-      out_buffers[col].null_count() = null_counts[col];
-      out_columns.emplace_back(make_column(out_buffers[col], nullptr, std::nullopt, stream));
+      auto& buffer        = fixed_width_buffers[fixed_width_col];
+      buffer.null_count() = null_counts[fixed_width_col++];
+      out_columns.emplace_back(make_column(buffer, nullptr, std::nullopt, stream));
     }
   }
   return out_columns;

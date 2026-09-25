@@ -40,17 +40,23 @@ constexpr int warp_size = cudf::detail::warp_size;
 constexpr size_type block_size = 256;
 static_assert(block_size % warp_size == 0, "Blocks of rows must be warp aligned");
 
-/// Whether a row's string field is too long for a string (see `oversized_string_size`)
-__device__ inline bool is_oversized(decoded_string const& pair)
+/**
+ * @brief Decoded size of the string of row `row` of a column: `decoded_strings::null_size` if the
+ * row is null or past the last row, and `decoded_strings::oversized_size` if its field is too long
+ * for a string.
+ */
+__device__ inline size_type decoded_size(decoded_strings const& column,
+                                         thread_index_type row,
+                                         size_type num_rows)
 {
-  return pair.first != nullptr and pair.second == oversized_string_size;
+  return row < num_rows ? column.size(static_cast<size_type>(row)) : decoded_strings::null_size;
 }
 
-/// Number of characters of a row's string: 0 for a null row, and for an oversized field, which the
-/// reader rejects before any character is copied
-__device__ inline size_type string_size(decoded_string const& pair)
+/// Number of characters of a string of the given decoded size: 0 for a null row, and for an
+/// oversized field, which the reader rejects before any character is copied
+__device__ inline size_type string_size(size_type decoded_size)
 {
-  return pair.first != nullptr ? cuda::std::max(pair.second, size_type{0}) : 0;
+  return cuda::std::max(decoded_size, size_type{0});
 }
 
 /**
@@ -60,7 +66,7 @@ struct block_counts {
   int64_t valid;      ///< Valid rows
   int64_t chars;      ///< Characters
   int64_t separate;   ///< Strings copied separately (see `max_warp_copied_size`)
-  int64_t oversized;  ///< Fields too long for a string (see `oversized_string_size`)
+  int64_t oversized;  ///< Fields too long for a string (see `decoded_strings::oversized_size`)
 
   __device__ block_counts operator+(block_counts const& other) const
   {
@@ -94,7 +100,7 @@ __device__ inline bool is_copied_separately(size_type size) { return size > max_
  * block adds its counts to the column's counts, and writes its characters to
  * `block_chars[y * gridDim.x + x]`, from which the offsets of the blocks are computed.
  *
- * @param columns The (pointer, size) pairs of the rows of each column
+ * @param columns The strings of each column
  * @param num_rows Number of rows of each column
  * @param null_masks Validity mask of each column; every word that holds a row is written
  * @param valid_counts Number of valid rows of each column, accumulated into zeroed counts
@@ -106,7 +112,7 @@ __device__ inline bool is_copied_separately(size_type size) { return size > max_
  * @param block_chars Number of characters of each block of rows of each column
  */
 CUDF_KERNEL void __launch_bounds__(block_size)
-  compute_validity_and_sizes_kernel(decoded_string const* const* columns,
+  compute_validity_and_sizes_kernel(decoded_strings const* columns,
                                     size_type num_rows,
                                     bitmask_type* const* null_masks,
                                     int64_t* valid_counts,
@@ -115,16 +121,16 @@ CUDF_KERNEL void __launch_bounds__(block_size)
                                     int64_t* oversized_count,
                                     int64_t* block_chars)
 {
-  auto const col      = blockIdx.y;
-  auto const row      = static_cast<thread_index_type>(blockIdx.x) * block_size + threadIdx.x;
-  auto const in_range = row < num_rows;
+  auto const col = blockIdx.y;
+  auto const row = static_cast<thread_index_type>(blockIdx.x) * block_size + threadIdx.x;
 
-  auto const pair     = in_range ? columns[col][row] : decoded_string{nullptr, 0};
-  auto const is_valid = pair.first != nullptr;
-  auto const size     = string_size(pair);
+  auto const decoded      = decoded_size(columns[col], row, num_rows);
+  auto const is_valid     = decoded != decoded_strings::null_size;
+  auto const is_oversized = decoded == decoded_strings::oversized_size;
+  auto const size         = string_size(decoded);
 
   auto const valid_bits = __ballot_sync(0xffff'ffffu, is_valid);
-  if (in_range and threadIdx.x % warp_size == 0) {
+  if (row < num_rows and threadIdx.x % warp_size == 0) {
     null_masks[col][word_index(static_cast<size_type>(row))] = valid_bits;
   }
 
@@ -134,7 +140,7 @@ CUDF_KERNEL void __launch_bounds__(block_size)
     block_reduce(reduce_storage)
       .Reduce(
         block_counts{
-          is_valid ? 1 : 0, size, is_copied_separately(size) ? 1 : 0, is_oversized(pair) ? 1 : 0},
+          is_valid ? 1 : 0, size, is_copied_separately(size) ? 1 : 0, is_oversized ? 1 : 0},
         cuda::std::plus<>{});
   if (threadIdx.x == 0) {
     block_chars[static_cast<int64_t>(col) * gridDim.x + blockIdx.x] = counts.chars;
@@ -246,7 +252,7 @@ __device__ void copy_warp_characters(
  * The kernel is only launched when no field is oversized, so the sizes it reads are those that
  * `compute_validity_and_sizes_kernel` counted.
  *
- * @param columns The (pointer, size) pairs of the rows of each column
+ * @param columns The strings of each column
  * @param outputs Output offsets and characters of each column, sized by
  * `compute_validity_and_sizes_kernel`
  * @param block_offsets Offset of the first character of each block of rows of each column, in
@@ -257,7 +263,7 @@ __device__ void copy_warp_characters(
  * @param separate The strings copied separately, with room for all of them
  */
 CUDF_KERNEL void __launch_bounds__(block_size)
-  write_strings_kernel(decoded_string const* const* columns,
+  write_strings_kernel(decoded_strings const* columns,
                        strings_column_output const* outputs,
                        int64_t const* block_offsets,
                        size_type num_rows,
@@ -281,8 +287,11 @@ CUDF_KERNEL void __launch_bounds__(block_size)
   auto const row_block = tile / num_columns;
   auto const row       = row_block * block_size + threadIdx.x;
   auto const in_range  = row < num_rows;
-  auto const pair      = in_range ? columns[col][row] : decoded_string{nullptr, 0};
-  auto const size      = string_size(pair);
+  // Null rows and rows past the last row have no characters, and only non-empty strings have
+  // pointers to read
+  auto const size = string_size(decoded_size(columns[col], row, num_rows));
+  auto const source =
+    size > 0 ? columns[col].chars(static_cast<size_type>(row)) : static_cast<char const*>(nullptr);
 
   int64_t offset = 0;
   block_scan(scan_storage).ExclusiveSum(static_cast<int64_t>(size), offset);
@@ -306,7 +315,7 @@ CUDF_KERNEL void __launch_bounds__(block_size)
     first_slot = __shfl_sync(0xffff'ffffu, first_slot, 0);
     if (copied_separately) {
       auto const slot        = first_slot + __popc(separate_rows & ((1u << lane) - 1));
-      separate.sources[slot] = pair.first;
+      separate.sources[slot] = source;
       separate.targets[slot] = output.chars + offset;
       separate.sizes[slot]   = size;
     }
@@ -314,7 +323,7 @@ CUDF_KERNEL void __launch_bounds__(block_size)
 
   // Rows past the last row sort after every row, and have no characters
   starts[threadIdx.x]  = in_range ? offset : cuda::std::numeric_limits<int64_t>::max();
-  sources[threadIdx.x] = pair.first;
+  sources[threadIdx.x] = source;
   // Offset past the characters of the warp's rows: rows past the last row have no characters
   auto const warp_end = __shfl_sync(0xffff'ffffu, offset + size, warp_size - 1);
   __syncwarp();
@@ -334,19 +343,13 @@ CUDF_KERNEL void __launch_bounds__(block_size)
 
 }  // namespace
 
-std::vector<std::unique_ptr<column>> make_strings_columns(
-  host_span<device_span<decoded_string const> const> columns,
-  cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+std::vector<std::unique_ptr<column>> make_strings_columns(host_span<decoded_strings const> columns,
+                                                          size_type num_rows,
+                                                          cuda::stream_ref stream,
+                                                          rmm::device_async_resource_ref mr)
 {
   if (columns.empty()) { return {}; }
   auto const num_columns = columns.size();
-  auto const num_rows    = static_cast<size_type>(columns.front().size());
-  CUDF_EXPECTS(
-    std::all_of(columns.begin(),
-                columns.end(),
-                [&](auto const& column) { return column.size() == columns.front().size(); }),
-    "All string columns must have the same number of rows");
   if (num_rows == 0) {
     std::vector<std::unique_ptr<column>> empty_columns;
     std::generate_n(std::back_inserter(empty_columns), num_columns, [] {
@@ -359,14 +362,12 @@ std::vector<std::unique_ptr<column>> make_strings_columns(
 
   // Validity masks and counts; the kernel writes every mask word that holds a row
   std::vector<rmm::device_buffer> null_masks;
-  auto h_columns = cudf::detail::make_host_vector<decoded_string const*>(num_columns, stream);
-  auto h_masks   = cudf::detail::make_host_vector<bitmask_type*>(num_columns, stream);
+  auto h_masks = cudf::detail::make_host_vector<bitmask_type*>(num_columns, stream);
   for (size_t col = 0; col < num_columns; ++col) {
     null_masks.emplace_back(bitmask_allocation_size_bytes(num_rows), stream, mr);
-    h_columns[col] = columns[col].data();
-    h_masks[col]   = static_cast<bitmask_type*>(null_masks.back().data());
+    h_masks[col] = static_cast<bitmask_type*>(null_masks.back().data());
   }
-  auto const d_columns = cudf::detail::make_device_uvector_async(h_columns, stream, temp_mr);
+  auto const d_columns = cudf::detail::make_device_uvector_async(columns, stream, temp_mr);
   auto const d_masks   = cudf::detail::make_device_uvector_async(h_masks, stream, temp_mr);
   // The valid counts of the columns, their character counts, the number of strings copied
   // separately, and the number of fields too long for a string
