@@ -222,6 +222,21 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 }
 
 /**
+ * @brief Copies pageable host data into pinned memory with the host worker threads, one 1MB slice
+ * per task, returning once the copy has completed.
+ */
+void copy_to_pinned(char* dst, host_span<char const> src)
+{
+  constexpr size_t slice_bytes = 1024 * 1024;
+  std::vector<std::future<void>> tasks;
+  for (size_t i = 0; i < src.size(); i += slice_bytes) {
+    tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
+      [=] { std::copy_n(src.data() + i, std::min(slice_bytes, src.size() - i), dst + i); }));
+  }
+  std::ranges::for_each(tasks, [](auto& task) { task.get(); });
+}
+
+/**
  * @brief Copies host data to the device, returning once the copy has completed.
  *
  * The driver copies pageable memory through its own pinned buffers with one thread, which is only
@@ -253,8 +268,7 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
  */
 void copy_host_to_device(device_span<char> dst, host_span<char const> src, cuda::stream_ref stream)
 {
-  constexpr size_t slice_bytes  = 1024 * 1024;
-  constexpr size_t window_bytes = 32 * slice_bytes;
+  constexpr size_t window_bytes = 32 * 1024 * 1024;
   if (src.size() < window_bytes or is_device_accessible(src.data())) {
     return cudf::detail::cuda_memcpy(dst, src, stream);
   }
@@ -263,13 +277,7 @@ void copy_host_to_device(device_span<char> dst, host_span<char const> src, cuda:
   for (size_t offset = 0; offset < src.size(); offset += window_bytes) {
     auto const size   = std::min(window_bytes, src.size() - offset);
     auto const window = staging.data() + (offset / window_bytes % 2) * window_bytes;
-    std::vector<std::future<void>> tasks;
-    for (size_t i = 0; i < size; i += slice_bytes) {
-      tasks.emplace_back(cudf::detail::host_worker_pool().submit_task([=] {
-        std::copy_n(src.data() + offset + i, std::min(slice_bytes, size - i), window + i);
-      }));
-    }
-    std::ranges::for_each(tasks, [](auto& task) { task.get(); });
+    copy_to_pinned(window, src.subspan(offset, size));
     stream.sync();
     cudf::detail::cuda_memcpy_async(
       dst.subspan(offset, size), host_span<char const>{window, size, true}, stream);
@@ -361,8 +369,9 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   bool const read_whole_input = load_whole_file && !data.has_value() &&
                                 reader_opts.get_source().type() == io_type::DEVICE_BUFFER;
   // A whole file of more than one chunk read on the device (asynchronously, which user datasources
-  // need not support), or such pinned host input copied on another stream, is read in chunks, and
-  // the row offsets of each chunk are gathered once it has been read, while the next ones are read.
+  // need not support), or such host input copied on another stream, is read in chunks, and the row
+  // offsets of each chunk are gathered once it has been read, while the next ones are read.
+  // Pageable host input is staged through two alternating pinned chunks (see copy_host_to_device).
   // Other whole inputs are parsed as one chunk.
   auto const input_size            = max_input_size - input_pos;
   bool const whole_source          = load_whole_file && !data.has_value() && !read_whole_input;
@@ -373,8 +382,8 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   if (whole_source && !device_read_preferred) {
     host_input = source->host_read(input_pos, input_size);
   }
-  bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes &&
-                              is_device_accessible(host_input->data());
+  bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes;
+  bool const is_pinned      = copy_in_chunks && is_device_accessible(host_input->data());
   auto const chunk_bytes =
     load_whole_file && !read_in_chunks && !copy_in_chunks ? data_size : max_chunk_bytes;
   auto const buffer_size = std::min(chunk_bytes, data_size);
@@ -387,6 +396,8 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                  stream);
   // The copy stream is joined as `stream` waits for the copy of every chunk
   auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
+  auto staging           = rmm::device_uvector<char>(
+    copy_in_chunks && !is_pinned ? 2 * chunk_bytes : 0, stream, cudf::get_pinned_memory_resource());
   // Chunk copies and reads in flight when the loop exits with an exception still write into
   // `d_data`, and copy from `host_input`, so they are waited for before those are freed; the
   // destructor does not throw by design. The copies complete in order, on one stream.
@@ -438,11 +449,17 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                chunks.copies.size() * chunk_bytes < host_input->size()) {
           auto const offset = chunks.copies.size() * chunk_bytes;
           auto const size   = std::min(chunk_bytes, host_input->size() - offset);
-          cudf::detail::cuda_memcpy_async(
-            device_span<char>{d_data.data() + offset, size},
-            host_span<char const>{
-              reinterpret_cast<char const*>(host_input->data()) + offset, size, true},
-            copy_stream);
+          auto chunk_data   = reinterpret_cast<char const*>(host_input->data()) + offset;
+          if (!is_pinned) {
+            // The staging chunk was last copied from two chunks back, which must have completed
+            auto const window = staging.data() + chunks.copies.size() % 2 * chunk_bytes;
+            if (chunks.copies.size() >= 2) { chunks.copies[chunks.copies.size() - 2].sync(); }
+            copy_to_pinned(window, {chunk_data, size});
+            chunk_data = window;
+          }
+          cudf::detail::cuda_memcpy_async(device_span<char>{d_data.data() + offset, size},
+                                          host_span<char const>{chunk_data, size, true},
+                                          copy_stream);
           chunks.copies.push_back(copy_stream.record_event());
         }
         stream.wait(chunks.copies[chunk]);
