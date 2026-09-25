@@ -14,6 +14,7 @@
 
 #include <future>
 #include <sstream>
+#include <string>
 #include <vector>
 
 namespace cudf::test {
@@ -149,6 +150,84 @@ class log_capture {
   std::ostringstream oss_;
   std::vector<rapids_logger::sink_ptr> saved_sinks_;
 };
+
+/**
+ * @brief Returns timestamp strings that test the parsing of the fixed ISO 8601 layout
+ * `YYYY-MM-DD[T ]HH:MM:SS[Z|.fraction]`: strings of the layout, and near misses of it.
+ *
+ * The near misses are generated from strings of the layout: each is truncated to every length,
+ * and at every position a character is deleted, or one of a set of characters is substituted or
+ * inserted; a few suffixes are also appended. No string contains '/' (see
+ * `with_slash_date_separators`).
+ */
+inline std::vector<std::string> iso_8601_timestamp_test_strings()
+{
+  std::vector<std::string> strings        = {"2024-02-29T13:45:59.",
+                                             "2024-02-29T13:45:59.1",
+                                             "2024-02-29T13:45:59.12",
+                                             "2024-02-29 13:45:59.1234",
+                                             "2024-02-29T13:45:59.12345",
+                                             "2024-02-29T13:45:59.123456",
+                                             "2024-02-29T13:45:59.1234567",
+                                             "2024-02-29T13:45:59.12345678",
+                                             "2024-02-29T13:45:59.123456789",
+                                             "2024-02-29T13:45:59.123456789012",
+                                             "2024-02-29T13:45:59.123Z",
+                                             "2024-02-29 13:45:59.5+05:30",
+                                             "2024-02-29T13:45:59.25-08:00",
+                                             "1969-12-31T23:59:59.999",
+                                             "0000-00-00T00:00:00",
+                                             "9999-99-99T99:99:99.999",
+                                             "2024-02-29T01:45:59.5 PM",
+                                             "2024-02-29T01:45:59.5pm",
+                                             "2024-02-29 01:45:59.5 AM",
+                                             "2024-02-29T01:45:59 PM",
+                                             "12:",
+                                             "PM"};
+  std::string const characters            = "0 -.:MPTZmtxz";
+  std::vector<std::string> const suffixes = {"Z5", "Z+05:30", "ZZ", "Zm", "5", "M", " PM", "Z "};
+  for (std::string const layout :
+       {"2024-02-29T13:45:59", "2024-02-29 13:45:59Z", "2024-02-29T13:45:59.123"}) {
+    for (std::size_t position = 0; position <= layout.size(); ++position) {
+      auto const head = layout.substr(0, position);
+      strings.push_back(head);
+      for (char const character : characters) {
+        strings.push_back(head + character + layout.substr(position));
+      }
+      if (position < layout.size()) {
+        strings.push_back(head + layout.substr(position + 1));
+        for (char const character : characters) {
+          strings.push_back(head + character + layout.substr(position + 1));
+        }
+      }
+    }
+    for (auto const& suffix : suffixes) {
+      strings.push_back(layout + suffix);
+    }
+  }
+  return strings;
+}
+
+/**
+ * @brief Replaces the first two '-' of a timestamp string with '/'.
+ *
+ * For a string without '/', timestamp parsing gives the same result for the returned string, which
+ * never has the fixed ISO 8601 layout: the parsing treats '-' and '/' alike when it looks for the
+ * end of the date, uses the first two separators of the date (all '-' or all '/'), and ignores
+ * both in the components and in the time of day.
+ *
+ * @param timestamp Timestamp string without '/'
+ * @return The string with '/' as date separator
+ */
+inline std::string with_slash_date_separators(std::string timestamp)
+{
+  for (int i = 0; i < 2; ++i) {
+    if (auto const position = timestamp.find('-'); position != std::string::npos) {
+      timestamp[position] = '/';
+    }
+  }
+  return timestamp;
+}
 
 }  // namespace cudf::test
 
