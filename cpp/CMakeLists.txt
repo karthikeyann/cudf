@@ -829,6 +829,7 @@ add_library(
   src/io/csv/csv_gpu.cu
   src/io/csv/durations.cu
   src/io/csv/reader_impl.cu
+  src/io/csv/string_columns.cu
   src/io/csv/writer_impl.cu
   src/io/functions.cpp
   src/io/cudftable.cpp

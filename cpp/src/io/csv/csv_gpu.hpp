@@ -5,12 +5,15 @@
 
 #pragma once
 
+#include "csv_common.hpp"
 #include "io/utilities/parsing_utils.cuh"
 
 #include <cudf/types.hpp>
 
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/std/limits>
+#include <cuda/std/utility>
 #include <cuda/stream>
 
 #include <vector>
@@ -30,6 +33,24 @@ namespace gpu {
  * EOF: End state (EOF reached)
  */
 enum { ROW_CTX_NONE = 0, ROW_CTX_QUOTE = 1, ROW_CTX_COMMENT = 2, ROW_CTX_EOF = 3 };
+
+/// A string field and its size, as decoded by `decode_row_column_data`; the field is null if the
+/// pointer is null
+using decoded_string = cuda::std::pair<char const*, size_type>;
+
+/**
+ * @brief Size that `decode_row_column_data` gives to a string field longer than a string can be
+ * (`std::numeric_limits<size_type>::max()` characters), so that the reader can reject it.
+ */
+constexpr size_type oversized_string_size = -2;
+
+/// Size to decode for a string field of `length` characters (see `oversized_string_size`)
+__host__ __device__ constexpr size_type decoded_string_size(size_t length)
+{
+  return length <= static_cast<size_t>(cuda::std::numeric_limits<size_type>::max())
+           ? static_cast<size_type>(length)
+           : oversized_string_size;
+}
 
 constexpr uint32_t rowofs_block_dim = 512;
 /// Character block size for gather_row_offsets
@@ -258,7 +279,7 @@ std::vector<column_type_histogram> detect_column_types(
 /**
  * @brief Launches kernel for decoding row-column data
  *
- * String columns are output as (pointer, length) pairs that point into `data`, except for the
+ * String columns are output as `decoded_string` pairs that point into `data`, except for the
  * quoted fields with escaped quote pairs when `options.doublequote` is set: the pairs are
  * collapsed into `unescape_buffer`, at the offsets of the fields in `data`, and the (pointer,
  * length) pairs describe the unescaped strings there. `unescape_buffer` is either scratch memory or
@@ -277,7 +298,8 @@ std::vector<column_type_histogram> detect_column_types(
  * @param[in] dtypes List of dtype corresponding to each column
  * @param[out] columns Device memory output of column data. Fixed-width data is only written where
  * the field is valid and needs no initialization; string pairs must be zero-initialized, since
- * fields missing from short rows are not written
+ * fields missing from short rows are not written. Fields too long for a string get the size
+ * `oversized_string_size`
  * @param[in,out] valids Validity bitmaps of the columns; must be zero-initialized. The bits of the
  * valid fields of non-string columns are set
  * @param[in] staging_size Shared memory size needed to stage the rows of every thread block, as

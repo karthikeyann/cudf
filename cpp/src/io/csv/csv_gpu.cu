@@ -950,9 +950,8 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
               length = unescaped_length;
             }
           }
-          auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-          str_list[rec_id].first  = str;
-          str_list[rec_id].second = length;
+          static_cast<decoded_string*>(columns[actual_col])[rec_id] = {str,
+                                                                       decoded_string_size(length)};
         } else {
           if (cudf::type_dispatcher(dtype,
                                     ConvertFunctor{},
@@ -968,9 +967,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           }
         }
       } else if (dtype.id() == cudf::type_id::STRING) {
-        auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
-        str_list[rec_id].first  = nullptr;
-        str_list[rec_id].second = 0;
+        static_cast<decoded_string*>(columns[actual_col])[rec_id] = {nullptr, 0};
       }
       ++actual_col;
     }

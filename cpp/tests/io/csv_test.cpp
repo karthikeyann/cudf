@@ -31,6 +31,8 @@
 #include <cudf/table/table_view.hpp>
 
 #include <rmm/device_uvector.hpp>
+#include <rmm/mr/callback_memory_resource.hpp>
+#include <rmm/mr/cuda_async_memory_resource.hpp>
 #include <rmm/mr/cuda_memory_resource.hpp>
 #include <rmm/mr/pool_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
@@ -49,6 +51,7 @@
 #include <numeric>
 #include <optional>
 #include <random>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -4483,31 +4486,43 @@ TEST_F(CsvReaderTest, TypeInferenceOfWideTables)
 
 namespace {
 /**
- * @brief Sets the policy with which the CSV decoding kernels stage rows in shared memory (the
- * `LIBCUDF_CSV_ROW_STAGING` environment variable) for the lifetime of the object, and then restores
- * the previous one.
+ * @brief Sets an environment variable for the lifetime of the object, and then restores its
+ * previous value (or unsets it).
  */
-class row_staging_policy_setter {
+class environment_variable_setter {
  public:
-  explicit row_staging_policy_setter(char const* policy)
+  environment_variable_setter(char const* variable, char const* value) : _variable{variable}
   {
     if (auto const* previous = std::getenv(variable); previous != nullptr) { _previous = previous; }
-    setenv(variable, policy, 1);
+    setenv(variable, value, 1);
   }
-  row_staging_policy_setter(row_staging_policy_setter const&)            = delete;
-  row_staging_policy_setter& operator=(row_staging_policy_setter const&) = delete;
-  ~row_staging_policy_setter()
+  environment_variable_setter(environment_variable_setter const&)            = delete;
+  environment_variable_setter& operator=(environment_variable_setter const&) = delete;
+  ~environment_variable_setter()
   {
     if (_previous.has_value()) {
-      setenv(variable, _previous->c_str(), 1);
+      setenv(_variable, _previous->c_str(), 1);
     } else {
-      unsetenv(variable);
+      unsetenv(_variable);
     }
   }
 
  private:
-  static constexpr char const* variable = "LIBCUDF_CSV_ROW_STAGING";
+  char const* _variable;
   std::optional<std::string> _previous;
+};
+
+/**
+ * @brief Sets the policy with which the CSV decoding kernels stage rows in shared memory (the
+ * `LIBCUDF_CSV_ROW_STAGING` environment variable) for the lifetime of the object, and then restores
+ * the previous one.
+ */
+class row_staging_policy_setter : environment_variable_setter {
+ public:
+  explicit row_staging_policy_setter(char const* policy)
+    : environment_variable_setter{"LIBCUDF_CSV_ROW_STAGING", policy}
+  {
+  }
 };
 
 /**
@@ -5610,6 +5625,549 @@ TEST_F(CsvReaderTest, FixedLayoutIsoTimestamps)
     std::vector<cudf::timestamp_ms>{cudf::timestamp_ms{leap_day + 13h + 45min + 59s + 123ms},
                                     cudf::timestamp_ms{leap_day + 13h + 45min + 59s + 5ms}},
     result.tbl->get_column(0));
+}
+
+namespace {
+/// Reads a CSV buffer without a header, with string columns only, in which only "NA" is null
+cudf::io::table_with_metadata read_string_columns(cudf::io::source_info const& source,
+                                                  int num_columns)
+{
+  return cudf::io::read_csv(
+    cudf::io::csv_reader_options::builder(source)
+      .compression(cudf::io::compression_type::NONE)
+      .header(-1)
+      .keep_default_na(false)
+      .na_values({"NA"})
+      .dtypes(std::vector<data_type>(num_columns, dtype<cudf::string_view>()))
+      .build());
+}
+
+cudf::io::table_with_metadata read_string_columns(std::string const& buffer, int num_columns)
+{
+  return read_string_columns(cudf::io::source_info{cudf::host_span<std::byte const>{
+                               reinterpret_cast<std::byte const*>(buffer.data()), buffer.size()}},
+                             num_columns);
+}
+
+/**
+ * @brief Runs `test` with each row staging policy, with every device allocation filled with a
+ * byte pattern first.
+ *
+ * Device memory that the reader reads without writing it then holds the pattern, whatever earlier
+ * allocations left in it, so that such reads change the results deterministically. A decoded
+ * string size of the pattern is negative, but neither the size of a null row nor that of an
+ * oversized field, so an unwritten row reads as a valid empty string, which the tests catch because
+ * the only rows that can be left unwritten are null. An unwritten size of the strings copied
+ * separately reads as a copy of nothing, so the tests do not catch unwritten slots of those (the
+ * kernels count and list the same strings, with the same `is_copied_separately`).
+ */
+template <typename Test>
+void with_each_row_staging_policy_in_filled_memory(Test const& test)
+{
+  constexpr int fill_byte = 0xab;
+  rmm::mr::cuda_async_memory_resource upstream;
+  cudf::test::scoped_current_device_resource const filled{rmm::mr::callback_memory_resource{
+    [&upstream](std::size_t bytes, cuda::stream_ref stream, void*) {
+      auto* ptr = upstream.allocate(stream, bytes, cuda::mr::default_cuda_malloc_alignment);
+      CUDF_CUDA_TRY(cudaMemsetAsync(ptr, fill_byte, bytes, stream.get()));
+      return ptr;
+    },
+    [&upstream](void* ptr, std::size_t bytes, cuda::stream_ref stream, void*) {
+      upstream.deallocate(stream, ptr, bytes, cuda::mr::default_cuda_malloc_alignment);
+    }}};
+  with_each_row_staging_policy(test);
+}
+
+/// Rows of string columns, as CSV text and as the expected columns, built field by field
+struct string_rows {
+  std::string text;
+  std::vector<std::vector<std::string>> values;
+  std::vector<std::vector<bool>> valid;
+
+  explicit string_rows(int num_columns) : values(num_columns), valid(num_columns) {}
+
+  /// Appends a field of column `col` holding `value`, written as `field` (null if `std::nullopt`)
+  void add(int col, std::optional<std::string> const& value, std::string const& field)
+  {
+    if (col != 0) { text += ','; }
+    text += field;
+    values[col].push_back(value.value_or(""));
+    valid[col].push_back(value.has_value());
+  }
+
+  /// Appends a field of column `col` holding `value`, unquoted, or "NA" if `std::nullopt`
+  void add(int col, std::optional<std::string> const& value)
+  {
+    add(col, value, value.value_or("NA"));
+  }
+
+  void end_row() { text += '\n'; }
+
+  [[nodiscard]] cudf::table expected() const
+  {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    for (size_t col = 0; col < values.size(); ++col) {
+      columns.push_back(cudf::test::strings_column_wrapper(
+                          values[col].begin(), values[col].end(), valid[col].begin())
+                          .release());
+    }
+    return cudf::table{std::move(columns)};
+  }
+};
+}  // namespace
+
+TEST_F(CsvReaderTest, StringColumnsAcrossWarpsAndBlocks)
+{
+  // String columns of strings of 0 to 40 characters, of nulls only, of empty strings and nulls, of
+  // nulls in the first and the last rows and around the rows of each warp, and of strings with
+  // escaped quotes (which are unescaped into other memory than the other strings). The row counts
+  // cover partial and whole warps and blocks of rows of the kernels that build the columns.
+  constexpr int num_columns = 5;
+  for (int const num_rows : {1, 31, 32, 33, 255, 256, 257, 1000}) {
+    SCOPED_TRACE("rows " + std::to_string(num_rows));
+    string_rows rows(num_columns);
+    for (int i = 0; i < num_rows; ++i) {
+      auto const text = std::to_string(i);
+      rows.add(0, std::string(i % 41, static_cast<char>('a' + i % 26)));
+      rows.add(1, std::nullopt);
+      rows.add(2,
+               i % 3 == 0   ? std::optional<std::string>{""}
+               : i % 3 == 1 ? std::nullopt
+                            : std::optional<std::string>{"x"});
+      auto const is_edge = i == 0 or i == num_rows - 1 or i % 32 == 0 or i % 32 == 31;
+      rows.add(3, is_edge ? std::nullopt : std::optional<std::string>{"r" + text});
+      rows.add(4, "a\"" + text + "\"", "\"a\"\"" + text + "\"\"\"");
+      rows.end_row();
+    }
+    auto const expected = rows.expected();
+    with_each_row_staging_policy_in_filled_memory([&] {
+      auto const result = read_string_columns(rows.text, num_columns);
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+      EXPECT_EQ(result.tbl->view().column(1).null_count(), num_rows);
+      EXPECT_EQ(result.tbl->view().column(0).null_count(), 0);
+    });
+  }
+}
+
+TEST_F(CsvReaderTest, ManyStringColumnsWithMissingFields)
+{
+  // More string columns than rows of a warp, of rows that miss up to all but one of their trailing
+  // fields; the missing fields are null. Also with only some of the columns selected.
+  constexpr int num_columns = 70;
+  constexpr int num_rows    = 300;
+  string_rows rows(num_columns);
+  for (int i = 0; i < num_rows; ++i) {
+    // The first row has all the fields, so that all the columns are detected
+    auto const num_fields = num_columns - i % num_columns;
+    for (int col = 0; col < num_columns; ++col) {
+      if (col >= num_fields) {
+        rows.values[col].emplace_back();
+        rows.valid[col].push_back(false);
+      } else {
+        rows.add(col,
+                 (i + col) % 11 == 0
+                   ? std::nullopt
+                   : std::optional<std::string>{std::to_string(col) + ":" + std::to_string(i)});
+      }
+    }
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  std::vector<cudf::size_type> const selected{0, 1, 33, 64, 69};
+  with_each_row_staging_policy_in_filled_memory([&] {
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(),
+                                       read_string_columns(rows.text, num_columns).tbl->view());
+
+    auto opts = cudf::io::csv_reader_options::builder(
+                  cudf::io::source_info{cudf::host_span<std::byte const>{
+                    reinterpret_cast<std::byte const*>(rows.text.data()), rows.text.size()}})
+                  .compression(cudf::io::compression_type::NONE)
+                  .header(-1)
+                  .keep_default_na(false)
+                  .na_values({"NA"})
+                  .use_cols_indexes(selected)
+                  .dtypes(std::vector<data_type>(num_columns, dtype<cudf::string_view>()))
+                  .build();
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view().select(selected),
+                                       cudf::io::read_csv(opts).tbl->view());
+  });
+}
+
+TEST_F(CsvReaderTest, MoreStringColumnsThanGridDimension)
+{
+  // The string columns are built by a kernel that indexes the columns with the second dimension of
+  // its grid, which is limited to 65535. The decoding does not depend on the row staging policy.
+  constexpr int num_columns = 70'000;
+  constexpr int num_rows    = 3;
+  // The read makes a few allocations per column; allocate them from a pool, as each allocation of
+  // the upstream resource is slow under compute-sanitizer
+  cudf::test::scoped_current_device_resource const pool{
+    rmm::mr::pool_memory_resource{rmm::mr::cuda_memory_resource{}, 64 << 20}};
+  std::string buffer;
+  for (int row = 0; row < num_rows; ++row) {
+    for (int col = 0; col < num_columns; ++col) {
+      if (col != 0) { buffer += ','; }
+      // Column `col` has `col % num_rows` nulls
+      buffer += row < col % num_rows ? "NA" : std::string(1 + (col + row) % 3, 'a' + row);
+    }
+    buffer += '\n';
+  }
+  auto const result = read_string_columns(buffer, num_columns);
+  auto const view   = result.tbl->view();
+  ASSERT_EQ(view.num_columns(), num_columns);
+  for (int col = 0; col < num_columns; ++col) {
+    ASSERT_EQ(view.column(col).null_count(), col % num_rows) << "column " << col;
+  }
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(
+    view.column(num_columns - 2),
+    cudf::test::strings_column_wrapper({"", "", "cc"}, {false, false, true}));
+  CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(view.column(num_columns - 1),
+                                      cudf::test::strings_column_wrapper({"a", "bb", "ccc"}));
+}
+
+TEST_F(CsvReaderTest, LongStringsAmongShortStrings)
+{
+  // Strings longer than the reader copies with the other strings of their warps are copied
+  // separately. They are placed in the first and last rows, next to each other, next to empty and
+  // null strings, at the edges of warps and blocks of rows, and make up whole columns.
+  constexpr int num_rows = 600;
+  auto const long_string = [](int row, size_t length) {
+    std::string value(length, static_cast<char>('A' + row % 26));
+    // Distinct characters at both ends catch misplaced copies
+    value.front() = '<';
+    value.back()  = '>';
+    return value;
+  };
+  std::vector<size_t> const long_lengths{1000, 1023, 1024, 1025, 1500, 4096, 100'000};
+  std::set<int> const long_rows{0, 1, 2, 30, 31, 32, 100, 101, 255, 256, 257, num_rows - 1};
+  string_rows rows(3);
+  for (int i = 0; i < num_rows; ++i) {
+    auto const length = long_lengths[i % long_lengths.size()];
+    if (long_rows.contains(i)) {
+      rows.add(0, long_string(i, length));
+    } else if (long_rows.contains(i - 1) or long_rows.contains(i + 1)) {
+      rows.add(0, i % 2 == 0 ? std::nullopt : std::optional<std::string>{""});
+    } else {
+      rows.add(0, std::to_string(i));
+    }
+    rows.add(1, long_string(i, length));
+    rows.add(2, i == 50 ? long_string(i, 1 << 20) : std::to_string(i));
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  with_each_row_staging_policy_in_filled_memory([&] {
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(),
+                                       read_string_columns(rows.text, 3).tbl->view());
+  });
+}
+
+TEST_F(CsvReaderTest, StringColumnsWithLargeOffsets)
+{
+  // String columns with at least LIBCUDF_LARGE_STRINGS_THRESHOLD characters have 64-bit offsets,
+  // and the others 32-bit offsets
+  constexpr int num_rows = 300;
+  string_rows rows(3);
+  for (int i = 0; i < num_rows; ++i) {
+    rows.add(0, std::string(i % 7, 'x'));
+    rows.add(1, i == 7 ? std::optional<std::string>{"y"} : std::optional<std::string>{""});
+    rows.add(2, i % 5 == 0 ? std::nullopt : std::optional<std::string>{std::to_string(i)});
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  environment_variable_setter const threshold{"LIBCUDF_LARGE_STRINGS_THRESHOLD", "100"};
+  with_each_row_staging_policy([&] {
+    auto const result = read_string_columns(rows.text, 3);
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+    auto const offsets_type = [&](int col) {
+      return cudf::strings_column_view(result.tbl->view().column(col)).offsets().type().id();
+    };
+    EXPECT_EQ(offsets_type(0), type_id::INT64);
+    EXPECT_EQ(offsets_type(1), type_id::INT32);
+    EXPECT_EQ(offsets_type(2), type_id::INT64);
+  });
+
+  environment_variable_setter const disabled{"LIBCUDF_LARGE_STRINGS_ENABLED", "0"};
+  EXPECT_THROW(read_string_columns(rows.text, 3), std::overflow_error);
+}
+
+TEST_F(CsvReaderTest, StringsOfDeviceBuffersAreCopied)
+{
+  // Strings are read from device buffers in place, and copied into the columns: the columns do
+  // not change when the buffer is overwritten after the read
+  string_rows rows(2);
+  for (int i = 0; i < 100; ++i) {
+    rows.add(0, "s" + std::to_string(i));
+    rows.add(1, "q\"" + std::to_string(i), "\"q\"\"" + std::to_string(i) + "\"");
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  auto const stream   = cudf::get_default_stream();
+  with_each_row_staging_policy([&] {
+    auto d_buffer = cudf::detail::make_device_uvector(
+      cudf::host_span<char const>{rows.text.data(), rows.text.size()},
+      stream,
+      cudf::get_current_device_resource_ref());
+    auto const result =
+      read_string_columns(cudf::io::source_info{cudf::device_span<std::byte const>{
+                            reinterpret_cast<std::byte const*>(d_buffer.data()), d_buffer.size()}},
+                          2);
+    CUDF_CUDA_TRY(cudaMemsetAsync(d_buffer.data(), 'X', d_buffer.size(), stream.get()));
+    stream.sync();
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+  });
+}
+
+TEST_F(CsvReaderTest, InferredStringColumnsOfRaggedRows)
+{
+  // Columns inferred as strings, of rows that miss up to all of their fields: blank rows are kept,
+  // and all of their fields are null
+  constexpr int num_columns = 4;
+  string_rows rows(num_columns);
+  for (int i = 0; i < 700; ++i) {
+    // The first row has all the fields, so that all the columns are detected
+    auto const num_fields = i == 0 ? num_columns : i % (num_columns + 1);
+    for (int col = 0; col < num_columns; ++col) {
+      if (col < num_fields) {
+        rows.add(col,
+                 col == 1 ? std::to_string(i) + "x"
+                          : std::string(1 + (i + col) % 9, static_cast<char>('a' + col)));
+      } else {
+        rows.values[col].emplace_back();
+        rows.valid[col].push_back(false);
+      }
+    }
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  with_each_row_staging_policy_in_filled_memory([&] {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(rows.text).header(-1).skip_blank_lines(false).build());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+  });
+}
+
+TEST_F(CsvReaderTest, WhitespaceDelimitedStringColumnsOfShortRows)
+{
+  // Rows of 0 to 3 whitespace-delimited fields, with leading and trailing whitespace, and a last
+  // row of whitespace only and no terminator: the missing fields are null.
+  // A string field keeps all but one of the whitespace characters that follow it, unlike pandas,
+  // which drops them all. The test pins this long-standing behavior, so that a change to it is
+  // noticed.
+  constexpr int num_columns = 3;
+  std::string text;
+  std::vector<std::vector<std::string>> values(num_columns);
+  std::vector<std::vector<bool>> valid(num_columns);
+  auto const add_row = [&](std::vector<std::string> const& fields,
+                           std::string const& leading,
+                           std::string const& separator,
+                           std::string const& trailing) {
+    text += leading;
+    for (size_t col = 0; col < fields.size(); ++col) {
+      text += (col == 0 ? "" : separator) + fields[col];
+    }
+    text += trailing;
+    // Whitespace characters that follow each field, all but one of which the field keeps
+    auto const kept_whitespace = [](std::string const& run) {
+      auto const length = run.find_first_not_of(' ');
+      auto const spaces = length == std::string::npos ? run.size() : length;
+      return std::string(std::max<size_t>(spaces, 1) - 1, ' ');
+    };
+    for (size_t col = 0; col < num_columns; ++col) {
+      auto const& following = col + 1 < fields.size() ? separator : trailing;
+      values[col].push_back(col < fields.size() ? fields[col] + kept_whitespace(following) : "");
+      valid[col].push_back(col < fields.size());
+    }
+  };
+  for (int i = 0; i < 300; ++i) {
+    // Rows of whitespace only have no fields
+    auto const num_fields = i == 0 ? num_columns : i % 7 == 5 ? 0 : 1 + i % num_columns;
+    std::vector<std::string> fields;
+    for (int col = 0; col < num_fields; ++col) {
+      fields.push_back("w" + std::to_string(i * num_columns + col));
+    }
+    add_row(fields,
+            i % 2 == 0 and num_fields != 0 ? "" : "   ",
+            i % 4 == 0 ? " " : "   ",
+            i % 3 == 0 ? "   \n" : "\n");
+  }
+  add_row({"last"}, "  ", " ", "   \n");
+  // Only a last row without a terminator can end in its leading whitespace
+  add_row({}, "   ", " ", "");
+
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (int col = 0; col < num_columns; ++col) {
+    columns.push_back(
+      cudf::test::strings_column_wrapper(values[col].begin(), values[col].end(), valid[col].begin())
+        .release());
+  }
+  auto const expected = cudf::table{std::move(columns)};
+  for (bool const infer_types : {false, true}) {
+    SCOPED_TRACE(infer_types ? "inferred types" : "explicit types");
+    with_each_row_staging_policy_in_filled_memory([&] {
+      auto opts = host_buffer_options(text).header(-1).delim_whitespace(true).build();
+      if (not infer_types) {
+        opts.set_dtypes(std::vector<data_type>(num_columns, dtype<cudf::string_view>()));
+      }
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), cudf::io::read_csv(opts).tbl->view());
+    });
+  }
+}
+
+TEST_F(CsvReaderTest, SelectedStringColumnsOfShortRows)
+{
+  // Selected string columns of rows that miss up to all of their fields, with blank rows kept
+  constexpr int num_columns = 7;
+  string_rows rows(num_columns);
+  for (int i = 0; i < 520; ++i) {
+    auto const num_fields = i == 0 ? num_columns : i % (num_columns + 1);
+    for (int col = 0; col < num_columns; ++col) {
+      if (col < num_fields) {
+        rows.add(col,
+                 col % 2 == 1 ? std::to_string(i + col)
+                              : "s" + std::to_string(i) + "_" + std::to_string(col));
+      } else {
+        rows.values[col].emplace_back();
+        rows.valid[col].push_back(false);
+      }
+    }
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  std::vector<int> const selected{1, 4, 6};
+  with_each_row_staging_policy_in_filled_memory([&] {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(rows.text)
+                           .header(-1)
+                           .skip_blank_lines(false)
+                           .use_cols_indexes(selected)
+                           .dtypes(std::vector<data_type>(num_columns, dtype<cudf::string_view>()))
+                           .build());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view().select(selected.begin(), selected.end()),
+                                       result.tbl->view());
+  });
+}
+
+TEST_F(CsvReaderTest, LeadingStringColumnsOfShortRows)
+{
+  // The first two of 70 string columns selected, of rows of 1 or 70 fields: the fields missing
+  // from short rows include 68 trailing columns that are not selected, which have neither a type
+  // nor decoded strings (reading them reads past the kernel inputs, which memcheck detects)
+  constexpr int num_columns = 70;
+  string_rows rows(2);
+  for (int i = 0; i < 100; ++i) {
+    auto const is_full = i % 3 == 0;
+    rows.add(0, "r" + std::to_string(i));
+    if (is_full) {
+      rows.add(1, "f1");
+      for (int col = 2; col < num_columns; ++col) {
+        rows.text += ",f" + std::to_string(col);
+      }
+    } else {
+      rows.values[1].emplace_back();
+      rows.valid[1].push_back(false);
+    }
+    rows.end_row();
+  }
+  auto const expected = rows.expected();
+  with_each_row_staging_policy_in_filled_memory([&] {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(rows.text)
+                           .header(-1)
+                           .use_cols_indexes({0, 1})
+                           .dtypes(std::vector<data_type>(num_columns, dtype<cudf::string_view>()))
+                           .build());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+  });
+}
+
+TEST_F(CsvReaderTest, LongStringsAtEndOfUnalignedDeviceBuffers)
+{
+  // Short, long (from the longest string copied with the others of its warp, 1 KiB, on) and
+  // escaped strings read from device buffers at every alignment, in allocations that end where the
+  // data ends, with a last row of long fields and no terminator: the columns are those read from a
+  // host buffer, and the buffers are unchanged
+  constexpr int num_columns = 3;
+  std::string text;
+  for (int i = 0; i < 300; ++i) {
+    text += std::string(i % 50, static_cast<char>('a' + i % 26)) + ",";
+    text += (i % 37 == 0 ? std::string(1024 + i, 'L') : "b" + std::to_string(i)) + ",";
+    text += "\"q\"\"" + std::to_string(i) + "\"\n";
+  }
+  text += "tail," + std::string(3000, 'Z') + ",\"end\"\"" + std::string(2000, 'E') + "\"";
+  auto const dtypes = std::vector<data_type>(num_columns, dtype<cudf::string_view>());
+  auto const read   = [&](cudf::io::source_info const& source) {
+    return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source)
+                                .compression(cudf::io::compression_type::NONE)
+                                .header(-1)
+                                .dtypes(dtypes)
+                                .build());
+  };
+  auto const expected = read(cudf::io::source_info{cudf::host_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(text.data()), text.size()}});
+  with_each_row_staging_policy([&] {
+    for (size_t offset = 0; offset < 16; ++offset) {
+      SCOPED_TRACE("offset " + std::to_string(offset));
+      auto const d_buffer = device_copy_at_offset(text, offset);
+      auto const result   = read(cudf::io::source_info{cudf::device_span<std::byte const>{
+        reinterpret_cast<std::byte const*>(d_buffer.data() + offset), text.size()}});
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.tbl->view(), result.tbl->view());
+      expect_device_copy_unchanged(d_buffer, text, offset);
+    }
+  });
+}
+
+TEST_F(CsvReaderTest, StringColumnsOfByteRangesAndRowSelections)
+{
+  // Rows of an integer, a string, a double and an escaped string, and short rows: the byte ranges
+  // of the data read together the rows of the whole data, and skiprows and nrows select a slice
+  std::string text;
+  for (int i = 0; i < 2000; ++i) {
+    text += std::to_string(i) + ",s" + std::to_string(i) + "," + std::to_string(i * 0.5) +
+            ",\"t\"\"" + std::to_string(i) + "\"\n";
+    if (i % 97 == 0) { text += std::to_string(i) + "\n"; }
+  }
+  auto const full = cudf::io::read_csv(host_buffer_options(text).header(-1).build());
+
+  constexpr size_t range_size = 777;
+  std::vector<std::unique_ptr<cudf::table>> ranges;
+  for (size_t offset = 0; offset < text.size(); offset += range_size) {
+    auto range = cudf::io::read_csv(host_buffer_options(text)
+                                      .header(-1)
+                                      .byte_range_offset(offset)
+                                      .byte_range_size(range_size)
+                                      .dtypes({dtype<int64_t>(),
+                                               dtype<cudf::string_view>(),
+                                               dtype<double>(),
+                                               dtype<cudf::string_view>()})
+                                      .build());
+    // Ranges without the start of a row are empty
+    if (range.tbl->num_columns() != 0) { ranges.push_back(std::move(range.tbl)); }
+  }
+  std::vector<cudf::table_view> range_views;
+  for (auto const& range : ranges) {
+    range_views.push_back(range->view());
+  }
+  CUDF_TEST_EXPECT_TABLES_EQUIVALENT(full.tbl->view(), cudf::concatenate(range_views)->view());
+
+  auto const selected =
+    cudf::io::read_csv(host_buffer_options(text).header(-1).skiprows(10).nrows(500).build());
+  CUDF_TEST_EXPECT_TABLES_EQUIVALENT(cudf::slice(full.tbl->view(), {10, 510})[0],
+                                     selected.tbl->view());
+}
+
+TEST_F(CsvReaderTest, HeaderOnlyStringColumns)
+{
+  // String columns of no rows, with and without a terminator after the header
+  for (std::string const text : {"a,b\n", "a,b"}) {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(text)
+                           .dtypes(std::vector<data_type>(2, dtype<cudf::string_view>()))
+                           .build());
+    ASSERT_EQ(result.tbl->num_columns(), 2);
+    EXPECT_EQ(result.tbl->num_rows(), 0);
+    EXPECT_EQ(result.tbl->get_column(0).type().id(), type_id::STRING);
+    EXPECT_EQ(result.tbl->get_column(1).type().id(), type_id::STRING);
+  }
 }
 
 namespace {
