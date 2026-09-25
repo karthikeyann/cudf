@@ -330,9 +330,9 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   cuda::stream_ref stream)
 {
   // Reads with row selection parse chunks of at most this size, so that they can stop early. Whole
-  // files and pinned host inputs larger than this are parsed in chunks too, overlapping reading with
-  // parsing (see below). Other reads parse the whole input as one chunk: every chunk synchronizes
-  // the stream to gather its row offsets and regrows the offsets.
+  // files and pinned host inputs larger than this are parsed in chunks too, overlapping reading
+  // with parsing (see below). Other reads parse the whole input as one chunk: every chunk
+  // synchronizes the stream to gather its row offsets and regrows the offsets.
   constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
 
   auto const data_size      = data.has_value() ? data->size() : source->size();
@@ -364,18 +364,20 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // need not support), or such pinned host input copied on another stream, is read in chunks, and
   // the row offsets of each chunk are gathered once it has been read, while the next ones are read.
   // Other whole inputs are parsed as one chunk.
-  auto const input_size = max_input_size - input_pos;
-  bool const whole_source = load_whole_file && !data.has_value() && !read_whole_input;
+  auto const input_size            = max_input_size - input_pos;
+  bool const whole_source          = load_whole_file && !data.has_value() && !read_whole_input;
   bool const device_read_preferred = whole_source && source->is_device_read_preferred(input_size);
   bool const read_in_chunks        = device_read_preferred && input_size > max_chunk_bytes &&
                               reader_opts.get_source().type() == io_type::FILEPATH;
   std::unique_ptr<datasource::buffer> host_input;
-  if (whole_source && !device_read_preferred) { host_input = source->host_read(input_pos, input_size); }
-  bool const copy_in_chunks =
-    host_input != nullptr && input_size > max_chunk_bytes && is_device_accessible(host_input->data());
+  if (whole_source && !device_read_preferred) {
+    host_input = source->host_read(input_pos, input_size);
+  }
+  bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes &&
+                              is_device_accessible(host_input->data());
   auto const chunk_bytes =
     load_whole_file && !read_in_chunks && !copy_in_chunks ? data_size : max_chunk_bytes;
-  auto const buffer_size    = std::min(chunk_bytes, data_size);
+  auto const buffer_size = std::min(chunk_bytes, data_size);
 
   device_input input{rmm::device_uvector<char>{0, stream}, nullptr};
   auto& d_data = input.copy;
@@ -450,11 +452,11 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         // first served) and synchronizes `stream` before reading into device memory.
         for (size_t offset = chunks.reads.empty() ? 0 : input_size; offset < input_size;
              offset += chunk_bytes) {
-          chunks.reads.push_back(source->device_read_async(
-            input_pos + offset,
-            std::min(chunk_bytes, input_size - offset),
-            reinterpret_cast<uint8_t*>(d_data.data() + offset),
-            stream));
+          chunks.reads.push_back(
+            source->device_read_async(input_pos + offset,
+                                      std::min(chunk_bytes, input_size - offset),
+                                      reinterpret_cast<uint8_t*>(d_data.data() + offset),
+                                      stream));
         }
         chunks.reads[previous_data_size / chunk_bytes].get();
       } else if (source->is_device_read_preferred(read_size)) {

@@ -6711,10 +6711,12 @@ TEST_F(CsvReaderTest, BomPrefixedPinnedHostBuffersAndFiles)
   // the same data from pageable memory, which is parsed as one chunk.
   std::string large = "\xEF\xBB\xBF";
   for (int i = 0; large.size() < 64u * 1024 * 1024 + 4096; ++i) {
-    large += std::to_string(i) + ",\"" + std::string(100 + i % 13, 'a' + i % 26) + "\n\"\"x\"\"\"\n";
+    large +=
+      std::to_string(i) + ",\"" + std::string(100 + i % 13, 'a' + i % 26) + "\n\"\"x\"\"\"\n";
   }
   auto const stream = cudf::get_default_stream();
-  for (std::string const& text : {std::string{"\xEF\xBB\xBF"}, std::string{"\xEF\xBB\xBF\n"}, large}) {
+  for (std::string const& text :
+       {std::string{"\xEF\xBB\xBF"}, std::string{"\xEF\xBB\xBF\n"}, large}) {
     auto pinned = cudf::detail::make_pinned_vector<char>(text.size(), stream);
     std::copy(text.begin(), text.end(), pinned.begin());
     auto const filepath = temp_env->get_temp_filepath("BomPrefixed.csv");
@@ -6762,6 +6764,33 @@ TEST_F(CsvReaderTest, BlankRowsOnlyAfterFirstChunk)
     expected.tbl->view());
   CUDF_TEST_EXPECT_TABLES_EQUAL(read(cudf::io::source_info{filepath}).tbl->view(),
                                 expected.tbl->view());
+}
+
+TEST_F(CsvReaderTest, RowOffsetsOfMidRowCommentAndNonAsciiQuoteChars)
+{
+  // Comment characters that do not start a row, and a quote character above 0x7F (negative as
+  // char), in 32-character slices gathered aligned (skiprows) and shifted by one (a byte range
+  // with an offset), over several 16KB blocks
+  std::string buffer = "x,x\n";
+  for (int i = 0; i < 400; ++i) {
+    buffer += std::to_string(i) + ",mid#row " + std::string(i % 50, '#') + "\n";
+    buffer +=
+      "\xFE" + std::string(i % 40, 'q') + "\n#\xFE\xFE" + "\xFE," + std::to_string(i) + "\n";
+    buffer += "# comment " + std::string(64 + i % 7, 'c') + "\n";
+  }
+  auto builder = [&]() {
+    return cudf::io::csv_reader_options::builder(
+             cudf::io::source_info{cudf::host_span<char const>{buffer.data(), buffer.size()}})
+      .names({"a", "b"})
+      .header(-1)
+      .comment('#')
+      .quotechar('\xFE')
+      .dtypes(std::vector<data_type>{dtype<cudf::string_view>(), dtype<cudf::string_view>()});
+  };
+  auto const aligned   = cudf::io::read_csv(builder().skiprows(1).build());
+  auto const unaligned = cudf::io::read_csv(builder().byte_range_offset(1).build());
+  EXPECT_EQ(aligned.tbl->num_rows(), 800);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(aligned.tbl->view(), unaligned.tbl->view());
 }
 
 CUDF_TEST_PROGRAM_MAIN()

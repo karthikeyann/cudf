@@ -820,8 +820,8 @@ struct blank_row_chars {
  * @param c The character
  * @param c_prev The character before it, or the terminator at the start of the data
  */
-__device__ __forceinline__ uint32_t char_row_context(
-  int c, int c_prev, int terminator, int delimiter, int quotechar, int commentchar)
+__device__ __forceinline__ uint32_t
+char_row_context(int c, int c_prev, int terminator, int delimiter, int quotechar, int commentchar)
 {
   if (c_prev == terminator) {
     if (c == commentchar) {
@@ -896,6 +896,8 @@ __device__ __forceinline__ uint32_t match_bytes(uint32_t word, int c)
  * @param byte_range_start Ignore rows starting before this position in the file
  * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
  * @param skip_rows Number of rows to skip (ignored in phase 1)
+ * @param blank_chars Characters that make a row blank when it starts with one of them
+ * @param maybe_blank_rows Flag set in phase 2 if an output row may be blank
  * @param terminator Line terminator character
  * @param delimiter Column delimiter character
  * @param quotechar Quote character
@@ -940,8 +942,8 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   uint32_t const t     = threadIdx.x;
   // Phase 2's initial block context is loaded first, as it may be in host memory
   uint64_t const initial_ctx = (offsets_out.data() && t == 0) ? row_ctx[blockIdx.x] : 0;
-  size_t block_pos     = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
-  auto cur             = start + block_pos;
+  size_t block_pos = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
+  auto cur         = start + block_pos;
 
   // Initial state is neutral context (no state transitions), zero rows
   uint4 ctx_map = {
@@ -965,7 +967,6 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     uint4 const vectors[2] = {reinterpret_cast<uint4 const*>(cur)[0],
                               reinterpret_cast<uint4 const*>(cur)[1]};
     auto const words       = reinterpret_cast<uint32_t const*>(vectors);
-    auto const chars       = reinterpret_cast<char const*>(vectors);
     uint32_t terminators = 0, quotes = 0, comments = 0;
 #pragma unroll
     for (uint32_t i = 0; i < 8; i++) {
@@ -973,7 +974,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
       quotes |= match_bytes(words[i], quotechar) << (4 * i);
       comments |= match_bytes(words[i], commentchar) << (4 * i);
     }
-    auto const row_starts = (terminators << 1) | static_cast<uint32_t>(c_prev == terminator);
+    auto const row_starts  = (terminators << 1) | static_cast<uint32_t>(c_prev == terminator);
     auto constexpr regular = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
     if ((quotes | (comments & row_starts)) == 0) {
       ctx_map = {
@@ -989,7 +990,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
         merge_char_context(
           ctx_map,
           char_row_context(
-            chars[k], k > 0 ? chars[k - 1] : c_prev, terminator, delimiter, quotechar, commentchar),
+            cur[k], k > 0 ? cur[k - 1] : c_prev, terminator, delimiter, quotechar, commentchar),
           k);
         pos = k + 1;
       }
@@ -1052,9 +1053,8 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
         // Output byte offsets are relative to the base of the input buffer
         offsets_out[row - skip_rows] = block_pos - 1;
         rows_out_of_range += (start_offset + block_pos - 1 >= byte_range_end);
-        // The row starts in the parsed data, or at its end
-        maybe_blank |= blank_chars.is_blank({start, static_cast<size_t>(data_end - start)},
-                                            block_pos - 1);
+        // The row starts in `data` or at its end
+        maybe_blank |= blank_chars.is_blank(data, block_pos - 1);
       }
       row++;
       rowmap >>= pos;
@@ -1077,13 +1077,11 @@ size_t __host__ count_blank_rows(cudf::io::parse_options_view const& opts,
                                  device_span<uint64_t const> row_offsets,
                                  cuda::stream_ref stream)
 {
-  return thrust::count_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data, blank_chars = blank_row_chars{opts}] __device__(uint64_t const pos) {
-      return blank_chars.is_blank(data, pos);
-    });
+  return thrust::count_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                          row_offsets.begin(),
+                          row_offsets.end(),
+                          [data, blank_chars = blank_row_chars{opts}] __device__(
+                            uint64_t const pos) { return blank_chars.is_blank(data, pos); });
 }
 
 device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view const& options,
@@ -1091,15 +1089,12 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
                                                  device_span<uint64_t> row_offsets,
                                                  cuda::stream_ref stream)
 {
-  // Counting the blank rows only reads, so it is cheaper than the compaction when there are none
-  if (count_blank_rows(options, data, row_offsets, stream) == 0) { return row_offsets; }
-  auto new_end = thrust::remove_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data, blank_chars = blank_row_chars{options}] __device__(uint64_t const pos) {
-      return blank_chars.is_blank(data, pos);
-    });
+  auto new_end =
+    thrust::remove_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                      row_offsets.begin(),
+                      row_offsets.end(),
+                      [data, blank_chars = blank_row_chars{options}] __device__(
+                        uint64_t const pos) { return blank_chars.is_blank(data, pos); });
   return row_offsets.subspan(0, new_end - row_offsets.begin());
 }
 
