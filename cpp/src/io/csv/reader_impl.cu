@@ -1185,7 +1185,10 @@ table_with_metadata read_csv(cudf::io::datasource* source,
                                   buffer.size);
       }
     }
-    auto string_columns     = cudf::make_strings_column_batch(string_pairs, stream, mr);
+    // The batch synchronizes the stream even when there are no string columns
+    auto string_columns     = string_pairs.empty()
+                                ? std::vector<std::unique_ptr<cudf::column>>{}
+                                : cudf::make_strings_column_batch(string_pairs, stream, mr);
     auto next_string_column = string_columns.begin();
     for (auto& buffer : out_buffers) {
       out_columns.emplace_back(buffer.type.id() == type_id::STRING

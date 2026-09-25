@@ -467,7 +467,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                       device_span<cudf::bitmask_type* const> valids,
                       device_span<size_type> valid_counts)
 {
-  char const* const raw_csv = data.data();
+  auto const raw_csv = data.data();
   // thread IDs range per block, so also need the block id.
   // this is entry into the field array - tid is an elements within the num_entries array
   auto const rec_id      = grid_1d::global_thread_id();
@@ -532,7 +532,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
             }
           }
           // A quoted field has both of its quotes, so the content length is not negative
-          if (was_quoted && options.doublequote) {
+          if (was_quoted && options.doublequote && options.quotechar != '\0') {
             auto const out    = unescaped.data() + (field_start - raw_csv);
             auto const length = static_cast<size_t>(end - field_start);
             if (auto const unescaped_length =

@@ -6821,4 +6821,34 @@ TEST_F(CsvReaderTest, UserSourceWholeFileHostReadsInChunks)
     read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}}).tbl->view());
 }
 
+TEST_F(CsvReaderTest, FixedLayoutTimestampsParseAsGeneralLayouts)
+{
+  // Column a has the fixed ISO 8601 layout parsed at fixed positions; column b has the same values
+  // with single-digit months and days, which are parsed by searching for the separators. Also
+  // strings close to the fixed layout that must take the general parsing (AM/PM, no seconds,
+  // digits only), in both columns.
+  std::vector<std::pair<std::string, std::string>> const fields{
+    {"2020-03-04T05:06:07", "2020-3-4T05:06:07"},
+    {"2020-03-04 05:06:07", "2020-3-4 05:06:07"},
+    {"2020-03-04T05:06:07Z", "2020-3-4T05:06:07Z"},
+    {"2020-03-04T05:06:07.123", "2020-3-4T05:06:07.123"},
+    {"2020-03-04T05:06:07.5Z", "2020-3-4T05:06:07.5Z"},
+    {"1999-12-31T23:59:59.999", "1999-12-31T23:59:59.999"},
+    {"2020-03-04T05:06:07.123 PM", "2020-3-4T05:06:07.123 PM"},
+    {"2020-03-04T05:06", "2020-3-4T05:06"},
+    {"20200304", "20200304"}};
+  std::string buffer;
+  for (auto const& [fixed, general] : fields) {
+    buffer += fixed + "," + general + "\n";
+  }
+  for (auto const type : {type_id::TIMESTAMP_SECONDS, type_id::TIMESTAMP_MILLISECONDS}) {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(buffer)
+                           .header(-1)
+                           .dtypes(std::vector<data_type>{data_type{type}, data_type{type}})
+                           .build());
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), result.tbl->view().column(1));
+  }
+}
+
 CUDF_TEST_PROGRAM_MAIN()

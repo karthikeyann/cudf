@@ -100,14 +100,13 @@ CUDF_HOST_DEVICE constexpr char to_lower(char const c)
 CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
 {
   if (begin < end && (*begin == '-' || *begin == '+')) begin++;
-  char const* cinf = "infinity";
-  auto index       = begin;
-  while (index < end) {
-    if (*cinf != to_lower(*index)) break;
-    index++;
-    cinf++;
+  if (end - begin != 3 && end - begin != 8) { return false; }
+  // A branch-free comparison compiles into faster parsing kernels than an early exit
+  bool matches = true;
+  for (auto i = 0; i < end - begin; ++i) {
+    matches &= to_lower(begin[i]) == "infinity"[i];
   }
-  return ((index == begin + 3 || index == begin + 8) && index >= end);
+  return matches;
 }
 
 namespace detail {
