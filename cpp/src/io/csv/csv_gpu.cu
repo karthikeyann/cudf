@@ -787,6 +787,33 @@ rowctx_inverse_merge_transform(device_span<uint64_t const> ctxtree, uint32_t t)
 constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
 
 /**
+ * @brief The characters that make a row blank (skipped) when it starts with one of them: the
+ * terminator of an empty row if blank lines are skipped, the comment character, and the carriage
+ * return of an empty CRLF row.
+ */
+struct blank_row_chars {
+  char newline;
+  char comment;
+  char carriage;
+
+  explicit blank_row_chars(parse_options_view const& opts)
+    : newline{opts.skipblanklines ? opts.terminator : opts.comment},
+      comment{opts.comment != '\0' ? opts.comment : newline},
+      carriage{(opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment}
+  {
+  }
+
+  /**
+   * @brief Returns whether the row at `pos` in `data` is blank; `pos` may be the end of the data
+   */
+  [[nodiscard]] __device__ bool is_blank(device_span<char const> data, uint64_t pos) const
+  {
+    return pos != data.size() &&
+           (data[pos] == newline || data[pos] == comment || data[pos] == carriage);
+  }
+};
+
+/**
  * @brief Returns the context of a character for the row parser: its row start flags and output
  * context for each input context (see `make_char_context`).
  *
@@ -886,6 +913,8 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          size_t byte_range_start,
                          size_t byte_range_end,
                          size_t skip_rows,
+                         blank_row_chars const blank_chars,
+                         uint32_t* maybe_blank_rows,
                          int terminator,
                          int delimiter,
                          int quotechar,
@@ -1013,6 +1042,7 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     rowctx32_t ctx             = rowctx_inverse_merge_transform(bk_ctxtree, t);
     uint64_t row               = (bk_ctxtree[0] >> 2) + (ctx >> 2);
     uint32_t rows_out_of_range = 0;
+    bool maybe_blank           = false;
     uint32_t rowmap            = select_rowmap(ctx_map, ctx & 3);
     // Output row positions
     while (rowmap != 0) {
@@ -1022,11 +1052,14 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
         // Output byte offsets are relative to the base of the input buffer
         offsets_out[row - skip_rows] = block_pos - 1;
         rows_out_of_range += (start_offset + block_pos - 1 >= byte_range_end);
+        // The row starts in the parsed data, or at its end
+        maybe_blank |= blank_chars.is_blank({start, static_cast<size_t>(data_end - start)},
+                                            block_pos - 1);
       }
       row++;
       rowmap >>= pos;
     }
-    __syncthreads();
+    if (__syncthreads_or(maybe_blank) && t == 0) { atomicOr(maybe_blank_rows, 1u); }
     // Return the number of rows out of range
 
     using block_reduce = typename cub::BlockReduce<uint32_t, rowofs_block_dim>;
@@ -1044,16 +1077,12 @@ size_t __host__ count_blank_rows(cudf::io::parse_options_view const& opts,
                                  device_span<uint64_t const> row_offsets,
                                  cuda::stream_ref stream)
 {
-  auto const newline  = opts.skipblanklines ? opts.terminator : opts.comment;
-  auto const comment  = opts.comment != '\0' ? opts.comment : newline;
-  auto const carriage = (opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment;
   return thrust::count_if(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     row_offsets.begin(),
     row_offsets.end(),
-    [data = data, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != data.size()) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
+    [data, blank_chars = blank_row_chars{opts}] __device__(uint64_t const pos) {
+      return blank_chars.is_blank(data, pos);
     });
 }
 
@@ -1064,17 +1093,12 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
 {
   // Counting the blank rows only reads, so it is cheaper than the compaction when there are none
   if (count_blank_rows(options, data, row_offsets, stream) == 0) { return row_offsets; }
-  size_t d_size       = data.size();
-  auto const newline  = options.skipblanklines ? options.terminator : options.comment;
-  auto const comment  = options.comment != '\0' ? options.comment : newline;
-  auto const carriage = (options.skipblanklines && options.terminator == '\n') ? '\r' : comment;
-  auto new_end        = thrust::remove_if(
+  auto new_end = thrust::remove_if(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
     row_offsets.begin(),
     row_offsets.end(),
-    [data = data, d_size, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != d_size) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
+    [data, blank_chars = blank_row_chars{options}] __device__(uint64_t const pos) {
+      return blank_chars.is_blank(data, pos);
     });
   return row_offsets.subspan(0, new_end - row_offsets.begin());
 }
@@ -1133,6 +1157,7 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
                                      size_t byte_range_start,
                                      size_t byte_range_end,
                                      size_t skip_rows,
+                                     uint32_t* maybe_blank_rows,
                                      cuda::stream_ref stream)
 {
   uint32_t dim_grid = 1 + (chunk_size / rowofs_block_bytes);
@@ -1148,6 +1173,8 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
     byte_range_start,
     byte_range_end,
     skip_rows,
+    blank_row_chars{options},
+    maybe_blank_rows,
     options.terminator,
     options.delimiter,
     (options.quotechar) ? options.quotechar : 0x100,

@@ -6733,4 +6733,35 @@ TEST_F(CsvReaderTest, BomPrefixedPinnedHostBuffersAndFiles)
   }
 }
 
+TEST_F(CsvReaderTest, BlankRowsOnlyAfterFirstChunk)
+{
+  // Rows are only checked for blank ones if gathering them found a row that may be blank; here the
+  // blank, CRLF-blank and comment rows are all past the first 64MB chunk of the chunked reads
+  std::string text;
+  int num_rows = 0;
+  for (; text.size() < 64u * 1024 * 1024 + 4096; ++num_rows) {
+    text += std::to_string(num_rows) + "," + std::string(100 + num_rows % 13, 'x') + "\n";
+  }
+  text += "\n#comment\n\r\nlast,row\n";
+  ++num_rows;
+  auto const stream = cudf::get_default_stream();
+  auto pinned       = cudf::detail::make_pinned_vector<char>(text.size(), stream);
+  std::copy(text.begin(), text.end(), pinned.begin());
+  auto const filepath = temp_env->get_temp_filepath("BlankRowsOnlyAfterFirstChunk.csv");
+  std::ofstream(filepath, std::ios::binary) << text;
+  auto const read = [](cudf::io::source_info const& source) {
+    return cudf::io::read_csv(
+      cudf::io::csv_reader_options::builder(source).header(-1).comment('#').build());
+  };
+  auto const expected =
+    read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}});
+  EXPECT_EQ(expected.tbl->num_rows(), num_rows);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(
+    read(cudf::io::source_info{cudf::host_span<char const>{pinned.data(), pinned.size()}})
+      .tbl->view(),
+    expected.tbl->view());
+  CUDF_TEST_EXPECT_TABLES_EQUAL(read(cudf::io::source_info{filepath}).tbl->view(),
+                                expected.tbl->view());
+}
+
 CUDF_TEST_PROGRAM_MAIN()

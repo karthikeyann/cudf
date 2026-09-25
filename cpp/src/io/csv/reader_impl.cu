@@ -16,6 +16,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/device_scalar.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/host_worker_pool.hpp>
@@ -399,6 +400,9 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
     }
   } chunks;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
+  // Set when gathering outputs a row that may be blank, so that rows only need to be checked for
+  // blank ones if it is set
+  cudf::detail::device_scalar<uint32_t> maybe_blank_rows{0, stream};
 
   auto const max_blocks =
     std::max<size_t>((buffer_size / cudf::io::csv::gpu::rowofs_block_bytes) + 1, 2);
@@ -482,6 +486,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                                                                    range_begin,
                                                                    range_end,
                                                                    skip_rows,
+                                                                   maybe_blank_rows.data(),
                                                                    stream);
 
     cudf::detail::cuda_memcpy(
@@ -516,6 +521,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                                              range_begin,
                                              range_end,
                                              skip_rows,
+                                             maybe_blank_rows.data(),
                                              stream);
       // With byte range, we want to keep only one row out of the specified range
       if (range_end < data_size) {
@@ -558,7 +564,9 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   } while (pos < max_input_size);
 
   auto const non_blank_row_offsets =
-    io::csv::gpu::remove_blank_rows(parse_opts.view(), input.view(), all_row_offsets, stream);
+    maybe_blank_rows.value(stream) != 0
+      ? io::csv::gpu::remove_blank_rows(parse_opts.view(), input.view(), all_row_offsets, stream)
+      : device_span<uint64_t>{all_row_offsets};
   auto row_offsets = selected_rows_offsets{std::move(all_row_offsets), non_blank_row_offsets};
 
   // Remove header rows and extract header

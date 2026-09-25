@@ -136,6 +136,8 @@ inline __host__ __device__ rowctx64_t select_row_context(rowctx64_t sel_ctx,
  * @param byte_range_start Ignore rows starting before this position in the file
  * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
  * @param skip_rows Number of rows to skip (ignored in phase 1)
+ * @param maybe_blank_rows Device flag that phase 2 sets to nonzero if an output row may be blank
+ * (see `remove_blank_rows`), and leaves unchanged otherwise
  * @param stream CUDA stream used for device memory operations and kernel launches.
  *
  * @return Number of row contexts
@@ -151,6 +153,7 @@ uint32_t gather_row_offsets(cudf::io::parse_options_view const& options,
                             size_t byte_range_start,
                             size_t byte_range_end,
                             size_t skip_rows,
+                            uint32_t* maybe_blank_rows,
                             cuda::stream_ref stream);
 
 /**
