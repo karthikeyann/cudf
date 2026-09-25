@@ -380,8 +380,20 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                                    : std::min(buffer_size * 2, max_input_size),
                  stream);
   auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
-  std::vector<cuda::event> chunk_copies;
-  std::vector<std::future<size_t>> chunk_reads;
+  // Chunk copies and reads in flight when the loop exits with an exception still write into
+  // `d_data`, and copy from `host_input`, so they are waited for (without throwing) before those
+  // are freed. The copies complete in order, on one stream.
+  struct in_flight_chunks {
+    std::vector<cuda::event> copies;
+    std::vector<std::future<size_t>> reads;
+    ~in_flight_chunks()
+    {
+      if (!copies.empty()) { cudaEventSynchronize(copies.back().get()); }
+      for (auto& read : reads) {
+        if (read.valid()) { read.wait(); }
+      }
+    }
+  } chunks;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
 
   auto const max_blocks =
@@ -411,32 +423,32 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         // with more ahead, the copies of this loop's row contexts would queue behind all of them.
         // No data is discarded, so every chunk is parsed and waits for its copy.
         auto const chunk = previous_data_size / chunk_bytes;
-        while (chunk_copies.size() < chunk + 2 &&
-               chunk_copies.size() * chunk_bytes < host_input->size()) {
-          auto const offset = chunk_copies.size() * chunk_bytes;
+        while (chunks.copies.size() < chunk + 2 &&
+               chunks.copies.size() * chunk_bytes < host_input->size()) {
+          auto const offset = chunks.copies.size() * chunk_bytes;
           auto const size   = std::min(chunk_bytes, host_input->size() - offset);
           cudf::detail::cuda_memcpy_async(
             device_span<char>{d_data.data() + offset, size},
             host_span<char const>{
               reinterpret_cast<char const*>(host_input->data()) + offset, size, true},
             copy_stream);
-          chunk_copies.push_back(copy_stream.record_event());
+          chunks.copies.push_back(copy_stream.record_event());
         }
-        stream.wait(chunk_copies[chunk]);
+        stream.wait(chunks.copies[chunk]);
       } else if (read_in_chunks) {
         // All chunks are requested at the first one, into the capacity of `d_data`; the source
         // completes them in order (e.g. kvikio's thread pool runs its tasks first come, first
         // served). No data is discarded, so every chunk is parsed and waits for its read.
         auto const input_size = max_input_size - input_pos;
-        for (size_t offset = chunk_reads.empty() ? 0 : input_size; offset < input_size;
+        for (size_t offset = chunks.reads.empty() ? 0 : input_size; offset < input_size;
              offset += chunk_bytes) {
-          chunk_reads.push_back(source->device_read_async(
+          chunks.reads.push_back(source->device_read_async(
             input_pos + offset,
             std::min(chunk_bytes, input_size - offset),
             reinterpret_cast<uint8_t*>(d_data.data() + offset),
             stream));
         }
-        chunk_reads[previous_data_size / chunk_bytes].get();
+        chunks.reads[previous_data_size / chunk_bytes].get();
       } else if (source->is_device_read_preferred(read_size)) {
         source->device_read(read_offset,
                             read_size,
