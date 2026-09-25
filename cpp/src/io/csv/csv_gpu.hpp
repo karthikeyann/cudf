@@ -124,7 +124,9 @@ inline __host__ __device__ rowctx64_t select_row_context(rowctx64_t sel_ctx,
  * the number of rows starting at byte_range_end or beyond.
  *
  * @param options Options that control parsing of individual fields
- * @param row_ctx Row parsing context (output of phase 1 or input to phase 2)
+ * @param row_ctx Row parsing context (output of phase 1 or input to phase 2), in device-accessible
+ * memory; phase 2 may read and write it in pinned host memory, which the host must then not access
+ * until the stream is synchronized
  * @param offsets_out Row offsets (nullptr for phase1, non-null indicates phase 2)
  * @param data Base pointer of character data (all row offsets are relative to this)
  * @param chunk_size Total number of characters to parse

@@ -799,7 +799,9 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  * Row parsing context will be updated after phase 2 such that the value contains
  * the number of rows starting at byte_range_end or beyond.
  *
- * @param row_ctx Row parsing context (output of phase 1 or input to phase 2)
+ * @param row_ctx Row parsing context (output of phase 1 or input to phase 2), in device-accessible
+ * memory; phase 2 may read and write it in pinned host memory, which the host must then not access
+ * until the stream is synchronized
  * @param offsets_out Row offsets (nullptr for phase1, non-null indicates phase 2)
  * @param data Base pointer of character data (all row offsets are relative to this)
  * @param chunk_size Total number of characters to parse

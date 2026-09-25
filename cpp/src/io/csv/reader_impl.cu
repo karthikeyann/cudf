@@ -42,6 +42,7 @@
 #include <memory>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -327,9 +328,10 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   bool load_whole_file,
   cuda::stream_ref stream)
 {
-  // Reads with row selection parse chunks of at most this size, so that they can stop early. Other
-  // reads parse the whole input as one chunk, read at once: every chunk synchronizes the stream to
-  // gather its row offsets and regrows the offsets.
+  // Reads with row selection parse chunks of at most this size, so that they can stop early. Whole
+  // files and pinned host inputs larger than this are parsed in chunks too, overlapping reading with
+  // parsing (see below). Other reads parse the whole input as one chunk: every chunk synchronizes
+  // the stream to gather its row offsets and regrows the offsets.
   constexpr size_t max_chunk_bytes = 64 * 1024 * 1024;  // 64MB
 
   auto const data_size      = data.has_value() ? data->size() : source->size();
@@ -357,18 +359,19 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // The options describe `source` (see `cudf::io::read_csv`).
   bool const read_whole_input = load_whole_file && !data.has_value() &&
                                 reader_opts.get_source().type() == io_type::DEVICE_BUFFER;
-  // A whole file read on the device (asynchronously, which user datasources need not support), or
-  // pinned host input copied on another stream, is read in chunks, and the row offsets of each
-  // chunk are gathered once it has been read, while the next ones are read. Other whole inputs are
-  // parsed as one chunk.
-  bool const whole_source   = load_whole_file && !data.has_value() && !read_whole_input;
-  bool const read_in_chunks = whole_source && reader_opts.get_source().type() == io_type::FILEPATH &&
-                              source->is_device_read_preferred(max_input_size - input_pos);
+  // A whole file of more than one chunk read on the device (asynchronously, which user datasources
+  // need not support), or such pinned host input copied on another stream, is read in chunks, and
+  // the row offsets of each chunk are gathered once it has been read, while the next ones are read.
+  // Other whole inputs are parsed as one chunk.
+  auto const input_size = max_input_size - input_pos;
+  bool const whole_source = load_whole_file && !data.has_value() && !read_whole_input;
+  bool const device_read_preferred = whole_source && source->is_device_read_preferred(input_size);
+  bool const read_in_chunks        = device_read_preferred && input_size > max_chunk_bytes &&
+                              reader_opts.get_source().type() == io_type::FILEPATH;
   std::unique_ptr<datasource::buffer> host_input;
-  if (whole_source && !source->is_device_read_preferred(max_input_size - input_pos)) {
-    host_input = source->host_read(input_pos, max_input_size - input_pos);
-  }
-  bool const copy_in_chunks = host_input != nullptr && is_device_accessible(host_input->data());
+  if (whole_source && !device_read_preferred) { host_input = source->host_read(input_pos, input_size); }
+  bool const copy_in_chunks =
+    host_input != nullptr && input_size > max_chunk_bytes && is_device_accessible(host_input->data());
   auto const chunk_bytes =
     load_whole_file && !read_in_chunks && !copy_in_chunks ? data_size : max_chunk_bytes;
   auto const buffer_size    = std::min(chunk_bytes, data_size);
@@ -379,16 +382,17 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                  : load_whole_file ? data_size
                                    : std::min(buffer_size * 2, max_input_size),
                  stream);
+  // The copy stream is joined as `stream` waits for the copy of every chunk
   auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
   // Chunk copies and reads in flight when the loop exits with an exception still write into
-  // `d_data`, and copy from `host_input`, so they are waited for (without throwing) before those
-  // are freed. The copies complete in order, on one stream.
+  // `d_data`, and copy from `host_input`, so they are waited for before those are freed; the
+  // destructor does not throw by design. The copies complete in order, on one stream.
   struct in_flight_chunks {
     std::vector<cuda::event> copies;
     std::vector<std::future<size_t>> reads;
     ~in_flight_chunks()
     {
-      if (!copies.empty()) { cudaEventSynchronize(copies.back().get()); }
+      if (!copies.empty()) { std::ignore = cudaEventSynchronize(copies.back().get()); }
       for (auto& read : reads) {
         if (read.valid()) { read.wait(); }
       }
@@ -419,9 +423,10 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         // a view of exactly the requested bytes of the caller's buffer
         input.source_buffer = source->device_read(read_offset, read_size, stream);
       } else if (copy_in_chunks) {
-        // Copies run one chunk ahead, into the capacity of `d_data`, which holds the whole input;
-        // with more ahead, the copies of this loop's row contexts would queue behind all of them.
-        // No data is discarded, so every chunk is parsed and waits for its copy.
+        // Copies run one chunk ahead, into the capacity of `d_data`, which is reserved for the
+        // whole input (growing it within its capacity keeps the bytes). Whole-file reads have no
+        // rows to skip and the first chunk starts a row, so no data is discarded and every chunk
+        // is parsed and waits for its copy.
         auto const chunk = previous_data_size / chunk_bytes;
         while (chunks.copies.size() < chunk + 2 &&
                chunks.copies.size() * chunk_bytes < host_input->size()) {
@@ -436,10 +441,9 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         }
         stream.wait(chunks.copies[chunk]);
       } else if (read_in_chunks) {
-        // All chunks are requested at the first one, into the capacity of `d_data`; the source
-        // completes them in order (e.g. kvikio's thread pool runs its tasks first come, first
-        // served). No data is discarded, so every chunk is parsed and waits for its read.
-        auto const input_size = max_input_size - input_pos;
+        // All chunks are requested at the first one, into the capacity of `d_data` (as above);
+        // the source completes them in order (kvikio's thread pool runs its tasks first come,
+        // first served) and synchronizes `stream` before reading into device memory.
         for (size_t offset = chunks.reads.empty() ? 0 : input_size; offset < input_size;
              offset += chunk_bytes) {
           chunks.reads.push_back(source->device_read_async(
@@ -543,6 +547,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
       }
     } else {
       // Discard data (all rows below skip_rows), keeping one character for history
+      CUDF_EXPECTS(!copy_in_chunks && !read_in_chunks, "Chunks read ahead cannot be discarded");
       size_t discard_bytes = std::max(d_data.size(), sizeof(char)) - sizeof(char);
       if (discard_bytes != 0) {
         erase_except_last(d_data, stream);

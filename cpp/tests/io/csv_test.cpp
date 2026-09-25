@@ -6704,4 +6704,33 @@ TEST_F(CsvReaderTest, PinnedHostBufferAndFileAcrossChunks)
                                 pageable.tbl->view());
 }
 
+TEST_F(CsvReaderTest, BomPrefixedPinnedHostBuffersAndFiles)
+{
+  // Whole pinned host inputs and files of more than one 64MB chunk are read in chunks, which start
+  // after the UTF-8 BOM; inputs of the BOM alone hold no data to read. Results must match reading
+  // the same data from pageable memory, which is parsed as one chunk.
+  std::string large = "\xEF\xBB\xBF";
+  for (int i = 0; large.size() < 64u * 1024 * 1024 + 4096; ++i) {
+    large += std::to_string(i) + ",\"" + std::string(100 + i % 13, 'a' + i % 26) + "\n\"\"x\"\"\"\n";
+  }
+  auto const stream = cudf::get_default_stream();
+  for (std::string const& text : {std::string{"\xEF\xBB\xBF"}, std::string{"\xEF\xBB\xBF\n"}, large}) {
+    auto pinned = cudf::detail::make_pinned_vector<char>(text.size(), stream);
+    std::copy(text.begin(), text.end(), pinned.begin());
+    auto const filepath = temp_env->get_temp_filepath("BomPrefixed.csv");
+    std::ofstream(filepath, std::ios::binary) << text;
+    auto const read = [](cudf::io::source_info const& source) {
+      return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source).header(-1).build());
+    };
+    auto const expected =
+      read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}});
+    CUDF_TEST_EXPECT_TABLES_EQUAL(
+      read(cudf::io::source_info{cudf::host_span<char const>{pinned.data(), pinned.size()}})
+        .tbl->view(),
+      expected.tbl->view());
+    CUDF_TEST_EXPECT_TABLES_EQUAL(read(cudf::io::source_info{filepath}).tbl->view(),
+                                  expected.tbl->view());
+  }
+}
+
 CUDF_TEST_PROGRAM_MAIN()
