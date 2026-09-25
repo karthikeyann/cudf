@@ -787,6 +787,64 @@ rowctx_inverse_merge_transform(device_span<uint64_t const> ctxtree, uint32_t t)
 constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
 
 /**
+ * @brief Returns the context of a character for the row parser: its row start flags and output
+ * context for each input context (see `make_char_context`).
+ *
+ * @param c The character
+ * @param c_prev The character before it, or the terminator at the start of the data
+ */
+__device__ __forceinline__ uint32_t char_row_context(
+  int c, int c_prev, int terminator, int delimiter, int quotechar, int commentchar)
+{
+  if (c_prev == terminator) {
+    if (c == commentchar) {
+      // Start of a new comment row
+      return make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
+    } else if (c == quotechar) {
+      // Quoted string on newrow, or quoted string ending in terminator
+      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+    }
+    // Start of a new row unless within a quote
+    return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
+  } else if (c == quotechar) {
+    // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
+    // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
+    // exit because it might be the first quote of a "" escape sequence. We transition to
+    // COMMENT (pending exit) and wait for the next character:
+    //   - If next char is quote: it's a "" escape, return to QUOTE
+    //   - If next char is anything else: exit confirmed, go to NONE
+    // This doesn't conflict with actual comment handling because comments are only
+    // detected at row boundaries (after newline), where COMMENT state is set with row
+    // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
+    if (c_prev == delimiter) {
+      // Quote after delimiter: start field or pending exit
+      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+    } else if (c_prev == quotechar) {
+      // Quote after quote: "" escape or stay NONE (Spark compatibility)
+      return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+    }
+    // Quote after regular char: pending exit or stay NONE
+    return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
+  }
+  // Non-quote char: stay in current state, or exit from pending
+  return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+}
+
+/**
+ * @brief Returns a 4-bit mask of the bytes of `word` equal to the character `c` (bit i for byte
+ * i); none match if `c` is not a byte value (e.g. 0x100 for an unused character).
+ */
+__device__ __forceinline__ uint32_t match_bytes(uint32_t word, int c)
+{
+  if (c < -128 || c > 255) { return 0; }
+  // 0xff in each matching byte
+  auto const matches = __vcmpeq4(word, static_cast<uint32_t>(c & 0xff) * 0x0101'0101u);
+  // Moves the low bit of byte i (bit 8i) to bit 21 + i; the partial products land on distinct
+  // bits, so the multiplication does not carry into bits 21 to 24
+  return (((matches & 0x0101'0101u) * 0x0020'4081u) >> 21) & 0xf;
+}
+
+/**
  * @brief Gather row offsets from CSV character data split into 16KB chunks
  *
  * This is done in two phases: the first phase returns the possible row counts
@@ -863,78 +921,60 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     .z = 0,
     .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6)};
   int c, c_prev = (cur > start && cur <= end) ? cur[-1] : terminator;
-  // A slice within the chunk that holds no quote or comment character has fixed transitions: each
-  // character after a terminator starts a row in the NONE and COMMENT contexts and none in the
-  // QUOTE context, NONE and QUOTE are kept, and COMMENT (pending quote exit) goes to NONE at the
-  // first character. This is what the loop below computes for it; aligned slices are loaded with
-  // two 16-byte loads and checked for this case first. (Slices are aligned when the data starts
-  // at an aligned address at the parse position, as in whole-file and first-chunk reads of the
-  // reader's own copy, but not in byte-range reads with an offset, which keep one character before
-  // the range, nor in caller buffers parsed in place from an unaligned address (e.g. after a BOM);
-  // those take the loop.)
-  bool regular_slice = false;
+  // Aligned slices within the chunk are loaded with two 16-byte loads, and their terminators,
+  // quotes and comment characters located a word at a time. Only the characters after a
+  // terminator and quotes have transitions other than the regular one (NONE and QUOTE are kept,
+  // COMMENT, the pending quote exit, goes to NONE, and no row starts), which is idempotent, so
+  // each run of regular characters is merged at once; a slice without quotes, or comment
+  // characters that start rows, has fixed transitions. The loop below computes the same for any
+  // slice. (Slices are aligned when the data starts at an aligned address at the parse position,
+  // as in whole-file and first-chunk reads of the reader's own copy, but not in byte-range reads
+  // with an offset, which keep one character before the range, nor in caller buffers parsed in
+  // place from an unaligned address (e.g. after a BOM); those take the loop.)
+  bool slice_merged = false;
   if (cur + 32 <= end && reinterpret_cast<uintptr_t>(cur) % sizeof(uint4) == 0) {
-    uint4 const words[2] = {reinterpret_cast<uint4 const*>(cur)[0],
-                            reinterpret_cast<uint4 const*>(cur)[1]};
-    auto const chars     = reinterpret_cast<char const*>(words);
-    uint32_t row_starts  = 0;
-    regular_slice        = true;
+    uint4 const vectors[2] = {reinterpret_cast<uint4 const*>(cur)[0],
+                              reinterpret_cast<uint4 const*>(cur)[1]};
+    auto const words       = reinterpret_cast<uint32_t const*>(vectors);
+    auto const chars       = reinterpret_cast<char const*>(vectors);
+    uint32_t terminators = 0, quotes = 0, comments = 0;
 #pragma unroll
-    for (uint32_t pos = 0; pos < 32; pos++) {
-      int const ch = chars[pos];
-      regular_slice &= ch != quotechar && ch != commentchar;
-      row_starts |= static_cast<uint32_t>((pos == 0 ? c_prev : chars[pos - 1]) == terminator)
-                    << pos;
+    for (uint32_t i = 0; i < 8; i++) {
+      terminators |= match_bytes(words[i], terminator) << (4 * i);
+      quotes |= match_bytes(words[i], quotechar) << (4 * i);
+      comments |= match_bytes(words[i], commentchar) << (4 * i);
     }
-    if (regular_slice) {
+    auto const row_starts = (terminators << 1) | static_cast<uint32_t>(c_prev == terminator);
+    auto constexpr regular = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+    if ((quotes | (comments & row_starts)) == 0) {
       ctx_map = {
         .x = row_starts,
         .y = 0,
         .z = row_starts,
         .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_NONE << 4) | (ROW_CTX_EOF << 6)};
+    } else {
+      uint32_t pos = 0;  // first character not merged yet
+      for (auto events = row_starts | quotes; events != 0; events &= events - 1) {
+        auto const k = static_cast<uint32_t>(__ffs(events)) - 1;
+        if (k > pos) { merge_char_context(ctx_map, regular, pos); }
+        merge_char_context(
+          ctx_map,
+          char_row_context(
+            chars[k], k > 0 ? chars[k - 1] : c_prev, terminator, delimiter, quotechar, commentchar),
+          k);
+        pos = k + 1;
+      }
+      if (pos < 32) { merge_char_context(ctx_map, regular, pos); }
     }
+    slice_merged = true;
   }
   // Otherwise, loop through all 32 bytes and keep a bitmask of row starts for each possible input
   // context
-  for (uint32_t pos = 0; pos < 32 && !regular_slice; pos++, cur++, c_prev = c) {
+  for (uint32_t pos = 0; pos < 32 && !slice_merged; pos++, cur++, c_prev = c) {
     uint32_t ctx;
     if (cur < end) {
-      c = cur[0];
-      if (c_prev == terminator) {
-        if (c == commentchar) {
-          // Start of a new comment row
-          ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
-        } else if (c == quotechar) {
-          // Quoted string on newrow, or quoted string ending in terminator
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
-        } else {
-          // Start of a new row unless within a quote
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
-        }
-      } else if (c == quotechar) {
-        // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
-        // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
-        // exit because it might be the first quote of a "" escape sequence. We transition to
-        // COMMENT (pending exit) and wait for the next character:
-        //   - If next char is quote: it's a "" escape, return to QUOTE
-        //   - If next char is anything else: exit confirmed, go to NONE
-        // This doesn't conflict with actual comment handling because comments are only
-        // detected at row boundaries (after newline), where COMMENT state is set with row
-        // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
-        if (c_prev == delimiter) {
-          // Quote after delimiter: start field or pending exit
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-        } else if (c_prev == quotechar) {
-          // Quote after quote: "" escape or stay NONE (Spark compatibility)
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
-        } else {
-          // Quote after regular char: pending exit or stay NONE
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
-        }
-      } else {
-        // Non-quote char: stay in current state, or exit from pending
-        ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
-      }
+      c   = cur[0];
+      ctx = char_row_context(c, c_prev, terminator, delimiter, quotechar, commentchar);
     } else {
       bool const is_last_chunk = data_end_off <= data.size();
       if (is_last_chunk && cur <= end && cur == data_end) {
