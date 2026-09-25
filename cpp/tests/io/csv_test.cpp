@@ -4533,6 +4533,187 @@ TEST_F(CsvReaderTest, InvalidRowStagingPolicy)
                cudf::logic_error);
 }
 
+TEST_F(CsvReaderTest, NaAndBooleanValuesWithCommonPrefixes)
+{
+  // Keys that are prefixes of other keys, a duplicate key and the empty key. The non-ASCII keys
+  // sort after the ASCII keys as unsigned bytes, and "é" (C3 A9) and "ÿ" (C3 BF) share a first
+  // byte.
+  std::vector<std::string> const na_values{"a", "ab", "abc", "", "b", "é", "aé", "ÿ", "ab"};
+  std::vector<std::string> const strings{"a",
+                                         "ab",
+                                         "abc",
+                                         "",
+                                         "b",
+                                         "é",
+                                         "aé",
+                                         "ÿ",
+                                         "abcd",
+                                         "abd",
+                                         "ac",
+                                         "ba",
+                                         "c",
+                                         "éa",
+                                         "è",
+                                         "aéa",
+                                         "ÿÿ"};
+  auto const num_na_strings = 8;
+  std::vector<std::string> const bools{"y", "ye", "yes", "sí", "n", "no", "nö", "nó"};
+
+  std::string buffer;
+  std::vector<bool> expected_valid;
+  std::vector<bool> expected_bools;
+  for (size_t row = 0; row < strings.size(); ++row) {
+    auto const& boolean = bools[row % bools.size()];
+    buffer += strings[row] + ',' + boolean + '\n';
+    expected_valid.push_back(row >= num_na_strings);
+    expected_bools.push_back(row % bools.size() < 4);
+  }
+  auto const expected_strings =
+    cudf::test::strings_column_wrapper(strings.begin(), strings.end(), expected_valid.begin());
+  auto const expected_bool_column =
+    cudf::test::fixed_width_column_wrapper<bool>(expected_bools.begin(), expected_bools.end());
+
+  auto const read = [&](std::vector<data_type> const& dtypes) {
+    return cudf::io::read_csv(host_buffer_options(buffer)
+                                .header(-1)
+                                .dtypes(dtypes)
+                                .keep_default_na(false)
+                                .na_values(na_values)
+                                .true_values({"y", "ye", "yes", "sí"})
+                                .false_values({"n", "no", "nö", "nó"})
+                                .build());
+  };
+  with_each_row_staging_policy([&] {
+    for (auto const& dtypes : {std::vector<data_type>{dtype<cudf::string_view>(), dtype<bool>()},
+                               std::vector<data_type>{}}) {
+      SCOPED_TRACE(dtypes.empty() ? "inferred types" : "explicit types");
+      auto const result = read(dtypes);
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected_strings, result.tbl->view().column(0));
+      CUDF_TEST_EXPECT_COLUMNS_EQUIVALENT(expected_bool_column, result.tbl->view().column(1));
+    }
+  });
+}
+
+TEST_F(CsvReaderTest, NaValuesOfLargeTries)
+{
+  // The trie of 40000 keys of six characters has more than 44000 nodes, and the children of the
+  // last nodes of its fifth level are more than 32767 nodes after them
+  std::vector<std::string> na_values;
+  for (int i = 0; i < 40000; ++i) {
+    auto const digits = std::to_string(i);
+    na_values.push_back("k" + std::string(5 - digits.size(), '0') + digits);
+  }
+  std::string const buffer = "k00000\nk39999\nk31234\nk3999\nk399990\nk40000\nx\n";
+
+  auto const expected = cudf::test::strings_column_wrapper(
+    {"", "", "", "k3999", "k399990", "k40000", "x"}, {false, false, false, true, true, true, true});
+  with_each_row_staging_policy([&] {
+    auto const result = cudf::io::read_csv(host_buffer_options(buffer)
+                                             .header(-1)
+                                             .dtypes({dtype<cudf::string_view>()})
+                                             .keep_default_na(false)
+                                             .na_values(na_values)
+                                             .build());
+    CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->view().column(0));
+  });
+}
+
+TEST_F(CsvReaderTest, NullMasksOfManyColumns)
+{
+  // Columns of each decoded type, with string columns among them. The null masks of the other
+  // columns are zeroed together before decoding, entirely: the bits past the last row stay unset.
+  constexpr int num_columns = 100;
+  constexpr int num_rows    = 70;
+  auto const column_types   = std::vector<data_type>{
+    dtype<int64_t>(), dtype<double>(), dtype<cudf::string_view>(), dtype<bool>(), dtype<int32_t>()};
+  auto const is_valid = [](int row, int col) { return (row + col) % 7 != 0; };
+
+  std::string buffer;
+  for (int row = 0; row < num_rows; ++row) {
+    for (int col = 0; col < num_columns; ++col) {
+      if (col != 0) { buffer += ','; }
+      if (not is_valid(row, col)) {
+        buffer += "NA";
+        continue;
+      }
+      switch (col % column_types.size()) {
+        case 0: buffer += std::to_string(row * 1000 + col); break;
+        case 1: buffer += std::to_string(row) + ".25"; break;
+        case 2: buffer += "s" + std::to_string(row); break;
+        case 3: buffer += row % 2 == 0 ? "true" : "false"; break;
+        default: buffer += std::to_string(-row); break;
+      }
+    }
+    buffer += '\n';
+  }
+
+  std::vector<data_type> dtypes;
+  std::vector<std::unique_ptr<cudf::column>> columns;
+  for (int col = 0; col < num_columns; ++col) {
+    auto const valid = cudf::detail::make_counting_transform_iterator(
+      0, [&, col](int row) { return is_valid(row, col); });
+    dtypes.push_back(column_types[col % column_types.size()]);
+    switch (col % column_types.size()) {
+      case 0: {
+        auto const values = cudf::detail::make_counting_transform_iterator(
+          0, [col](int row) { return int64_t{row} * 1000 + col; });
+        columns.push_back(column_wrapper<int64_t>(values, values + num_rows, valid).release());
+        break;
+      }
+      case 1: {
+        auto const values =
+          cudf::detail::make_counting_transform_iterator(0, [](int row) { return row + 0.25; });
+        columns.push_back(column_wrapper<double>(values, values + num_rows, valid).release());
+        break;
+      }
+      case 2: {
+        auto const values = cudf::detail::make_counting_transform_iterator(
+          0, [](int row) { return "s" + std::to_string(row); });
+        columns.push_back(
+          cudf::test::strings_column_wrapper(values, values + num_rows, valid).release());
+        break;
+      }
+      case 3: {
+        auto const values =
+          cudf::detail::make_counting_transform_iterator(0, [](int row) { return row % 2 == 0; });
+        columns.push_back(column_wrapper<bool>(values, values + num_rows, valid).release());
+        break;
+      }
+      default: {
+        auto const values =
+          cudf::detail::make_counting_transform_iterator(0, [](int row) { return -row; });
+        columns.push_back(column_wrapper<int32_t>(values, values + num_rows, valid).release());
+        break;
+      }
+    }
+  }
+  auto const expected = cudf::table{std::move(columns)};
+
+  with_each_row_staging_policy([&] {
+    auto const result =
+      cudf::io::read_csv(host_buffer_options(buffer).header(-1).dtypes(dtypes).build());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.view(), result.tbl->view());
+    constexpr auto word_bits = cudf::detail::size_in_bits<cudf::bitmask_type>();
+    auto const mask_words =
+      cudf::bitmask_allocation_size_bytes(num_rows) / sizeof(cudf::bitmask_type);
+    for (int col = 0; col < num_columns; ++col) {
+      if (dtypes[col].id() == cudf::type_id::STRING) { continue; }
+      auto const mask = cudf::detail::make_std_vector(
+        cudf::device_span<cudf::bitmask_type const>{result.tbl->view().column(col).null_mask(),
+                                                    mask_words},
+        cudf::get_default_stream());
+      for (auto word = static_cast<size_t>(num_rows / word_bits); word < mask.size(); ++word) {
+        // The bits of the rows in the word
+        auto const first_row = static_cast<int>(word * word_bits);
+        auto const row_bits  = first_row >= num_rows
+                                 ? cudf::bitmask_type{0}
+                                 : (cudf::bitmask_type{1} << (num_rows - first_row)) - 1;
+        EXPECT_EQ(mask[word] & ~row_bits, 0u) << "column " << col << ", word " << word;
+      }
+    }
+  });
+}
+
 TEST_F(CsvReaderTest, TypeInferenceOfShortRows)
 {
   // Rows of fields of 1 to 3 characters, with the counts of each block in shared memory (up to 32

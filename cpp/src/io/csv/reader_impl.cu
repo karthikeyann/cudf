@@ -16,6 +16,7 @@
 
 #include <cudf/column/column_factories.hpp>
 #include <cudf/copying.hpp>
+#include <cudf/detail/utilities/batched_memset.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/cuda_memcpy.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
@@ -50,7 +51,6 @@ using std::vector;
 
 using cudf::device_span;
 using cudf::host_span;
-using cudf::detail::make_device_uvector_async;
 
 namespace cudf {
 namespace io {
@@ -733,15 +733,13 @@ void infer_column_types(parse_options const& parse_opts,
     });
   if (num_inferred_columns == 0) { return; }
 
-  auto const column_stats = cudf::io::csv::gpu::detect_column_types(
-    parse_opts.view(),
-    data,
-    make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
-    row_offsets,
-    num_inferred_columns,
-    row_staging_size,
-    stream);
-  stream.sync();
+  auto const column_stats = cudf::io::csv::gpu::detect_column_types(parse_opts.view(),
+                                                                    data,
+                                                                    column_flags,
+                                                                    row_offsets,
+                                                                    num_inferred_columns,
+                                                                    row_staging_size,
+                                                                    stream);
 
   auto inf_col_idx = 0;
   for (auto col_idx = 0u; col_idx < column_flags.size(); ++col_idx) {
@@ -792,50 +790,61 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
                                        cuda::stream_ref stream,
                                        rmm::device_async_resource_ref mr)
 {
+  // The per-column inputs of the decode kernel, uploaded with a single copy. They are allocated
+  // first, while the stream is idle, since allocating pinned host memory synchronizes it.
+  auto inputs =
+    cudf::detail::hostdevice_arrays<column_parse::flags, data_type, void*, bitmask_type*>(
+      {column_flags.size(), column_types.size(), column_types.size(), column_types.size()}, stream);
+  auto const [flags, types, columns, masks] = inputs.spans();
+  std::copy(column_flags.begin(), column_flags.end(), flags.host_begin());
+  std::copy(column_types.begin(), column_types.end(), types.host_begin());
+
   // Alloc output; columns' data memory is still expected for empty dataframe
   std::vector<column_buffer> out_buffers;
   out_buffers.reserve(column_types.size());
 
+  // The null masks of the non-string columns, all zeroed with a single batched memset
+  std::vector<device_span<bitmask_type>> null_masks;
+  auto const mask_words = bitmask_allocation_size_bytes(num_records) / sizeof(bitmask_type);
   for (int col = 0, active_col = 0; col < num_actual_columns; ++col) {
     if (column_flags[col] & column_parse::enabled) {
       // Only the string (pointer, length) pairs need zeroing, for the fields missing from short
       // rows; the decode kernel writes the other data wherever it is valid (see
-      // decode_row_column_data)
+      // decode_row_column_data). String columns get their null masks when they are built from the
+      // pairs, so their buffers have none.
       auto const is_string = column_types[active_col].id() == type_id::STRING;
-      auto out_buffer      = column_buffer(column_types[active_col], true);
-      out_buffer.create(num_records, is_string, stream, mr);
+      auto out_buffer      = column_buffer(column_types[active_col], not is_string);
+      out_buffer.create_with_mask(num_records, mask_state::UNINITIALIZED, is_string, stream, mr);
+      if (not is_string) { null_masks.emplace_back(out_buffer.null_mask(), mask_words); }
+      columns[active_col] = out_buffer.data();
+      masks[active_col]   = out_buffer.null_mask();
 
       out_buffer.name = column_names[col];
       out_buffers.emplace_back(std::move(out_buffer));
       active_col++;
     }
   }
-
-  auto h_data  = cudf::detail::make_host_vector<void*>(num_active_columns, stream);
-  auto h_valid = cudf::detail::make_host_vector<bitmask_type*>(num_active_columns, stream);
-
-  for (int i = 0; i < num_active_columns; ++i) {
-    h_data[i]  = out_buffers[i].data();
-    h_valid[i] = out_buffers[i].null_mask();
+  if (not null_masks.empty()) {
+    cudf::detail::batched_memset<bitmask_type>(null_masks, bitmask_type{0}, stream);
   }
+  inputs.host_to_device_async(stream);
 
-  cudf::io::csv::gpu::decode_row_column_data(
-    parse_opts.view(),
-    data,
-    unescape_buffer,
-    make_device_uvector_async(column_flags, stream, cudf::get_current_device_resource_ref()),
-    row_offsets,
-    make_device_uvector_async(column_types, stream, cudf::get_current_device_resource_ref()),
-    make_device_uvector_async(h_data, stream, cudf::get_current_device_resource_ref()),
-    make_device_uvector_async(h_valid, stream, cudf::get_current_device_resource_ref()),
-    row_staging_size,
-    stream);
+  cudf::io::csv::gpu::decode_row_column_data(parse_opts.view(),
+                                             data,
+                                             unescape_buffer,
+                                             flags,
+                                             row_offsets,
+                                             types,
+                                             columns,
+                                             masks,
+                                             row_staging_size,
+                                             stream);
 
   // Only the validity of non-string columns is decoded into the masks; string columns get theirs
   // (and their null counts) when they are built from the decoded string pairs
   std::vector<bitmask_type const*> decoded_masks(num_active_columns, nullptr);
   for (int i = 0; i < num_active_columns; ++i) {
-    if (column_types[i].id() != cudf::type_id::STRING) { decoded_masks[i] = h_valid[i]; }
+    if (column_types[i].id() != cudf::type_id::STRING) { decoded_masks[i] = masks[i]; }
   }
   auto const null_counts = cudf::batch_null_count(decoded_masks, 0, num_records, stream);
   for (int i = 0; i < num_active_columns; ++i) {
@@ -845,17 +854,16 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
   return out_buffers;
 }
 
-cudf::detail::host_vector<data_type> determine_column_types(
-  csv_reader_options const& reader_opts,
-  parse_options const& parse_opts,
-  host_span<std::string const> column_names,
-  device_span<char const> data,
-  device_span<uint64_t const> row_offsets,
-  size_t row_staging_size,
-  int32_t num_records,
-  host_span<column_parse::flags> column_flags,
-  cudf::size_type num_active_columns,
-  cuda::stream_ref stream)
+std::vector<data_type> determine_column_types(csv_reader_options const& reader_opts,
+                                              parse_options const& parse_opts,
+                                              host_span<std::string const> column_names,
+                                              device_span<char const> data,
+                                              device_span<uint64_t const> row_offsets,
+                                              size_t row_staging_size,
+                                              int32_t num_records,
+                                              host_span<column_parse::flags> column_flags,
+                                              cudf::size_type num_active_columns,
+                                              cuda::stream_ref stream)
 {
   std::vector<data_type> column_types(column_flags.size());
 
@@ -880,8 +888,8 @@ cudf::detail::host_vector<data_type> determine_column_types(
                      stream);
 
   // compact column_types to only include active columns
-  auto active_col_types =
-    cudf::detail::make_empty_host_vector<data_type>(num_active_columns, stream);
+  std::vector<data_type> active_col_types;
+  active_col_types.reserve(num_active_columns);
   std::copy_if(column_types.cbegin(),
                column_types.cend(),
                std::back_inserter(active_col_types),
@@ -928,10 +936,8 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   auto const is_column_index    = [num_actual_columns](int index) {
     return index >= 0 && index < num_actual_columns;
   };
-  auto column_flags =
-    cudf::detail::make_host_vector<column_parse::flags>(num_actual_columns, stream);
-  std::fill(
-    column_flags.begin(), column_flags.end(), column_parse::enabled | column_parse::inferred);
+  auto column_flags = std::vector<column_parse::flags>(
+    num_actual_columns, column_parse::enabled | column_parse::inferred);
 
   // User did not pass column names to override names in the file
   // Process names from the file to remove empty and duplicated strings
@@ -1168,11 +1174,9 @@ table_with_metadata read_csv(cudf::io::datasource* source,
 }
 
 /**
- * @brief Create a serialized trie for N/A value matching, based on the options.
+ * @brief Returns the values to match as N/A values, based on the options.
  */
-cudf::detail::trie create_na_trie(char quotechar,
-                                  csv_reader_options const& reader_opts,
-                                  cuda::stream_ref stream)
+std::vector<std::string> get_na_values(char quotechar, csv_reader_options const& reader_opts)
 {
   // Default values to recognize as null values
   static std::vector<std::string> const default_na_values{"",
@@ -1194,7 +1198,7 @@ cudf::detail::trie create_na_trie(char quotechar,
                                                           "nan",
                                                           "null"};
 
-  if (!reader_opts.is_enabled_na_filter()) { return cudf::detail::trie(0, stream); }
+  if (!reader_opts.is_enabled_na_filter()) { return {}; }
 
   std::vector<std::string> na_values = reader_opts.get_na_values();
   if (reader_opts.is_enabled_keep_default_na()) {
@@ -1206,7 +1210,7 @@ cudf::detail::trie create_na_trie(char quotechar,
     na_values.emplace_back(2, quotechar);
   }
 
-  return cudf::detail::create_serialized_trie(na_values, stream);
+  return na_values;
 }
 
 parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::stream_ref stream)
@@ -1246,22 +1250,15 @@ parse_options make_parse_options(csv_reader_options const& reader_opts, cuda::st
   CUDF_EXPECTS(parse_opts.thousands != parse_opts.delimiter,
                "Thousands separator cannot be the same as the delimiter");
 
-  // Handle user-defined true values, whereby field data is substituted with a
-  // boolean true or numeric `1` value
-  if (not reader_opts.get_true_values().empty()) {
-    parse_opts.trie_true =
-      cudf::detail::create_serialized_trie(reader_opts.get_true_values(), stream);
-  }
-
-  // Handle user-defined false values, whereby field data is substituted with a
-  // boolean false or numeric `0` value
-  if (not reader_opts.get_false_values().empty()) {
-    parse_opts.trie_false =
-      cudf::detail::create_serialized_trie(reader_opts.get_false_values(), stream);
-  }
-
-  // Handle user-defined N/A values, whereby field data is treated as null
-  parse_opts.trie_na = create_na_trie(parse_opts.quotechar, reader_opts, stream);
+  // Fields that match the true (false) values are substituted with a boolean true (false) or a
+  // numeric 1 (0) value, and fields that match the N/A values are null
+  auto const key_sets   = std::vector{reader_opts.get_true_values(),
+                                    reader_opts.get_false_values(),
+                                    get_na_values(parse_opts.quotechar, reader_opts)};
+  auto tries            = cudf::detail::create_serialized_tries(key_sets, stream);
+  parse_opts.trie_true  = std::move(tries[0]);
+  parse_opts.trie_false = std::move(tries[1]);
+  parse_opts.trie_na    = std::move(tries[2]);
 
   return parse_opts;
 }

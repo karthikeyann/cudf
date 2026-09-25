@@ -6,6 +6,7 @@
 #include "csv_common.hpp"
 #include "csv_gpu.hpp"
 #include "io/utilities/block_utils.cuh"
+#include "io/utilities/hostdevice_vector.hpp"
 #include "io/utilities/parsing_utils.cuh"
 #include "io/utilities/trie.cuh"
 
@@ -1766,7 +1767,7 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
 std::vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> const data,
-  device_span<column_parse::flags const> const column_flags,
+  host_span<column_parse::flags const> const column_flags,
   device_span<uint64_t const> const row_starts,
   size_t const num_active_columns,
   size_t const staging_size,
@@ -1776,13 +1777,19 @@ std::vector<column_type_histogram> detect_column_types(
   int const block_size = csvparse_block_dim;
   int const grid_size  = (row_starts.size() + block_size - 1) / block_size;
 
-  auto d_counts = cudf::detail::make_zeroed_device_uvector_async<cudf::size_type>(
-    num_active_columns * num_field_classes, stream, cudf::get_current_device_resource_ref());
+  // The column flags and the zeroed counts are uploaded with a single copy, and copied back to the
+  // same pinned host memory, which is allocated before the kernel is launched
+  auto buffers = cudf::detail::hostdevice_arrays<column_parse::flags, cudf::size_type>(
+    {column_flags.size(), num_active_columns * num_field_classes}, stream);
+  auto const [flags, counts] = buffers.spans();
+  std::copy(column_flags.begin(), column_flags.end(), flags.host_begin());
+  std::fill(counts.host_begin(), counts.host_end(), 0);
+  buffers.host_to_device_async(stream);
 
   // Narrow tables have few counters, which every warp updates: count them per block in shared
   // memory
   bool const use_shared_counts = num_active_columns <= max_shared_count_columns;
-  auto const counts_size       = use_shared_counts ? d_counts.size() * sizeof(cudf::size_type) : 0;
+  auto const counts_size       = use_shared_counts ? counts.size_bytes() : 0;
   auto const [staged_kernel, unstaged_kernel] =
     use_shared_counts
       ? std::pair{data_type_detection<true, true>, data_type_detection<false, true>}
@@ -1792,14 +1799,14 @@ std::vector<column_type_histogram> detect_column_types(
   auto const kernel         = stage_rows ? staged_kernel : unstaged_kernel;
   auto const rows_smem_size = stage_rows ? staging_size : 0;
   kernel<<<grid_size, block_size, counts_size + rows_smem_size, stream.get()>>>(
-    options, data, column_flags, row_starts, d_counts, rows_smem_size);
+    options, data, flags, row_starts, counts, rows_smem_size);
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  auto const h_counts = cudf::detail::make_host_vector(d_counts, stream);
+  buffers.device_to_host(stream);
   std::vector<column_type_histogram> histograms(num_active_columns);
   for (size_t col = 0; col < num_active_columns; ++col) {
     auto const count = [&](field_class cls) {
-      return h_counts[col * num_field_classes + static_cast<int>(cls)];
+      return counts[col * num_field_classes + static_cast<int>(cls)];
     };
     auto& histogram                    = histograms[col];
     histogram.null_count               = count(field_class::NA);

@@ -20,12 +20,11 @@
 namespace cudf {
 namespace detail {
 
-/*
+/**
  * @brief Searches for a string in a serialized trie.
  *
- * @param trie Pointer to the array of nodes that make up the trie
- * @param key Pointer to the start of the string to find
- * @param key_len Length of the string to find
+ * @param trie The nodes of the serialized trie; empty for a trie without keys
+ * @param key The string to find
  *
  * @return Boolean value; true if string is found, false otherwise
  */
@@ -34,6 +33,8 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
 {
   if (trie.empty()) { return false; }
   if (key.empty()) { return trie.front().is_leaf; }
+  // The root holds the length of the longest key
+  if (key.size() > static_cast<size_t>(trie.front().children_offset)) { return false; }
   auto curr_node = trie.begin() + 1;
   for (auto curr_key = key.begin(); curr_key < key.end(); ++curr_key) {
     // Don't jump away from root node

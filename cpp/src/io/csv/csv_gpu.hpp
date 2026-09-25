@@ -249,7 +249,7 @@ void compute_row_staging_size(device_span<uint64_t const> row_offsets,
 std::vector<column_type_histogram> detect_column_types(
   cudf::io::parse_options_view const& options,
   device_span<char const> data,
-  device_span<column_parse::flags const> column_flags,
+  host_span<column_parse::flags const> column_flags,
   device_span<uint64_t const> row_offsets,
   size_t const num_active_columns,
   size_t const staging_size,
