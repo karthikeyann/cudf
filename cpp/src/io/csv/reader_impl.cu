@@ -1122,7 +1122,8 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   if (num_records != 0) {
     // Decoding unescapes quoted strings in the reader's copy of the data, or else in a scratch
     // buffer of the same size, only needed when the decode kernel unescapes (doublequote with a
-    // quote character) and there are string columns; the string columns are built from it
+    // quote character, the kernel's condition, which must stay identical) and there are string
+    // columns; the string columns are built from it
     auto& input = data_row_offsets.first;
     auto const has_strings =
       std::any_of(column_types.begin(), column_types.end(), [](auto const& type) {

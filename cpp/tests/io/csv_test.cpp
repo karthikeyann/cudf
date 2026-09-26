@@ -3587,6 +3587,38 @@ TEST_F(CsvReaderTest, EscapedQuotePairsDeviceSourceUnchanged)
   EXPECT_EQ(std::string(h_after.begin(), h_after.end()), buffer);
 }
 
+TEST_F(CsvReaderTest, DeviceSourceWithoutUnescaping)
+{
+  // Device buffers are parsed in place with no unescape buffer when quoted strings are not
+  // unescaped (doublequote off, or no quoting); the results match those of host buffers
+  std::string const buffer = "a,b\n1,\"x\"\"y\"\n2,\"\"\"\"\"\"\n3,\"z\"\n";
+  auto const stream        = cudf::get_default_stream();
+  auto const d_buffer =
+    cudf::detail::make_device_uvector(cudf::host_span<char const>{buffer.data(), buffer.size()},
+                                      stream,
+                                      cudf::get_current_device_resource_ref());
+  auto const read =
+    [&](cudf::io::source_info const& source, bool doublequote, cudf::io::quote_style quoting) {
+      return cudf::io::read_csv(
+        cudf::io::csv_reader_options::builder(source)
+          .compression(cudf::io::compression_type::NONE)
+          .doublequote(doublequote)
+          .quoting(quoting)
+          .dtypes(std::vector<data_type>{dtype<int32_t>(), dtype<cudf::string_view>()}));
+    };
+  auto const device_source = cudf::io::source_info{cudf::device_span<std::byte const>{
+    reinterpret_cast<std::byte const*>(d_buffer.data()), d_buffer.size()}};
+  auto const host_source =
+    cudf::io::source_info{cudf::host_span<char const>{buffer.data(), buffer.size()}};
+  for (auto const& [doublequote, quoting] : {std::pair{false, cudf::io::quote_style::MINIMAL},
+                                             std::pair{true, cudf::io::quote_style::NONE}}) {
+    CUDF_TEST_EXPECT_TABLES_EQUAL(read(device_source, doublequote, quoting).tbl->view(),
+                                  read(host_source, doublequote, quoting).tbl->view());
+  }
+  auto const h_after = cudf::detail::make_std_vector(d_buffer, stream);
+  EXPECT_EQ(std::string(h_after.begin(), h_after.end()), buffer);
+}
+
 TEST_F(CsvReaderTest, ShortRowsMissingFieldsAreNull)
 {
   // Row i has 5 - i % 5 of the 5 fields (the first row has all of them, so that the number of
@@ -6851,9 +6883,10 @@ TEST_F(CsvReaderTest, UserSourceWholeFileDeviceReadsInChunks)
 
 TEST_F(CsvReaderTest, NaValuesWithTerminatorAndNonAsciiCharacters)
 {
-  // NA lookups of fields with a '\n' (the character that ends each list of children in the
-  // serialized trie) at the position of a key with a smaller character, and of fields that share
-  // a non-ASCII prefix with a key that has an ASCII sibling
+  // NA lookups of a field with a '\n' (the character that ends each list of children in the
+  // serialized trie) at the position of a key with a smaller character, of a non-ASCII key that is
+  // found after its ASCII siblings in unsigned byte order, and of a field that continues past a
+  // key's node without children
   std::string const buffer = "\"\x01\"\n\"\n\"\n\xC3\xA9\na\xC3\na\n";
   auto const result        = cudf::io::read_csv(host_buffer_options(buffer)
                                            .header(-1)
