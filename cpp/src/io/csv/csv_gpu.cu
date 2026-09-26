@@ -26,7 +26,6 @@
 
 #include <rmm/exec_policy.hpp>
 
-#include <cuda/atomic>
 #include <cuda/std/algorithm>
 #include <cuda/stream>
 #include <thrust/count.h>
@@ -48,6 +47,8 @@ namespace gpu {
 
 /// Block dimension for dtype detection and conversion kernels
 constexpr uint32_t csvparse_block_dim = 128;
+// The decode kernel relies on every warp decoding rows that start at a multiple of 32
+static_assert(csvparse_block_dim % cudf::detail::warp_size == 0);
 
 /*
  * @brief Returns true is the input character is a valid digit.
@@ -149,6 +150,94 @@ __device__ __inline__ bool is_floatingpoint(long len,
   return true;
 }
 
+/**
+ * @brief Groups the active lanes of the warp by `key`, so that one lane can perform the atomic
+ * operations of its whole group.
+ *
+ * @return The group's lane mask on the group's lowest lane, and zero on the other lanes
+ */
+template <typename Key>
+__device__ __forceinline__ uint32_t group_lanes_if_leader(Key key)
+{
+  auto const lanes = __match_any_sync(__activemask(), key);
+  return static_cast<int>(threadIdx.x % cudf::detail::warp_size) == __ffs(lanes) - 1 ? lanes : 0;
+}
+
+/**
+ * @brief Equivalent of `cudf::io::gpu::seek_field_end` (without escape characters) that reads
+ * the field in aligned 8-byte words rather than one character at a time.
+ *
+ * The kernels process one row per thread, so the character loads of a warp are scattered over 32
+ * rows and each of them is a separate memory transaction; word loads cut their number by up to 8x.
+ * Only a delimiter, a terminator or a '\r' can end a field, and only a quote character can change
+ * the quoting state of a field that starts with one; every other character leaves the state of
+ * `seek_field_end` unchanged. The positions of these characters in a word are flagged with the SWAR
+ * zero-byte test (which flags every occurrence and possibly some other bytes above the lowest one),
+ * and run through the exact state transitions of `seek_field_end` in increasing order, so the
+ * first position that ends the field is the one `seek_field_end` returns. Multi-character
+ * delimiters use `seek_field_end`.
+ *
+ * Only words that lie within `[data_begin, end)` are loaded, whatever the alignment of the data;
+ * the characters of the row outside of such words are read one at a time. A word may start before
+ * `begin`, in the previous field or row. Those characters are never used: the decode kernel may be
+ * rewriting them in another thread when they are part of a quoted field, including a field loaded
+ * here (see `convert_csv_to_cudf`), a benign race since only the bytes of the calling thread's own
+ * row affect the result.
+ *
+ * @param begin Pointer to the first character of the field
+ * @param end Pointer to the end of the row
+ * @param data_begin Pointer to the first character of the data that holds the row
+ * @param opts A set of parsing options
+ * @return Pointer to the character that ends the field, or `end`
+ */
+__device__ __inline__ char const* seek_field_end_by_words(char const* begin,
+                                                          char const* end,
+                                                          char const* data_begin,
+                                                          parse_options_view const& opts)
+{
+  if (opts.multi_delimiter) { return cudf::io::gpu::seek_field_end(begin, end, opts); }
+  bool const starts_with_quote = begin < end && *begin == opts.quotechar;
+  bool in_quotes               = false;
+  // Applies the state transition of `seek_field_end` at `pos` (updating the quoting state) and
+  // returns whether the field ends there
+  auto const ends_field = [&](char const* pos) {
+    if (starts_with_quote && *pos == opts.quotechar) {
+      in_quotes = !in_quotes;
+      return false;
+    }
+    return !in_quotes && (*pos == opts.delimiter || *pos == opts.terminator ||
+                          (*pos == '\r' && pos + 1 < end && pos[1] == '\n'));
+  };
+  // Flags the high bit of the zero bytes of `word` (see above)
+  auto const zero_bytes = [](uint64_t word) {
+    return (word - 0x0101'0101'0101'0101ULL) & ~word & 0x8080'8080'8080'8080ULL;
+  };
+  auto const repeat = [](char c) { return 0x0101'0101'0101'0101ULL * static_cast<uint8_t>(c); };
+  auto current      = begin;
+  while (current < end) {
+    auto const offset     = static_cast<int>(reinterpret_cast<uintptr_t>(current) % 8);
+    auto const word_begin = current - offset;
+    if (word_begin < data_begin || word_begin + 8 > end) {
+      if (ends_field(current)) { return current; }
+      ++current;
+      continue;
+    }
+    auto const word = *reinterpret_cast<uint64_t const*>(word_begin);
+    // Flags of the characters from `current` on
+    auto candidates =
+      (zero_bytes(word ^ repeat(opts.delimiter)) | zero_bytes(word ^ repeat(opts.terminator)) |
+       zero_bytes(word ^ repeat('\r')) |
+       (starts_with_quote ? zero_bytes(word ^ repeat(opts.quotechar)) : 0)) &
+      (~0ULL << (8 * offset));
+    for (; candidates != 0; candidates &= candidates - 1) {
+      auto const pos = word_begin + (__ffsll(static_cast<long long>(candidates)) - 1) / 8;
+      if (ends_field(pos)) { return pos; }
+    }
+    current = word_begin + 8;
+  }
+  return current;
+}
+
 /*
  * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
  *
@@ -191,19 +280,21 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     // not produce empty fields (matches pandas behavior).
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, opts);
     if (field_start >= row_end) break;
-    auto next_delimiter = cudf::io::gpu::seek_field_end(field_start, row_end, opts);
+    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, opts);
 
     // Checking if this is a column that the user wants --- user can filter columns
     if (column_flags[col] & column_parse::inferred) {
       // points to last character in the field
       auto const field_len = static_cast<size_t>(next_delimiter - field_start);
+      // The histogram counter of the field's class; the lanes are counted together below
+      cudf::size_type* counter = nullptr;
       if (serialized_trie_contains(opts.trie_na, {field_start, field_len})) {
-        atomicAdd(&d_column_data[actual_col].null_count, 1);
+        counter = &d_column_data[actual_col].null_count;
       } else if (serialized_trie_contains(opts.trie_true, {field_start, field_len}) ||
                  serialized_trie_contains(opts.trie_false, {field_start, field_len})) {
-        atomicAdd(&d_column_data[actual_col].bool_count, 1);
+        counter = &d_column_data[actual_col].bool_count;
       } else if (cudf::io::is_infinity(field_start, next_delimiter)) {
-        atomicAdd(&d_column_data[actual_col].float_count, 1);
+        counter = &d_column_data[actual_col].float_count;
       } else {
         long count_number    = 0;
         long count_decimal   = 0;
@@ -221,9 +312,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
         auto const trimmed_field_len   = trimmed_field_range.second - trimmed_field_range.first;
 
         if (trimmed_field_len == 0) {
-          cuda::atomic_ref<cudf::size_type, cuda::thread_scope_device> ref{
-            d_column_data[actual_col].string_count};
-          ref.fetch_add(1, cuda::memory_order_relaxed);
+          counter = &d_column_data[actual_col].string_count;
         } else {
           for (auto cur = trimmed_field_range.first; cur < trimmed_field_range.second; ++cur) {
             if (is_digit(*cur)) {
@@ -263,28 +352,31 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
           if (column_flags[col] & column_parse::as_datetime) {
             // PANDAS uses `object` dtype if the date is unparseable
             if (is_datetime(count_string, count_decimal, count_colon, count_dash, count_slash)) {
-              atomicAdd(&d_column_data[actual_col].datetime_count, 1);
+              counter = &d_column_data[actual_col].datetime_count;
             } else {
-              atomicAdd(&d_column_data[actual_col].string_count, 1);
+              counter = &d_column_data[actual_col].string_count;
             }
           } else if (count_number == int_req_number_cnt) {
             auto const is_negative = (*trimmed_field_range.first == '-');
             auto const data_begin =
               trimmed_field_range.first + (is_negative || (*trimmed_field_range.first == '+'));
-            cudf::size_type* ptr = cudf::io::gpu::infer_integral_field_counter(
+            counter = cudf::io::gpu::infer_integral_field_counter(
               data_begin, data_begin + count_number, is_negative, d_column_data[actual_col]);
-            atomicAdd(ptr, 1);
           } else if (is_floatingpoint(trimmed_field_len,
                                       count_number,
                                       count_decimal,
                                       count_thousands,
                                       count_dash + count_plus,
                                       count_exponent)) {
-            atomicAdd(&d_column_data[actual_col].float_count, 1);
+            counter = &d_column_data[actual_col].float_count;
           } else {
-            atomicAdd(&d_column_data[actual_col].string_count, 1);
+            counter = &d_column_data[actual_col].string_count;
           }
         }
+      }
+      // One atomic per group of lanes that increment the same counter
+      if (auto const lanes = group_lanes_if_leader(reinterpret_cast<uintptr_t>(counter))) {
+        atomicAdd(counter, __popc(lanes));
       }
       actual_col++;
     }
@@ -295,30 +387,85 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
 }
 
 /**
+ * @brief Writes a quoted field's content to `out` with each escaped quote pair (two consecutive
+ * `quotechar`) collapsed into a single `quotechar`, if it holds any pair.
+ *
+ * Pairs are matched left to right without overlap, so the result is the same as replacing every
+ * occurrence of the two-character string with the one-character string (`""""` becomes `""`).
+ * Content without escaped pairs is not written, and its length is returned unchanged. `out` may be
+ * `content` itself: the write position never passes the read position, which makes the in-place
+ * update safe.
+ *
+ * @param content First character of the content (after the opening quote)
+ * @param length Number of characters in the content (excluding the closing quote)
+ * @param out Destination of the unescaped content
+ * @param quotechar Quote character
+ * @return Length of the unescaped content
+ */
+__device__ __forceinline__ size_t unescape_doublequotes(char const* content,
+                                                        size_t length,
+                                                        char* out,
+                                                        char quotechar)
+{
+  auto const end = content + length;
+  auto in        = content;
+  while (in + 1 < end && !(in[0] == quotechar && in[1] == quotechar)) {
+    ++in;
+  }
+  if (in + 1 >= end) { return length; }
+
+  // The content before the first pair is only copied when not unescaping in place
+  if (out != content) { memcpy(out, content, in - content); }
+  auto out_end = out + (in - content);
+  while (in < end) {
+    auto const c = *in;
+    *out_end++   = c;
+    in += (c == quotechar && in + 1 < end && in[1] == quotechar) ? 2 : 1;
+  }
+  return out_end - out;
+}
+
+/**
  * @brief CUDA kernel that parses and converts CSV data into cuDF column data.
  *
- * Data is processed one record at a time
+ * Data is processed one record at a time. A fixed-width output is written wherever its field is
+ * valid, which is where the (zero-initialized) validity bit is set, so fixed-width outputs do not
+ * need to be initialized. String outputs do: a (pointer, length) pair is written for valid and NA
+ * fields, while fields missing from the end of a short row rely on the zeroed pair reading as null.
+ *
+ * When `options.doublequote` is set, quoted string fields with escaped quote pairs are written to
+ * `unescaped` with the pairs collapsed, at their offsets in `data`, and their string pairs point
+ * there. When `unescaped` is `data` (the reader's own copy), this is done in place, which relies
+ * on two invariants:
+ * - All accesses for row `i` stay within its byte range `[row_offsets[i], row_offsets[i + 1])`,
+ *   and the ranges of different rows do not overlap, so each byte is accessed by one thread only.
+ *   Code that loads bytes outside the row (e.g. aligned word loads) must not use them: other
+ *   threads may be rewriting them.
+ * - Within a row, a field is rewritten only after its end (and therefore the start of the next
+ *   field) has been found, and the rewrite stays within the field.
+ * No other code reads `data` after this kernel, except to copy the strings it describes.
  *
  * @param[in] options A set of parsing options
  * @param[in] data The entire CSV data to read
+ * @param[out] unescaped Destination of the unescaped quoted string fields, of the size of `data`;
+ * may be `data` itself
  * @param[in] column_flags Per-column parsing behavior flags
  * @param[in] row_offsets The start the CSV data of interest
  * @param[in] dtypes The data type of the column
  * @param[out] columns The output column data
  * @param[out] valids The bitmaps indicating whether column fields are valid
  * @param[out] valid_counts The number of valid fields in each column
- * @param[out] is_quoted_flags Per-column boolean arrays tracking which rows were quoted fields
  */
 CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
   convert_csv_to_cudf(cudf::io::parse_options_view options,
                       device_span<char const> data,
+                      device_span<char> unescaped,
                       device_span<column_parse::flags const> column_flags,
                       device_span<uint64_t const> row_offsets,
                       device_span<cudf::data_type const> dtypes,
                       device_span<void* const> columns,
                       device_span<cudf::bitmask_type* const> valids,
-                      device_span<size_type> valid_counts,
-                      device_span<bool* const> is_quoted_flags)
+                      device_span<size_type> valid_counts)
 {
   auto const raw_csv = data.data();
   // thread IDs range per block, so also need the block id.
@@ -342,7 +489,7 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
     field_start = cudf::io::gpu::skip_leading_delimiter_run(field_start, row_end, options);
     if (field_start >= row_end) break;
     next_field          = field_start;
-    auto next_delimiter = cudf::io::gpu::seek_field_end(field_start, row_end, options);
+    auto next_delimiter = seek_field_end_by_words(field_start, row_end, raw_csv, options);
 
     if (column_flags[col] & column_parse::enabled) {
       // check if the entire field is a NaN string - consistent with pandas
@@ -357,8 +504,6 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
         field_start = trimmed_field.first;
         field_end   = trimmed_field.second;
       }
-      bool* const is_quoted_output =
-        is_quoted_flags.empty() ? nullptr : is_quoted_flags[actual_col];
       if (is_valid) {
         // Type dispatcher does not handle STRING
         if (dtypes[actual_col].id() == cudf::type_id::STRING) {
@@ -386,8 +531,17 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
               }
             }
           }
-          // Track whether this field was quoted (for doublequote unescaping)
-          if (is_quoted_output != nullptr) { is_quoted_output[rec_id] = was_quoted; }
+          // A quoted field has both of its quotes, so the content length is not negative
+          if (was_quoted && options.doublequote && options.quotechar != '\0') {
+            auto const out    = unescaped.data() + (field_start - raw_csv);
+            auto const length = static_cast<size_t>(end - field_start);
+            if (auto const unescaped_length =
+                  unescape_doublequotes(field_start, length, out, options.quotechar);
+                unescaped_length != length) {
+              field_start = out;
+              end         = out + unescaped_length;
+            }
+          }
           auto str_list = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
           str_list[rec_id].first  = field_start;
           str_list[rec_id].second = end - field_start;
@@ -401,16 +555,21 @@ CUDF_KERNEL void __launch_bounds__(csvparse_block_dim)
                                     dtypes[actual_col],
                                     options,
                                     column_flags[col] & column_parse::as_hexadecimal)) {
-            // set the valid bitmap - all bits were set to 0 to start
-            set_bit(valids[actual_col], rec_id);
-            atomicAdd(&valid_counts[actual_col], 1);
+            // Set the valid bit (the masks start all null) and count it, with a single atomic of
+            // each kind per group of lanes that mark the same column together. The lanes normally
+            // mark the same column, but may not after diverging in earlier fields, hence the
+            // grouping. A warp decodes 32 consecutive rows that start at a multiple of 32, so the
+            // bits of a group are in one mask word, where the bit of each row is at its lane index.
+            if (auto const lanes = group_lanes_if_leader(actual_col)) {
+              atomicOr(&valids[actual_col][cudf::word_index(rec_id)], lanes);
+              atomicAdd(&valid_counts[actual_col], __popc(lanes));
+            }
           }
         }
       } else if (dtypes[actual_col].id() == cudf::type_id::STRING) {
         auto str_list           = static_cast<std::pair<char const*, size_t>*>(columns[actual_col]);
         str_list[rec_id].first  = nullptr;
         str_list[rec_id].second = 0;
-        if (is_quoted_output != nullptr) { is_quoted_output[rec_id] = false; }
       }
       ++actual_col;
     }
@@ -628,6 +787,96 @@ rowctx_inverse_merge_transform(device_span<uint64_t const> ctxtree, uint32_t t)
 constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
 
 /**
+ * @brief The characters that make a row blank (skipped) when it starts with one of them: the
+ * terminator of an empty row if blank lines are skipped, the comment character, and the carriage
+ * return of an empty CRLF row.
+ */
+struct blank_row_chars {
+  char newline;
+  char comment;
+  char carriage;
+
+  explicit blank_row_chars(parse_options_view const& opts)
+    : newline{opts.skipblanklines ? opts.terminator : opts.comment},
+      comment{opts.comment != '\0' ? opts.comment : newline},
+      carriage{(opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment}
+  {
+  }
+
+  /**
+   * @brief Returns whether the row at `pos` in `data` is blank; `pos` may be the end of the data
+   */
+  [[nodiscard]] __device__ bool is_blank(device_span<char const> data, uint64_t pos) const
+  {
+    return pos != data.size() &&
+           (data[pos] == newline || data[pos] == comment || data[pos] == carriage);
+  }
+};
+
+/**
+ * @brief Returns the context of a character for the row parser: its row start flags and output
+ * context for each input context (see `make_char_context`).
+ *
+ * @param c The character
+ * @param c_prev The character before it, or the terminator at the start of the data
+ */
+__device__ __forceinline__ uint32_t
+char_row_context(int c, int c_prev, int terminator, int delimiter, int quotechar, int commentchar)
+{
+  uint32_t ctx;
+  if (c_prev == terminator) {
+    if (c == commentchar) {
+      // Start of a new comment row
+      ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
+    } else if (c == quotechar) {
+      // Quoted string on newrow, or quoted string ending in terminator
+      ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+    } else {
+      // Start of a new row unless within a quote
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
+    }
+  } else if (c == quotechar) {
+    // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
+    // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
+    // exit because it might be the first quote of a "" escape sequence. We transition to
+    // COMMENT (pending exit) and wait for the next character:
+    //   - If next char is quote: it's a "" escape, return to QUOTE
+    //   - If next char is anything else: exit confirmed, go to NONE
+    // This doesn't conflict with actual comment handling because comments are only
+    // detected at row boundaries (after newline), where COMMENT state is set with row
+    // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
+    if (c_prev == delimiter) {
+      // Quote after delimiter: start field or pending exit
+      ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+    } else if (c_prev == quotechar) {
+      // Quote after quote: "" escape or stay NONE (Spark compatibility)
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+    } else {
+      // Quote after regular char: pending exit or stay NONE
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
+    }
+  } else {
+    // Non-quote char: stay in current state, or exit from pending
+    ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+  }
+  return ctx;
+}
+
+/**
+ * @brief Returns a 4-bit mask of the bytes of `word` equal to the character `c` (bit i for byte
+ * i); none match if `c` is not a byte value (e.g. 0x100 for an unused character).
+ */
+__device__ __forceinline__ uint32_t match_bytes(uint32_t word, int c)
+{
+  if (c < -128 || c > 255) { return 0; }
+  // 0xff in each matching byte
+  auto const matches = __vcmpeq4(word, static_cast<uint32_t>(c & 0xff) * 0x0101'0101u);
+  // Moves the low bit of byte i (bit 8i) to bit 21 + i; the partial products land on distinct
+  // bits, so the multiplication does not carry into bits 21 to 24
+  return (((matches & 0x0101'0101u) * 0x0020'4081u) >> 21) & 0xf;
+}
+
+/**
  * @brief Gather row offsets from CSV character data split into 16KB chunks
  *
  * This is done in two phases: the first phase returns the possible row counts
@@ -640,7 +889,9 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  * Row parsing context will be updated after phase 2 such that the value contains
  * the number of rows starting at byte_range_end or beyond.
  *
- * @param row_ctx Row parsing context (output of phase 1 or input to phase 2)
+ * @param row_ctx Row parsing context (output of phase 1 or input to phase 2), in device-accessible
+ * memory; phase 2 may read and write it in pinned host memory, which the host must then not access
+ * until the stream is synchronized
  * @param offsets_out Row offsets (nullptr for phase1, non-null indicates phase 2)
  * @param data Base pointer of character data (all row offsets are relative to this)
  * @param chunk_size Total number of characters to parse
@@ -650,6 +901,8 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  * @param byte_range_start Ignore rows starting before this position in the file
  * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
  * @param skip_rows Number of rows to skip (ignored in phase 1)
+ * @param blank_chars Characters that make a row blank when it starts with one of them
+ * @param maybe_blank_rows Flag set in phase 2 if an output row may be blank
  * @param terminator Line terminator character
  * @param delimiter Column delimiter character
  * @param quotechar Quote character
@@ -658,7 +911,6 @@ constexpr auto bk_ctxtree_size = rowofs_block_dim * 2;
  */
 CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   gather_row_offsets_gpu(uint64_t* row_ctx,
-                         device_span<uint64_t> ctxtree,
                          device_span<uint64_t> offsets_out,
                          device_span<char const> const data,
                          size_t chunk_size,
@@ -668,14 +920,18 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
                          size_t byte_range_start,
                          size_t byte_range_end,
                          size_t skip_rows,
+                         blank_row_chars const blank_chars,
+                         uint32_t* maybe_blank_rows,
                          int terminator,
                          int delimiter,
                          int quotechar,
                          int escapechar,
                          int commentchar)
 {
-  auto start            = data.data();
-  auto const bk_ctxtree = ctxtree.subspan(blockIdx.x * bk_ctxtree_size, bk_ctxtree_size);
+  auto start = data.data();
+  // The block's merge transform tree only lives for the duration of the block
+  __shared__ packed_rowctx_t ctxtree[bk_ctxtree_size];
+  auto const bk_ctxtree = device_span<uint64_t>{ctxtree, bk_ctxtree_size};
 
   // file-level end position for this scan, clamped to the file size
   size_t const end_in_file = (parse_pos >= data_size || chunk_size > data_size - parse_pos)
@@ -689,8 +945,10 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
   // Offset of `parse_pos` inside the local `data` window, clamped to avoid underflow
   auto const parse_off = parse_pos > start_offset ? parse_pos - start_offset : 0;
   uint32_t const t     = threadIdx.x;
-  size_t block_pos     = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
-  auto cur             = start + block_pos;
+  // Phase 2's initial block context is loaded first, as it may be in host memory
+  uint64_t const initial_ctx = (offsets_out.data() && t == 0) ? row_ctx[blockIdx.x] : 0;
+  size_t block_pos = parse_off + blockIdx.x * static_cast<size_t>(rowofs_block_bytes) + t * 32;
+  auto cur         = start + block_pos;
 
   // Initial state is neutral context (no state transitions), zero rows
   uint4 ctx_map = {
@@ -699,46 +957,59 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
     .z = 0,
     .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_COMMENT << 4) | (ROW_CTX_EOF << 6)};
   int c, c_prev = (cur > start && cur <= end) ? cur[-1] : terminator;
-  // Loop through all 32 bytes and keep a bitmask of row starts for each possible input context
-  for (uint32_t pos = 0; pos < 32; pos++, cur++, c_prev = c) {
+  // Aligned slices within the chunk are loaded with two 16-byte loads, and their terminators,
+  // quotes and comment characters located a word at a time. Only the characters after a
+  // terminator and quotes have transitions other than the regular one (NONE and QUOTE are kept,
+  // COMMENT, the pending quote exit, goes to NONE, and no row starts), which is idempotent, so
+  // each run of regular characters is merged at once; a slice without quotes, or comment
+  // characters that start rows, has fixed transitions. The loop below computes the same for any
+  // slice. (Slices are aligned when the data starts at an aligned address at the parse position,
+  // as in whole-file and first-chunk reads of the reader's own copy, but not in byte-range reads
+  // with an offset, which keep one character before the range, nor in caller buffers parsed in
+  // place from an unaligned address (e.g. after a BOM); those take the loop.)
+  bool slice_merged = false;
+  if (cur + 32 <= end && reinterpret_cast<uintptr_t>(cur) % sizeof(uint4) == 0) {
+    uint4 const vectors[2] = {reinterpret_cast<uint4 const*>(cur)[0],
+                              reinterpret_cast<uint4 const*>(cur)[1]};
+    auto const words       = reinterpret_cast<uint32_t const*>(vectors);
+    uint32_t terminators = 0, quotes = 0, comments = 0;
+#pragma unroll
+    for (uint32_t i = 0; i < 8; i++) {
+      terminators |= match_bytes(words[i], terminator) << (4 * i);
+      quotes |= match_bytes(words[i], quotechar) << (4 * i);
+      comments |= match_bytes(words[i], commentchar) << (4 * i);
+    }
+    auto const row_starts  = (terminators << 1) | static_cast<uint32_t>(c_prev == terminator);
+    auto constexpr regular = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+    if ((quotes | (comments & row_starts)) == 0) {
+      ctx_map = {
+        .x = row_starts,
+        .y = 0,
+        .z = row_starts,
+        .w = (ROW_CTX_NONE << 0) | (ROW_CTX_QUOTE << 2) | (ROW_CTX_NONE << 4) | (ROW_CTX_EOF << 6)};
+    } else {
+      uint32_t pos = 0;  // first character not merged yet
+      for (auto events = row_starts | quotes; events != 0; events &= events - 1) {
+        auto const k = static_cast<uint32_t>(__ffs(events)) - 1;
+        if (k > pos) { merge_char_context(ctx_map, regular, pos); }
+        merge_char_context(
+          ctx_map,
+          char_row_context(
+            cur[k], k > 0 ? cur[k - 1] : c_prev, terminator, delimiter, quotechar, commentchar),
+          k);
+        pos = k + 1;
+      }
+      if (pos < 32) { merge_char_context(ctx_map, regular, pos); }
+    }
+    slice_merged = true;
+  }
+  // Otherwise, loop through all 32 bytes and keep a bitmask of row starts for each possible input
+  // context
+  for (uint32_t pos = 0; pos < 32 && !slice_merged; pos++, cur++, c_prev = c) {
     uint32_t ctx;
     if (cur < end) {
-      c = cur[0];
-      if (c_prev == terminator) {
-        if (c == commentchar) {
-          // Start of a new comment row
-          ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
-        } else if (c == quotechar) {
-          // Quoted string on newrow, or quoted string ending in terminator
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
-        } else {
-          // Start of a new row unless within a quote
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
-        }
-      } else if (c == quotechar) {
-        // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
-        // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
-        // exit because it might be the first quote of a "" escape sequence. We transition to
-        // COMMENT (pending exit) and wait for the next character:
-        //   - If next char is quote: it's a "" escape, return to QUOTE
-        //   - If next char is anything else: exit confirmed, go to NONE
-        // This doesn't conflict with actual comment handling because comments are only
-        // detected at row boundaries (after newline), where COMMENT state is set with row
-        // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
-        if (c_prev == delimiter) {
-          // Quote after delimiter: start field or pending exit
-          ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
-        } else if (c_prev == quotechar) {
-          // Quote after quote: "" escape or stay NONE (Spark compatibility)
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
-        } else {
-          // Quote after regular char: pending exit or stay NONE
-          ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
-        }
-      } else {
-        // Non-quote char: stay in current state, or exit from pending
-        ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
-      }
+      c   = cur[0];
+      ctx = char_row_context(c, c_prev, terminator, delimiter, quotechar, commentchar);
     } else {
       bool const is_last_chunk = data_end_off <= data.size();
       if (is_last_chunk && cur <= end && cur == data_end) {
@@ -770,13 +1041,14 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
 
   // If this is the second phase, get the block's initial parser state and row counter
   if (offsets_out.data()) {
-    if (t == 0) { bk_ctxtree[0] = row_ctx[blockIdx.x]; }
+    if (t == 0) { bk_ctxtree[0] = initial_ctx; }
     __syncthreads();
 
     // Walk back the transform tree with the known initial parser state
     rowctx32_t ctx             = rowctx_inverse_merge_transform(bk_ctxtree, t);
     uint64_t row               = (bk_ctxtree[0] >> 2) + (ctx >> 2);
     uint32_t rows_out_of_range = 0;
+    bool maybe_blank           = false;
     uint32_t rowmap            = select_rowmap(ctx_map, ctx & 3);
     // Output row positions
     while (rowmap != 0) {
@@ -786,11 +1058,13 @@ CUDF_KERNEL void __launch_bounds__(rowofs_block_dim)
         // Output byte offsets are relative to the base of the input buffer
         offsets_out[row - skip_rows] = block_pos - 1;
         rows_out_of_range += (start_offset + block_pos - 1 >= byte_range_end);
+        // The row starts in `data` or at its end
+        maybe_blank |= blank_chars.is_blank(data, block_pos - 1);
       }
       row++;
       rowmap >>= pos;
     }
-    __syncthreads();
+    if (__syncthreads_or(maybe_blank) && t == 0) { atomicOr(maybe_blank_rows, 1u); }
     // Return the number of rows out of range
 
     using block_reduce = typename cub::BlockReduce<uint32_t, rowofs_block_dim>;
@@ -808,17 +1082,11 @@ size_t __host__ count_blank_rows(cudf::io::parse_options_view const& opts,
                                  device_span<uint64_t const> row_offsets,
                                  cuda::stream_ref stream)
 {
-  auto const newline  = opts.skipblanklines ? opts.terminator : opts.comment;
-  auto const comment  = opts.comment != '\0' ? opts.comment : newline;
-  auto const carriage = (opts.skipblanklines && opts.terminator == '\n') ? '\r' : comment;
-  return thrust::count_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data = data, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != data.size()) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
-    });
+  return thrust::count_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                          row_offsets.begin(),
+                          row_offsets.end(),
+                          [data, blank_chars = blank_row_chars{opts}] __device__(
+                            uint64_t const pos) { return blank_chars.is_blank(data, pos); });
 }
 
 device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view const& options,
@@ -826,18 +1094,12 @@ device_span<uint64_t> __host__ remove_blank_rows(cudf::io::parse_options_view co
                                                  device_span<uint64_t> row_offsets,
                                                  cuda::stream_ref stream)
 {
-  size_t d_size       = data.size();
-  auto const newline  = options.skipblanklines ? options.terminator : options.comment;
-  auto const comment  = options.comment != '\0' ? options.comment : newline;
-  auto const carriage = (options.skipblanklines && options.terminator == '\n') ? '\r' : comment;
-  auto new_end        = thrust::remove_if(
-    rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_offsets.begin(),
-    row_offsets.end(),
-    [data = data, d_size, newline, comment, carriage] __device__(uint64_t const pos) {
-      return ((pos != d_size) &&
-              (data[pos] == newline || data[pos] == comment || data[pos] == carriage));
-    });
+  auto new_end =
+    thrust::remove_if(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                      row_offsets.begin(),
+                      row_offsets.end(),
+                      [data, blank_chars = blank_row_chars{options}] __device__(
+                        uint64_t const pos) { return blank_chars.is_blank(data, pos); });
   return row_offsets.subspan(0, new_end - row_offsets.begin());
 }
 
@@ -865,13 +1127,13 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
 
 void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<char const> data,
+                            device_span<char> unescaped,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
-                            device_span<bool* const> is_quoted_flags,
                             cuda::stream_ref stream)
 {
   // Calculate actual block count to use based on records count
@@ -879,15 +1141,8 @@ void decode_row_column_data(cudf::io::parse_options_view const& options,
   auto const num_rows   = row_offsets.size() - 1;
   auto const grid_size  = cudf::util::div_rounding_up_safe<size_t>(num_rows, block_size);
 
-  convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(options,
-                                                                  data,
-                                                                  column_flags,
-                                                                  row_offsets,
-                                                                  dtypes,
-                                                                  columns,
-                                                                  valids,
-                                                                  valid_counts,
-                                                                  is_quoted_flags);
+  convert_csv_to_cudf<<<grid_size, block_size, 0, stream.get()>>>(
+    options, data, unescaped, column_flags, row_offsets, dtypes, columns, valids, valid_counts);
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
@@ -902,14 +1157,13 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
                                      size_t byte_range_start,
                                      size_t byte_range_end,
                                      size_t skip_rows,
+                                     uint32_t* maybe_blank_rows,
                                      cuda::stream_ref stream)
 {
   uint32_t dim_grid = 1 + (chunk_size / rowofs_block_bytes);
-  auto ctxtree      = rmm::device_uvector<packed_rowctx_t>(dim_grid * bk_ctxtree_size, stream);
 
   gather_row_offsets_gpu<<<dim_grid, rowofs_block_dim, 0, stream.get()>>>(
     row_ctx,
-    ctxtree,
     offsets_out,
     data,
     chunk_size,
@@ -919,6 +1173,8 @@ uint32_t __host__ gather_row_offsets(parse_options_view const& options,
     byte_range_start,
     byte_range_end,
     skip_rows,
+    blank_row_chars{options},
+    maybe_blank_rows,
     options.terminator,
     options.delimiter,
     (options.quotechar) ? options.quotechar : 0x100,

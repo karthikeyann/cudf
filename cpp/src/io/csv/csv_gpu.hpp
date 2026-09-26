@@ -124,7 +124,9 @@ inline __host__ __device__ rowctx64_t select_row_context(rowctx64_t sel_ctx,
  * the number of rows starting at byte_range_end or beyond.
  *
  * @param options Options that control parsing of individual fields
- * @param row_ctx Row parsing context (output of phase 1 or input to phase 2)
+ * @param row_ctx Row parsing context (output of phase 1 or input to phase 2), in device-accessible
+ * memory; phase 2 may read and write it in pinned host memory, which the host must then not access
+ * until the stream is synchronized
  * @param offsets_out Row offsets (nullptr for phase1, non-null indicates phase 2)
  * @param data Base pointer of character data (all row offsets are relative to this)
  * @param chunk_size Total number of characters to parse
@@ -134,6 +136,8 @@ inline __host__ __device__ rowctx64_t select_row_context(rowctx64_t sel_ctx,
  * @param byte_range_start Ignore rows starting before this position in the file
  * @param byte_range_end In phase 2, store the number of rows beyond range in row_ctx
  * @param skip_rows Number of rows to skip (ignored in phase 1)
+ * @param maybe_blank_rows Device flag that phase 2 sets to nonzero if an output row may be blank
+ * (see `remove_blank_rows`), and leaves unchanged otherwise
  * @param stream CUDA stream used for device memory operations and kernel launches.
  *
  * @return Number of row contexts
@@ -149,6 +153,7 @@ uint32_t gather_row_offsets(cudf::io::parse_options_view const& options,
                             size_t byte_range_start,
                             size_t byte_range_end,
                             size_t skip_rows,
+                            uint32_t* maybe_blank_rows,
                             cuda::stream_ref stream);
 
 /**
@@ -200,27 +205,35 @@ cudf::detail::host_vector<column_type_histogram> detect_column_types(
 /**
  * @brief Launches kernel for decoding row-column data
  *
+ * String columns are output as (pointer, length) pairs that point into `data`. When
+ * `options.doublequote` is set, the quoted string fields that hold escaped quote pairs are written
+ * with the pairs collapsed to `unescaped`, at their offsets in `data`, and their string pairs point
+ * there. `unescaped` has the size of `data`; it may be `data` itself when the reader owns it (the
+ * unescaping is then in place), in which case decoding must be its last use other than building
+ * the string columns from the pairs.
+ *
  * @param[in] options Options that control individual field data conversion
  * @param[in] data The row-column data
+ * @param[out] unescaped Destination of the unescaped quoted string fields
  * @param[in] column_flags Flags that control individual column parsing
  * @param[in] row_offsets List of row data start positions (offsets)
  * @param[in] dtypes List of dtype corresponding to each column
- * @param[out] columns Device memory output of column data
- * @param[out] valids Device memory output of column valids bitmap data
+ * @param[out] columns Device memory output of column data. Fixed-width data is only written where
+ * the field is valid and needs no initialization; string pairs must be zero-initialized, since
+ * fields missing from short rows are not written
+ * @param[out] valids Device memory output of column valids bitmap data; must be zero-initialized
  * @param[out] valid_counts Device memory output of the number of valid fields in each column
- * @param[out] is_quoted Per-column boolean arrays indicating which rows were quoted fields
- *                          (nullptr entries mean the column doesn't need quote tracking)
  * @param[in] stream CUDA stream to use
  */
 void decode_row_column_data(cudf::io::parse_options_view const& options,
                             device_span<char const> data,
+                            device_span<char> unescaped,
                             device_span<column_parse::flags const> column_flags,
                             device_span<uint64_t const> row_offsets,
                             device_span<cudf::data_type const> dtypes,
                             device_span<void* const> columns,
                             device_span<cudf::bitmask_type* const> valids,
                             device_span<size_type> valid_counts,
-                            device_span<bool* const> is_quoted,
                             cuda::stream_ref stream);
 
 }  // namespace gpu

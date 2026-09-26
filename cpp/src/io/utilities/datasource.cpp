@@ -14,6 +14,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <kvikio/detail/posix_io.hpp>
 #include <kvikio/file_handle.hpp>
 #include <kvikio/file_utils.hpp>
 #include <kvikio/mmap.hpp>
@@ -147,6 +148,26 @@ class file_source : public kvikio_source<kvikio::FileHandle> {
       _kvikio_handle.get_compat_mode_manager().is_compat_mode_preferred() ? "on" : "off");
   }
 
+  using kvikio_source::host_read;
+
+  /**
+   * @copydoc cudf::io::datasource::host_read(size_t, size_t, uint8_t*)
+   *
+   * kvikIO's `pread` queues even a read of a single task on kvikIO's thread pool, so parallel
+   * callers (e.g. on the host worker pool) could read with no more threads than that pool has. A
+   * read of at most one task is read on the calling thread instead, as kvikIO's task would (POSIX,
+   * with direct I/O if kvikIO is configured for it).
+   */
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    if (size > kvikio::defaults::task_size()) {
+      return kvikio_source::host_read(offset, size, dst);
+    }
+    auto const read_size = std::min(size, this->size() - offset);
+    return kvikio::detail::posix_host_read<kvikio::detail::PartialIO::NO>(
+      _kvikio_handle.fd(), dst, read_size, offset, _kvikio_handle.fd(true));
+  }
+
   std::future<size_t> device_read_async(size_t offset,
                                         size_t size,
                                         uint8_t* dst,
@@ -197,14 +218,17 @@ class device_buffer_source final : public datasource {
   {
   }
 
+  // Host reads copy with a plain cudaMemcpyAsync rather than cudf::detail::cuda_memcpy, which uses
+  // cudaMemcpyBatchAsync on non-default streams: with it, synchronizing the stream after a copy of
+  // a few bytes (e.g. a reader checking the leading bytes of the data) was measured to take ~200us
+  // longer, leaving the GPU idle for a large share of a fast device read.
   size_t host_read(size_t offset, size_t size, uint8_t* dst) override
   {
     auto const count  = std::min(size, this->size() - offset);
     auto const stream = cudf::detail::current_cuda_stream_pool().get_stream();
-    cudf::detail::cuda_memcpy(host_span<uint8_t>{dst, count},
-                              device_span<uint8_t const>{
-                                reinterpret_cast<uint8_t const*>(_d_buffer.data() + offset), count},
-                              stream);
+    CUDF_CUDA_TRY(
+      cudaMemcpyAsync(dst, _d_buffer.data() + offset, count, cudaMemcpyDefault, stream.get()));
+    stream.sync();
     return count;
   }
 
@@ -212,8 +236,9 @@ class device_buffer_source final : public datasource {
   {
     auto const count  = std::min(size, this->size() - offset);
     auto const stream = cudf::detail::current_cuda_stream_pool().get_stream();
-    auto h_data       = cudf::detail::make_host_vector_async(
-      cudf::device_span<std::byte const>{_d_buffer.data() + offset, count}, stream);
+    auto h_data       = cudf::detail::make_host_vector<std::byte>(count, stream);
+    CUDF_CUDA_TRY(cudaMemcpyAsync(
+      h_data.data(), _d_buffer.data() + offset, count, cudaMemcpyDefault, stream.get()));
     stream.sync();
     return std::make_unique<owning_buffer<cudf::detail::host_vector<std::byte>>>(std::move(h_data));
   }
