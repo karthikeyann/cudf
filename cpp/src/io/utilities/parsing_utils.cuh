@@ -20,6 +20,7 @@
 
 #include <rmm/device_uvector.hpp>
 
+#include <cuda/std/array>
 #include <cuda/std/iterator>
 #include <cuda/std/limits>
 #include <cuda/std/optional>
@@ -98,15 +99,68 @@ CUDF_HOST_DEVICE constexpr char to_lower(char const c)
 CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
 {
   if (begin < end && (*begin == '-' || *begin == '+')) begin++;
-  char const* cinf = "infinity";
-  auto index       = begin;
-  while (index < end) {
-    if (*cinf != to_lower(*index)) break;
-    index++;
-    cinf++;
+  if (end - begin != 3 && end - begin != 8) { return false; }
+  // A branch-free comparison compiles into faster parsing kernels than an early exit
+  bool matches = true;
+  for (auto i = 0; i < end - begin; ++i) {
+    matches &= to_lower(begin[i]) == "infinity"[i];
   }
-  return ((index == begin + 3 || index == begin + 8) && index >= end);
+  return matches;
 }
+
+namespace detail {
+
+/// Number of successive divisions of 1 by 10 with a nonzero double result
+inline constexpr size_t num_fraction_place_values = 323;
+
+/// The place values of the digits of a decimal fraction: element `i` is 1 divided by 10 `i + 1`
+/// times, every division rounded to the nearest double (ties to even, with subnormals), as
+/// `parse_numeric` computes the place value that multiplies the `i`-th fraction digit.
+inline constexpr auto host_fraction_place_values = [] {
+  cuda::std::array<double, num_fraction_place_values> place_values{};
+  double place_value = 1;
+  for (auto& element : place_values) {
+    element = place_value /= 10;
+  }
+  return place_values;
+}();
+
+// A division of a double not above 5 * denorm_min by 10 rounds to zero, so every place value past
+// the table is zero
+static_assert(host_fraction_place_values.back() > 0 and
+                host_fraction_place_values.back() <=
+                  5 * cuda::std::numeric_limits<double>::denorm_min(),
+              "The fraction place value table must hold exactly the nonzero place values");
+
+/// Device copy of `host_fraction_place_values`, in constant memory: in the CSV reader, the threads
+/// of a warp parse the same column of different rows, so they mostly read the place value of the
+/// same fraction digit together, and constant memory broadcasts their reads. It has internal
+/// linkage: libcudf is built without relocatable device code, so every translation unit that
+/// parses floats has its own copy.
+static __constant__ cuda::std::array<double, num_fraction_place_values> const
+  fraction_place_values = host_fraction_place_values;
+
+/**
+ * @brief Returns the place value of the fraction digit at `index`, 0 being the first digit after
+ * the decimal point.
+ *
+ * The result is the value that dividing 1 by 10 `index + 1` times gives. It is looked up, which is
+ * much faster than a double division on GPUs.
+ *
+ * @param index Position of the digit in the fraction
+ * @return 1 divided by 10 `index + 1` times, every division rounded
+ */
+CUDF_HOST_DEVICE inline double fraction_place_value(size_t index)
+{
+  if (index >= num_fraction_place_values) { return 0.0; }
+#ifdef __CUDA_ARCH__
+  return fraction_place_values[index];
+#else
+  return host_fraction_place_values[index];
+#endif
+}
+
+}  // namespace detail
 
 /**
  * @brief Parses a character string and returns its numeric value.
@@ -155,13 +209,18 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
 
   if (cuda::std::is_floating_point_v<T>) {
     // Handle fractional part of the number if necessary
-    double divisor = 1;
+    double divisor             = 1;
+    size_t num_fraction_digits = 0;
     while (begin < end) {
       if (*begin == 'e' || *begin == 'E') {
         ++begin;
         break;
       } else if (*begin != opts.thousands && *begin != '+') {
-        divisor /= base;
+        if constexpr (base == 10) {
+          divisor = detail::fraction_place_value(num_fraction_digits++);
+        } else {
+          divisor /= base;
+        }
         value += decode_digit<T, as_hex>(*begin, &all_digits_valid) * divisor;
       }
       ++begin;
