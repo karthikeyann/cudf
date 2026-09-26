@@ -823,16 +823,18 @@ struct blank_row_chars {
 __device__ __forceinline__ uint32_t
 char_row_context(int c, int c_prev, int terminator, int delimiter, int quotechar, int commentchar)
 {
+  uint32_t ctx;
   if (c_prev == terminator) {
     if (c == commentchar) {
       // Start of a new comment row
-      return make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
+      ctx = make_char_context(ROW_CTX_COMMENT, ROW_CTX_QUOTE, ROW_CTX_COMMENT, 1, 0, 1);
     } else if (c == quotechar) {
       // Quoted string on newrow, or quoted string ending in terminator
-      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+      ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_NONE, ROW_CTX_QUOTE, 1, 0, 1);
+    } else {
+      // Start of a new row unless within a quote
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
     }
-    // Start of a new row unless within a quote
-    return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE, 1, 0, 1);
   } else if (c == quotechar) {
     // Quote handling uses ROW_CTX_COMMENT as a "pending exit" state to correctly handle
     // escaped quotes (""). When in QUOTE state and we see a quote, we can't immediately
@@ -845,16 +847,19 @@ char_row_context(int c, int c_prev, int terminator, int delimiter, int quotechar
     // counting. Mid-row, COMMENT is purely used for this pending exit mechanism.
     if (c_prev == delimiter) {
       // Quote after delimiter: start field or pending exit
-      return make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
+      ctx = make_char_context(ROW_CTX_QUOTE, ROW_CTX_COMMENT);
     } else if (c_prev == quotechar) {
       // Quote after quote: "" escape or stay NONE (Spark compatibility)
-      return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT, ROW_CTX_QUOTE);
+    } else {
+      // Quote after regular char: pending exit or stay NONE
+      ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
     }
-    // Quote after regular char: pending exit or stay NONE
-    return make_char_context(ROW_CTX_NONE, ROW_CTX_COMMENT);
+  } else {
+    // Non-quote char: stay in current state, or exit from pending
+    ctx = make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
   }
-  // Non-quote char: stay in current state, or exit from pending
-  return make_char_context(ROW_CTX_NONE, ROW_CTX_QUOTE, ROW_CTX_NONE);
+  return ctx;
 }
 
 /**
