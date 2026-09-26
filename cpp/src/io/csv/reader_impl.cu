@@ -224,6 +224,10 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 /**
  * @brief Copies pageable host data into pinned memory with the host worker threads, one 1MB slice
  * per task, returning once the copy has completed.
+ *
+ * The driver copies pageable memory to the device through its own pinned buffers with one thread;
+ * staging the data with many threads first is much faster on hosts where the GPU cannot access
+ * pageable memory directly. The parallelism is limited by the size of the host worker pool.
  */
 void copy_to_pinned(char* dst, host_span<char const> src)
 {
@@ -234,58 +238,6 @@ void copy_to_pinned(char* dst, host_span<char const> src)
       [=] { std::copy_n(src.data() + i, std::min(slice_bytes, src.size() - i), dst + i); }));
   }
   std::ranges::for_each(tasks, [](auto& task) { task.get(); });
-}
-
-/**
- * @brief Copies host data to the device, returning once the copy has completed.
- *
- * It copies at most one chunk of the reader (64MB) at a time: whole host inputs of more than one
- * chunk are copied in chunks by load_data_and_gather_row_offsets instead, staged the same way.
- *
- * The driver copies pageable memory through its own pinned buffers with one thread, which is only
- * slightly faster than a single-threaded memcpy into pinned memory (measured on an x86 host with a
- * PCIe GPU; platforms where the GPU accesses pageable memory directly may not benefit). Pageable
- * data of at least one window is instead copied into pinned memory by the host worker threads, one
- * slice per task, a window at a time into two alternating pinned windows. Each window is copied to
- * the device while the next one is filled. Synchronizing the stream before a window's device copy
- * is enqueued ensures the previous copy, from the other window, has completed, so the other window
- * can be refilled.
- *
- * Trade-offs: each staged read takes 64MB from the pinned memory resource (see
- * `cudf::set_pinned_memory_resource` and the default pool's sizing in host_memory.cpp), so on small
- * GPUs, or with concurrent readers, the first reads may grow the pool or allocate pinned memory,
- * which is slow; and the fill uses the host worker pool, whose size limits its parallelism. Smaller
- * windows lower the footprint but cost throughput (16MB windows made 256MB pageable reads ~25%
- * slower, mostly from per-window synchronization). Pageable inputs smaller than one window, and
- * pinned or device-accessible inputs, are copied directly (the pointer query is one cheap
- * driver call). The windows are held in an uninitialized `device_uvector` (host-accessible, as
- * the resource is pinned) rather than a zero-filled host vector. An exception from the loop is not
- * expected short of a CUDA error, which leaves the stream in an undefined state anyway.
- *
- * This is local to the CSV reader on purpose; other readers copying pageable host data could share
- * it from cudf::detail.
- *
- * @param dst Device destination, of the same size as `src`
- * @param src Host data, pinned or pageable
- * @param stream CUDA stream used for the device copies
- */
-void copy_host_to_device(device_span<char> dst, host_span<char const> src, cuda::stream_ref stream)
-{
-  constexpr size_t window_bytes = 32 * 1024 * 1024;
-  if (src.size() < window_bytes or is_device_accessible(src.data())) {
-    return cudf::detail::cuda_memcpy(dst, src, stream);
-  }
-  auto staging = rmm::device_uvector<char>(
-    std::min(2 * window_bytes, src.size()), stream, cudf::get_pinned_memory_resource());
-  for (size_t offset = 0; offset < src.size(); offset += window_bytes) {
-    auto const size   = std::min(window_bytes, src.size() - offset);
-    auto const window = staging.data() + (offset / window_bytes % 2) * window_bytes;
-    copy_to_pinned(window, src.subspan(offset, size));
-    stream.sync();
-    cudf::detail::cuda_memcpy_async(
-      dst.subspan(offset, size), host_span<char const>{window, size, true}, stream);
-  }
-  stream.sync();
 }
 
 /**
@@ -375,8 +327,8 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // A whole file of more than one chunk read on the device (asynchronously, which user datasources
   // need not support), or such host input copied on another stream, is read in chunks, and the row
   // offsets of each chunk are gathered once it has been read, while the next ones are read.
-  // Pageable host input is staged through two alternating pinned chunks (see copy_host_to_device).
-  // Host reads of other sources (e.g. user datasources, which may copy) read a chunk at a time.
+  // Pageable host input is staged through two alternating pinned chunks (see copy_to_pinned).
+  // Reads of other sources (e.g. user datasources, which may copy) read a chunk at a time.
   // Other whole inputs are parsed as one chunk.
   auto const input_size            = max_input_size - input_pos;
   bool const whole_source          = load_whole_file && !data.has_value() && !read_whole_input;
@@ -388,11 +340,12 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
       reader_opts.get_source().type() == io_type::HOST_BUFFER) {
     host_input = source->host_read(input_pos, input_size);
   }
-  bool const copy_in_chunks       = host_input != nullptr && input_size > max_chunk_bytes;
-  bool const is_pinned            = copy_in_chunks && is_device_accessible(host_input->data());
-  bool const host_reads_in_chunks = whole_source && !device_read_preferred && host_input == nullptr;
+  bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes;
+  bool const is_device_accessible_input =
+    copy_in_chunks && is_device_accessible(host_input->data());
+  bool const reads_bounded_by_chunk = whole_source && host_input == nullptr && !read_in_chunks;
   bool const single_chunk =
-    load_whole_file && !read_in_chunks && !copy_in_chunks && !host_reads_in_chunks;
+    load_whole_file && !read_in_chunks && !copy_in_chunks && !reads_bounded_by_chunk;
   auto const chunk_bytes = single_chunk ? data_size : max_chunk_bytes;
   auto const buffer_size = std::min(chunk_bytes, data_size);
 
@@ -403,9 +356,10 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                                    : std::min(buffer_size * 2, max_input_size),
                  stream);
   // Pageable chunks are staged in two alternating pinned chunks, which take up to 128MB of the
-  // pinned memory resource (see copy_host_to_device for the trade-offs)
+  // pinned memory resource: the first reads may grow the pool or allocate pinned memory, which is
+  // slow on small GPUs or with concurrent readers
   auto staging = rmm::device_uvector<char>(
-    copy_in_chunks && !is_pinned ? std::min(2 * chunk_bytes, input_size) : 0,
+    copy_in_chunks && !is_device_accessible_input ? std::min(2 * chunk_bytes, input_size) : 0,
     stream,
     cudf::get_pinned_memory_resource());
   // The copy stream is joined as `stream` waits for the copy of every chunk
@@ -463,7 +417,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
           auto const offset = chunks.copies.size() * chunk_bytes;
           auto const size   = std::min(chunk_bytes, host_input->size() - offset);
           auto chunk_data   = reinterpret_cast<char const*>(host_input->data()) + offset;
-          if (!is_pinned) {
+          if (!is_device_accessible_input) {
             // The staging chunk was last copied from two chunks back, which must have completed
             auto const window = staging.data() + (chunks.copies.size() % 2) * chunk_bytes;
             if (chunks.copies.size() >= 2) { chunks.copies[chunks.copies.size() - 2].sync(); }
@@ -499,7 +453,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         auto const buffer =
           host_input != nullptr ? std::move(host_input) : source->host_read(read_offset, read_size);
         // Use sync version to prevent buffer going out of scope before we copy the data.
-        copy_host_to_device(
+        cudf::detail::cuda_memcpy(
           device_span<char>{d_data.data() + previous_data_size, read_size},
           host_span<char const>{reinterpret_cast<char const*>(buffer->data()), buffer->size()},
           stream);

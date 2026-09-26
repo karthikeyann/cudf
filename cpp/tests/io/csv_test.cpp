@@ -6632,9 +6632,8 @@ TEST_F(CsvReaderTest, LiteralQuotesWithQuotingDisabled)
 
 TEST_F(CsvReaderTest, PageableHostBufferAcrossStagingWindows)
 {
-  // Pageable host data spanning three pinned staging windows (32MB each, `window_bytes` in
-  // copy_host_to_device; the data must stay larger than two windows), so the first window is
-  // refilled, the last window is partial and slices end mid-row
+  // Pageable host data of more than one 64MB chunk, staged through pinned chunks: the last chunk is
+  // partial and the 1MB staging slices end mid-row
   std::vector<std::string> expected;
   std::string buffer;
   for (int i = 0; i < 8800; ++i) {
@@ -6821,6 +6820,35 @@ TEST_F(CsvReaderTest, UserSourceWholeFileHostReadsInChunks)
     read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}}).tbl->view());
 }
 
+TEST_F(CsvReaderTest, UserSourceWholeFileDeviceReadsInChunks)
+{
+  // A user datasource that prefers device reads is also read a 64MB chunk at a time in a whole-file
+  // read, as it may copy on each read
+  struct max_read_source : public unaligned_device_source {
+    using unaligned_device_source::unaligned_device_source;
+    size_t device_read(size_t offset, size_t size, uint8_t* dst, cuda::stream_ref stream) override
+    {
+      max_read_size = std::max(max_read_size, size);
+      return unaligned_device_source::device_read(offset, size, dst, stream);
+    }
+    size_t max_read_size = 0;
+  };
+  std::string text;
+  for (int i = 0; text.size() < 64u * 1024 * 1024 + 4096; ++i) {
+    text += std::to_string(i) + ",\"" + std::string(100 + i % 13, 'a' + i % 26) + "\n\"\n";
+  }
+  max_read_source source{text};
+  auto const read = [](cudf::io::source_info const& info) {
+    return cudf::io::read_csv(cudf::io::csv_reader_options::builder(info).header(-1).build());
+  };
+  auto const result = read(cudf::io::source_info{&source});
+  EXPECT_GT(source.max_read_size, 0u);
+  EXPECT_LE(source.max_read_size, 64u * 1024 * 1024);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(
+    result.tbl->view(),
+    read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}}).tbl->view());
+}
+
 TEST_F(CsvReaderTest, FixedLayoutTimestampsParseAsGeneralLayouts)
 {
   // Column a has the fixed ISO 8601 layout parsed at fixed positions; column b has the same values
@@ -6841,13 +6869,17 @@ TEST_F(CsvReaderTest, FixedLayoutTimestampsParseAsGeneralLayouts)
   for (auto const& [fixed, general] : fields) {
     buffer += fixed + "," + general + "\n";
   }
-  for (auto const type : {type_id::TIMESTAMP_SECONDS, type_id::TIMESTAMP_MILLISECONDS}) {
-    auto const result =
-      cudf::io::read_csv(host_buffer_options(buffer)
-                           .header(-1)
-                           .dtypes(std::vector<data_type>{data_type{type}, data_type{type}})
-                           .build());
-    CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), result.tbl->view().column(1));
+  // Year-first dates parse the same way whether or not dayfirst is set
+  for (auto const dayfirst : {false, true}) {
+    for (auto const type : {type_id::TIMESTAMP_SECONDS, type_id::TIMESTAMP_MILLISECONDS}) {
+      auto const result =
+        cudf::io::read_csv(host_buffer_options(buffer)
+                             .header(-1)
+                             .dayfirst(dayfirst)
+                             .dtypes(std::vector<data_type>{data_type{type}, data_type{type}})
+                             .build());
+      CUDF_TEST_EXPECT_COLUMNS_EQUAL(result.tbl->view().column(0), result.tbl->view().column(1));
+    }
   }
 }
 
