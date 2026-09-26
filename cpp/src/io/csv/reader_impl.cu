@@ -222,20 +222,30 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 }
 
 /**
- * @brief Copies pageable host data into pinned memory with the host worker threads, one 1MB slice
- * per task, returning once the copy has completed.
+ * @brief Stages input into pinned memory with the host worker threads, one 4MB slice per task,
+ * returning once all slices are staged.
  *
  * The driver copies pageable memory to the device through its own pinned buffers with one thread;
  * staging the data with many threads first is much faster on hosts where the GPU cannot access
- * pageable memory directly. The parallelism is limited by the size of the host worker pool.
+ * pageable memory directly. Reads of files (from the page cache) scale with the number of threads
+ * too, beyond the size of kvikIO's thread pool. The parallelism is limited by the size of the host
+ * worker pool.
+ *
+ * @param dst Pinned memory to stage the input into
+ * @param size Number of bytes to stage
+ * @param stage_slice Stages the `size` bytes of the input at `offset` into `dst`, given as
+ * `(offset, size, dst)`
  */
-void copy_to_pinned(char* dst, host_span<char const> src)
+template <typename StageSlice>
+void stage_in_pinned(char* dst, size_t size, StageSlice const& stage_slice)
 {
-  constexpr size_t slice_bytes = 1024 * 1024;
+  constexpr size_t slice_bytes = 4 * 1024 * 1024;
   std::vector<std::future<void>> tasks;
-  for (size_t i = 0; i < src.size(); i += slice_bytes) {
+  for (size_t i = 0; i < size; i += slice_bytes) {
     tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
-      [=] { std::copy_n(src.data() + i, std::min(slice_bytes, src.size() - i), dst + i); }));
+      [&stage_slice, i, slice_size = std::min(slice_bytes, size - i), slice = dst + i] {
+        stage_slice(i, slice_size, slice);
+      }));
   }
   std::ranges::for_each(tasks, [](auto& task) { task.get(); });
 }
@@ -324,30 +334,29 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
   // The options describe `source` (see `cudf::io::read_csv`).
   bool const read_whole_input = load_whole_file && !data.has_value() &&
                                 reader_opts.get_source().type() == io_type::DEVICE_BUFFER;
-  // A whole file of more than one chunk read on the device (asynchronously, which user datasources
-  // need not support), or such host input copied on another stream, is read in chunks, and the row
-  // offsets of each chunk are gathered once it has been read, while the next ones are read.
-  // Pageable host input is staged through two alternating pinned chunks (see copy_to_pinned).
-  // Reads of other sources (e.g. user datasources, which may copy) read a chunk at a time.
-  // Other whole inputs are parsed as one chunk.
+  // A whole file or host input of more than one chunk is copied to the device in chunks on another
+  // stream, and the row offsets of each chunk are gathered once it has been copied, while the next
+  // ones are copied. Files and pageable host input are staged through two alternating pinned chunks
+  // (see stage_in_pinned). Reads of other sources (e.g. user datasources, which may copy) read a
+  // chunk at a time. Other whole inputs are parsed as one chunk.
   auto const input_size            = max_input_size - input_pos;
   bool const whole_source          = load_whole_file && !data.has_value() && !read_whole_input;
   bool const device_read_preferred = whole_source && source->is_device_read_preferred(input_size);
-  bool const read_in_chunks        = device_read_preferred && input_size > max_chunk_bytes &&
-                              reader_opts.get_source().type() == io_type::FILEPATH;
   std::unique_ptr<datasource::buffer> host_input;
   if (whole_source && !device_read_preferred &&
       reader_opts.get_source().type() == io_type::HOST_BUFFER) {
     host_input = source->host_read(input_pos, input_size);
   }
-  bool const copy_in_chunks = host_input != nullptr && input_size > max_chunk_bytes;
+  bool const copy_in_chunks =
+    (host_input != nullptr ||
+     (whole_source && reader_opts.get_source().type() == io_type::FILEPATH)) &&
+    input_size > max_chunk_bytes;
   bool const is_device_accessible_input =
-    copy_in_chunks && is_device_accessible(host_input->data());
-  bool const reads_bounded_by_chunk = whole_source && host_input == nullptr && !read_in_chunks;
-  bool const single_chunk =
-    load_whole_file && !read_in_chunks && !copy_in_chunks && !reads_bounded_by_chunk;
-  auto const chunk_bytes = single_chunk ? data_size : max_chunk_bytes;
-  auto const buffer_size = std::min(chunk_bytes, data_size);
+    host_input != nullptr && copy_in_chunks && is_device_accessible(host_input->data());
+  bool const reads_bounded_by_chunk = whole_source && !copy_in_chunks && host_input == nullptr;
+  bool const single_chunk           = load_whole_file && !copy_in_chunks && !reads_bounded_by_chunk;
+  auto const chunk_bytes            = single_chunk ? data_size : max_chunk_bytes;
+  auto const buffer_size            = std::min(chunk_bytes, data_size);
 
   device_input input{rmm::device_uvector<char>{0, stream}, nullptr};
   auto& d_data = input.copy;
@@ -355,28 +364,24 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                  : load_whole_file ? data_size
                                    : std::min(buffer_size * 2, max_input_size),
                  stream);
-  // Pageable chunks are staged in two alternating pinned chunks, which take up to 128MB of the
-  // pinned memory resource: the first reads may grow the pool or allocate pinned memory, which is
-  // slow on small GPUs or with concurrent readers
+  // File and pageable chunks are staged in two alternating pinned chunks, which take up to 128MB of
+  // the pinned memory resource: the first reads may grow the pool or allocate pinned memory, which
+  // is slow on small GPUs or with concurrent readers
   auto staging = rmm::device_uvector<char>(
     copy_in_chunks && !is_device_accessible_input ? std::min(2 * chunk_bytes, input_size) : 0,
     stream,
     cudf::get_pinned_memory_resource());
   // The copy stream is joined as `stream` waits for the copy of every chunk
   auto const copy_stream = copy_in_chunks ? cudf::detail::fork_streams(stream, 1).front() : stream;
-  // Chunk copies and reads in flight when the loop exits with an exception still write into
-  // `d_data`, and copy from `host_input` or `staging`, so they are waited for before those are
-  // freed (they are declared first); the destructor does not throw by design. The copies complete
-  // in order, on one stream.
+  // Chunk copies in flight when the loop exits with an exception still write into `d_data`, and
+  // copy from `host_input` or `staging`, so they are waited for before those are freed (they are
+  // declared first); the destructor does not throw by design. The copies complete in order, on one
+  // stream.
   struct in_flight_chunks {
     std::vector<cuda::event> copies;
-    std::vector<std::future<size_t>> reads;
     ~in_flight_chunks()
     {
       if (!copies.empty()) { std::ignore = cudaEventSynchronize(copies.back().get()); }
-      for (auto& read : reads) {
-        if (read.valid()) { read.wait(); }
-      }
     }
   } chunks;
   rmm::device_uvector<uint64_t> all_row_offsets{0, stream};
@@ -413,15 +418,27 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
         // is parsed and waits for its copy.
         auto const chunk = previous_data_size / chunk_bytes;
         while (chunks.copies.size() < chunk + 2 &&
-               chunks.copies.size() * chunk_bytes < host_input->size()) {
+               chunks.copies.size() * chunk_bytes < input_size) {
           auto const offset = chunks.copies.size() * chunk_bytes;
-          auto const size   = std::min(chunk_bytes, host_input->size() - offset);
-          auto chunk_data   = reinterpret_cast<char const*>(host_input->data()) + offset;
+          auto const size   = std::min(chunk_bytes, input_size - offset);
+          auto chunk_data   = host_input != nullptr
+                                ? reinterpret_cast<char const*>(host_input->data()) + offset
+                                : nullptr;
           if (!is_device_accessible_input) {
             // The staging chunk was last copied from two chunks back, which must have completed
             auto const window = staging.data() + (chunks.copies.size() % 2) * chunk_bytes;
             if (chunks.copies.size() >= 2) { chunks.copies[chunks.copies.size() - 2].sync(); }
-            copy_to_pinned(window, {chunk_data, size});
+            stage_in_pinned(window, size, [&](size_t slice_offset, size_t slice_size, char* dst) {
+              if (chunk_data != nullptr) {
+                std::copy_n(chunk_data + slice_offset, slice_size, dst);
+              } else {
+                auto const read_offset = input_pos + offset + slice_offset;
+                CUDF_EXPECTS(
+                  source->host_read(read_offset, slice_size, reinterpret_cast<uint8_t*>(dst)) ==
+                    slice_size,
+                  "Failed to read the input");
+              }
+            });
             chunk_data = window;
           }
           cudf::detail::cuda_memcpy_async(device_span<char>{d_data.data() + offset, size},
@@ -430,20 +447,6 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
           chunks.copies.push_back(copy_stream.record_event());
         }
         stream.wait(chunks.copies[chunk]);
-      } else if (read_in_chunks) {
-        // Reads run one chunk ahead, into the capacity of `d_data` (as above); the source
-        // completes them in order (kvikio's thread pool runs its tasks first come, first served)
-        // and synchronizes `stream` before reading into device memory.
-        auto const chunk = previous_data_size / chunk_bytes;
-        while (chunks.reads.size() < chunk + 2 && chunks.reads.size() * chunk_bytes < input_size) {
-          auto const offset = chunks.reads.size() * chunk_bytes;
-          chunks.reads.push_back(
-            source->device_read_async(input_pos + offset,
-                                      std::min(chunk_bytes, input_size - offset),
-                                      reinterpret_cast<uint8_t*>(d_data.data() + offset),
-                                      stream));
-        }
-        chunks.reads[chunk].get();
       } else if (source->is_device_read_preferred(read_size)) {
         source->device_read(read_offset,
                             read_size,
@@ -540,7 +543,7 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
       }
     } else {
       // Discard data (all rows below skip_rows), keeping one character for history
-      CUDF_EXPECTS(!copy_in_chunks && !read_in_chunks, "Chunks read ahead cannot be discarded");
+      CUDF_EXPECTS(!copy_in_chunks, "Chunks read ahead cannot be discarded");
       size_t discard_bytes = std::max(d_data.size(), sizeof(char)) - sizeof(char);
       if (discard_bytes != 0) {
         erase_except_last(d_data, stream);

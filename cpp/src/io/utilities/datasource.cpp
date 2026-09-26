@@ -14,6 +14,7 @@
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <kvikio/detail/posix_io.hpp>
 #include <kvikio/file_handle.hpp>
 #include <kvikio/file_utils.hpp>
 #include <kvikio/mmap.hpp>
@@ -145,6 +146,19 @@ class file_source : public kvikio_source<kvikio::FileHandle> {
     CUDF_LOG_INFO(
       "Reading a file using kvikIO, with compatibility mode %s.",
       _kvikio_handle.get_compat_mode_manager().is_compat_mode_preferred() ? "on" : "off");
+  }
+
+  // kvikIO runs a read of at most one task as one task on its thread pool; reading it on the
+  // calling thread instead lets callers reading in parallel (e.g. on the host worker pool) use more
+  // threads than kvikIO's pool has
+  size_t host_read(size_t offset, size_t size, uint8_t* dst) override
+  {
+    if (size > kvikio::defaults::task_size()) {
+      return kvikio_source::host_read(offset, size, dst);
+    }
+    auto const read_size = std::min(size, this->size() - offset);
+    return kvikio::detail::posix_host_read<kvikio::detail::PartialIO::NO>(
+      _kvikio_handle.fd(), dst, read_size, offset);
   }
 
   std::future<size_t> device_read_async(size_t offset,
