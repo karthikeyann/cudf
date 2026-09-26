@@ -40,27 +40,26 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
     return false;
   }
   if (key.empty()) { return trie.front().is_leaf; }
+  // A single loop, which compiles into faster parsing kernels than a loop over the key characters
+  // with a nested search of the children
   auto curr_node = trie.begin() + 1;
-  for (auto curr_key = key.begin(); curr_key < key.end(); ++curr_key) {
-    // Don't jump away from root node
-    if (curr_key != key.begin()) {
-      // A node without children has a negative offset: no key continues past it. Following the
-      // offset would resume the search at an unrelated node and could report a false match.
-      if (curr_node->children_offset < 0) { return false; }
-      curr_node += curr_node->children_offset;
-    }
-    // Search for the next character in the array of children nodes
-    // Nodes are sorted as unsigned bytes - terminate search if the node is larger or equal
-    auto const key_char = static_cast<unsigned char>(*curr_key);
-    while (curr_node->character != trie_terminating_character &&
-           static_cast<unsigned char>(curr_node->character) < key_char) {
+  size_t index   = 0;
+  while (true) {
+    // Children are sorted as unsigned bytes: the search skips the ones before the key character
+    if (curr_node->character != trie_terminating_character &&
+        static_cast<unsigned char>(curr_node->character) < static_cast<unsigned char>(key[index])) {
       ++curr_node;
+      continue;
     }
-    // Could not find the next character, done with the search
-    if (curr_node->character != *curr_key) { return false; }
+    // Could not find the character, done with the search
+    if (curr_node->character != key[index]) { return false; }
+    // Even if the node is present, return true only if that node is at the end of a word
+    if (++index == key.size()) { return curr_node->is_leaf; }
+    // A node without children has a negative offset: no key continues past it. Following the
+    // offset would resume the search at an unrelated node and could report a false match.
+    if (curr_node->children_offset < 0) { return false; }
+    curr_node += curr_node->children_offset;
   }
-  // Even if the node is present, return true only if that node is at the end of a word
-  return curr_node->is_leaf;
 }
 }  // namespace detail
 }  // namespace cudf

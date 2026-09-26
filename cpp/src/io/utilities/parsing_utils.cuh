@@ -21,7 +21,6 @@
 #include <rmm/device_uvector.hpp>
 
 #include <cuda/std/array>
-#include <cuda/std/cstddef>
 #include <cuda/std/iterator>
 #include <cuda/std/limits>
 #include <cuda/std/optional>
@@ -112,7 +111,7 @@ CUDF_HOST_DEVICE constexpr bool is_infinity(char const* begin, char const* end)
 namespace detail {
 
 /// Number of successive divisions of 1 by 10 with a nonzero double result
-inline constexpr cuda::std::size_t num_fraction_place_values = 323;
+inline constexpr size_t num_fraction_place_values = 323;
 
 /// The place values of the digits of a decimal fraction: element `i` is 1 divided by 10 `i + 1`
 /// times, every division rounded to the nearest double (ties to even, with subnormals), as
@@ -151,7 +150,7 @@ static __constant__ cuda::std::array<double, num_fraction_place_values> const
  * @param index Position of the digit in the fraction
  * @return 1 divided by 10 `index + 1` times, every division rounded
  */
-CUDF_HOST_DEVICE inline double fraction_place_value(cuda::std::size_t index)
+CUDF_HOST_DEVICE inline double fraction_place_value(size_t index)
 {
   if (index >= num_fraction_place_values) { return 0.0; }
 #ifdef __CUDA_ARCH__
@@ -210,8 +209,8 @@ CUDF_HOST_DEVICE cuda::std::optional<T> parse_numeric(char const* begin,
 
   if (cuda::std::is_floating_point_v<T>) {
     // Handle fractional part of the number if necessary
-    double divisor                        = 1;
-    cuda::std::size_t num_fraction_digits = 0;
+    double divisor             = 1;
+    size_t num_fraction_digits = 0;
     while (begin < end) {
       if (*begin == 'e' || *begin == 'E') {
         ++begin;
