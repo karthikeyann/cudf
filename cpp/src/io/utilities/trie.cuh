@@ -23,9 +23,8 @@ namespace detail {
 /*
  * @brief Searches for a string in a serialized trie.
  *
- * @param trie Pointer to the array of nodes that make up the trie
- * @param key Pointer to the start of the string to find
- * @param key_len Length of the string to find
+ * @param trie The array of nodes that make up the trie
+ * @param key The string to find
  *
  * @return Boolean value; true if string is found, false otherwise
  */
@@ -40,8 +39,11 @@ __device__ inline bool serialized_trie_contains(device_span<serial_trie_node con
     return false;
   }
   if (key.empty()) { return trie.front().is_leaf; }
-  // A single loop, which compiles into faster parsing kernels than a loop over the key characters
-  // with a nested search of the children
+  // A single loop over the nodes rather than a loop over the key characters with a nested search
+  // of the children: with the nested loops, nvcc kept the CSV decode kernel's own loop state in
+  // local memory (a stack frame), which slowed decoding down by up to 20%. Equivalent rewrites
+  // (if/else-if chains instead of `continue`, iterators instead of the index) brought the stack
+  // frame back; check the kernels' resource usage when changing this loop.
   auto curr_node = trie.begin() + 1;
   size_t index   = 0;
   while (true) {

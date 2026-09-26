@@ -6849,6 +6849,25 @@ TEST_F(CsvReaderTest, UserSourceWholeFileDeviceReadsInChunks)
     read(cudf::io::source_info{cudf::host_span<char const>{text.data(), text.size()}}).tbl->view());
 }
 
+TEST_F(CsvReaderTest, NaValuesWithTerminatorAndNonAsciiCharacters)
+{
+  // NA lookups of fields with a '\n' (the character that ends each list of children in the
+  // serialized trie) at the position of a key with a smaller character, and of fields that share
+  // a non-ASCII prefix with a key that has an ASCII sibling
+  std::string const buffer = "\"\x01\"\n\"\n\"\n\xC3\xA9\na\xC3\na\n";
+  auto const result        = cudf::io::read_csv(host_buffer_options(buffer)
+                                           .header(-1)
+                                           .dtypes({dtype<cudf::string_view>()})
+                                           .keep_default_na(false)
+                                           .na_values({"\"\x01\"", "a", "\xC3\xA9"})
+                                           .build());
+  std::vector<std::string> const strings{"\x01", "\n", "\xC3\xA9", "a\xC3", "a"};
+  std::vector<bool> const expected_valid{false, true, false, true, false};
+  auto const expected =
+    cudf::test::strings_column_wrapper(strings.begin(), strings.end(), expected_valid.begin());
+  CUDF_TEST_EXPECT_COLUMNS_EQUAL(expected, result.tbl->view().column(0));
+}
+
 TEST_F(CsvReaderTest, FixedLayoutTimestampsParseAsGeneralLayouts)
 {
   // Column a has the fixed ISO 8601 layout parsed at fixed positions; column b has the same values

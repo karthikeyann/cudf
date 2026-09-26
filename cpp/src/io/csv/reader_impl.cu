@@ -1121,15 +1121,18 @@ table_with_metadata read_csv(cudf::io::datasource* source,
   out_columns.reserve(column_types.size());
   if (num_records != 0) {
     // Decoding unescapes quoted strings in the reader's copy of the data, or else in a scratch
-    // buffer of the same size, only needed when doublequote is set and there are string columns;
-    // the string columns are built from it
+    // buffer of the same size, only needed when the decode kernel unescapes (doublequote with a
+    // quote character) and there are string columns; the string columns are built from it
     auto& input = data_row_offsets.first;
     auto const has_strings =
       std::any_of(column_types.begin(), column_types.end(), [](auto const& type) {
         return type.id() == type_id::STRING;
       });
     auto scratch = rmm::device_uvector<char>(
-      input.source_buffer && parse_opts.doublequote && has_strings ? data.size() : 0, stream);
+      input.source_buffer && parse_opts.doublequote && parse_opts.quotechar != '\0' && has_strings
+        ? data.size()
+        : 0,
+      stream);
     auto const unescaped = input.source_buffer ? device_span<char>{scratch} : input.copy;
     auto decode_result   = decode_data(  //
       parse_opts,
