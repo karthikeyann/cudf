@@ -222,31 +222,37 @@ constexpr std::array<uint8_t, 3> UTF8_BOM = {0xEF, 0xBB, 0xBF};
 }
 
 /**
- * @brief Stages input into pinned memory with the host worker threads, one 4MB slice per task,
- * returning once all slices are staged.
+ * @brief Reads input of a host buffer or file source into pinned memory with the host worker
+ * threads, one 4MB slice per task, returning once all slices are read.
  *
  * The driver copies pageable memory to the device through its own pinned buffers with one thread;
  * staging the data with many threads first is much faster on hosts where the GPU cannot access
- * pageable memory directly. Reads of files (from the page cache) scale with the number of threads
- * too, beyond the size of kvikIO's thread pool. The parallelism is limited by the size of the host
- * worker pool.
+ * pageable memory directly. Reads of files from the page cache scale with the number of threads
+ * too: a file source reads slices of at most kvikIO's task size (4MB by default) on the calling
+ * worker thread rather than on kvikIO's smaller thread pool. The parallelism is limited by the size
+ * of the host worker pool.
  *
- * @param dst Pinned memory to stage the input into
- * @param size Number of bytes to stage
- * @param stage_slice Stages the `size` bytes of the input at `offset` into `dst`, given as
- * `(offset, size, dst)`
+ * Every slice has completed before the exception of a failed slice is rethrown, since the slices
+ * write into `dst`.
+ *
+ * @param source The source to read from
+ * @param offset Offset of the input in the source
+ * @param size Number of bytes to read
+ * @param dst Pinned memory to read into
  */
-template <typename StageSlice>
-void stage_in_pinned(char* dst, size_t size, StageSlice const& stage_slice)
+void read_into_pinned(datasource& source, size_t offset, size_t size, char* dst)
 {
   constexpr size_t slice_bytes = 4 * 1024 * 1024;
   std::vector<std::future<void>> tasks;
   for (size_t i = 0; i < size; i += slice_bytes) {
     tasks.emplace_back(cudf::detail::host_worker_pool().submit_task(
-      [&stage_slice, i, slice_size = std::min(slice_bytes, size - i), slice = dst + i] {
-        stage_slice(i, slice_size, slice);
+      [&source, offset, dst, i, slice_size = std::min(slice_bytes, size - i)] {
+        CUDF_EXPECTS(source.host_read(
+                       offset + i, slice_size, reinterpret_cast<uint8_t*>(dst + i)) == slice_size,
+                     "Failed to read the input");
       }));
   }
+  std::ranges::for_each(tasks, [](auto& task) { task.wait(); });
   std::ranges::for_each(tasks, [](auto& task) { task.get(); });
 }
 
@@ -336,9 +342,11 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                                 reader_opts.get_source().type() == io_type::DEVICE_BUFFER;
   // A whole file or host input of more than one chunk is copied to the device in chunks on another
   // stream, and the row offsets of each chunk are gathered once it has been copied, while the next
-  // ones are copied. Files and pageable host input are staged through two alternating pinned chunks
-  // (see stage_in_pinned). Reads of other sources (e.g. user datasources, which may copy) read a
-  // chunk at a time. Other whole inputs are parsed as one chunk.
+  // ones are copied. Files and pageable host input are read into two alternating pinned chunks
+  // (see read_into_pinned); files are read through host memory even where kvikIO could read them
+  // to the device directly (GDS), as reading them with the host worker pool measured faster than
+  // kvikIO's device reads from the page cache. Reads of other sources (e.g. user datasources, which
+  // may copy) read a chunk at a time. Other whole inputs are parsed as one chunk.
   auto const input_size            = max_input_size - input_pos;
   bool const whole_source          = load_whole_file && !data.has_value() && !read_whole_input;
   bool const device_read_preferred = whole_source && source->is_device_read_preferred(input_size);
@@ -421,26 +429,15 @@ std::pair<device_input, selected_rows_offsets> load_data_and_gather_row_offsets(
                chunks.copies.size() * chunk_bytes < input_size) {
           auto const offset = chunks.copies.size() * chunk_bytes;
           auto const size   = std::min(chunk_bytes, input_size - offset);
-          auto chunk_data   = host_input != nullptr
-                                ? reinterpret_cast<char const*>(host_input->data()) + offset
-                                : nullptr;
+          auto const window = staging.data() + (chunks.copies.size() % 2) * chunk_bytes;
           if (!is_device_accessible_input) {
             // The staging chunk was last copied from two chunks back, which must have completed
-            auto const window = staging.data() + (chunks.copies.size() % 2) * chunk_bytes;
             if (chunks.copies.size() >= 2) { chunks.copies[chunks.copies.size() - 2].sync(); }
-            stage_in_pinned(window, size, [&](size_t slice_offset, size_t slice_size, char* dst) {
-              if (chunk_data != nullptr) {
-                std::copy_n(chunk_data + slice_offset, slice_size, dst);
-              } else {
-                auto const read_offset = input_pos + offset + slice_offset;
-                CUDF_EXPECTS(
-                  source->host_read(read_offset, slice_size, reinterpret_cast<uint8_t*>(dst)) ==
-                    slice_size,
-                  "Failed to read the input");
-              }
-            });
-            chunk_data = window;
+            read_into_pinned(*source, input_pos + offset, size, window);
           }
+          auto const chunk_data = is_device_accessible_input
+                                    ? reinterpret_cast<char const*>(host_input->data()) + offset
+                                    : window;
           cudf::detail::cuda_memcpy_async(device_span<char>{d_data.data() + offset, size},
                                           host_span<char const>{chunk_data, size, true},
                                           copy_stream);

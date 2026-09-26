@@ -6971,4 +6971,64 @@ TEST_F(CsvReaderTest, HostSourcesOfManyChunksMatchDeviceBuffer)
   }
 }
 
+TEST_F(CsvReaderTest, FilesAroundTheChunkSize)
+{
+  // Whole files of more than one 64MB chunk are read into pinned chunks in 4MB slices by the host
+  // worker threads: sizes of exactly one chunk (read as one chunk), one byte more (a one-byte
+  // second chunk), and a second chunk that is not a whole number of slices must all give the table
+  // of a device buffer.
+  constexpr size_t chunk_bytes = 64 * 1024 * 1024;
+  auto const stream            = cudf::get_default_stream();
+  for (size_t const file_size : {chunk_bytes, chunk_bytes + 1, chunk_bytes + 5 * 1024 * 1024 + 7}) {
+    std::string text;
+    for (int i = 0; text.size() + 200 < file_size; ++i) {
+      text += std::to_string(i) + "," + std::string(50 + i % 31, 'a' + i % 26) + "\n";
+    }
+    // The last row fills the file up to exactly `file_size` bytes, without a terminator
+    auto const last_row = std::string("-1,");
+    text += last_row + std::string(file_size - text.size() - last_row.size(), 'z');
+    ASSERT_EQ(text.size(), file_size);
+    auto const filepath = temp_env->get_temp_filepath("FileAroundTheChunkSize.csv");
+    std::ofstream(filepath, std::ios::binary) << text;
+    auto const d_text =
+      cudf::detail::make_device_uvector(cudf::host_span<char const>{text.data(), text.size()},
+                                        stream,
+                                        cudf::get_current_device_resource_ref());
+    auto const read = [](cudf::io::source_info const& source) {
+      return cudf::io::read_csv(cudf::io::csv_reader_options::builder(source).header(-1).build());
+    };
+    auto const expected = read(cudf::io::source_info{cudf::device_span<std::byte const>{
+      reinterpret_cast<std::byte const*>(d_text.data()), d_text.size()}});
+    CUDF_TEST_EXPECT_TABLES_EQUAL(read(cudf::io::source_info{filepath}).tbl->view(),
+                                  expected.tbl->view());
+  }
+}
+
+TEST_F(CsvReaderTest, FileSourceHostReadsIntoBuffers)
+{
+  // File sources read reads of at most one kvikIO task on the calling thread and larger ones on
+  // kvikIO's thread pool; both must read the bytes of the file, up to its end
+  std::string text(9 * 1024 * 1024 + 123, '\0');
+  for (size_t i = 0; i < text.size(); ++i) {
+    text[i] = static_cast<char>('a' + (i * 7) % 26);
+  }
+  auto const filepath = temp_env->get_temp_filepath("FileSourceHostReads.bin");
+  std::ofstream(filepath, std::ios::binary) << text;
+  auto const source = cudf::io::datasource::create(filepath);
+  std::vector<uint8_t> buffer(text.size());
+  for (auto const [offset, size] : std::vector<std::pair<size_t, size_t>>{
+         {0, 100},                   // small read
+         {1000, 4 * 1024 * 1024},    // one task
+         {12, 4 * 1024 * 1024 + 1},  // more than one task
+         {text.size() - 50, 50},     // up to the end of the file
+         {text.size() - 50, 1000},   // past the end of the file: clamped
+         {3, text.size() - 3}}) {    // most of the file
+    auto const read_size = source->host_read(offset, size, buffer.data());
+    auto const expected  = std::min(size, text.size() - offset);
+    ASSERT_EQ(read_size, expected);
+    EXPECT_EQ(std::string_view(reinterpret_cast<char const*>(buffer.data()), read_size),
+              std::string_view(text).substr(offset, expected));
+  }
+}
+
 CUDF_TEST_PROGRAM_MAIN()
