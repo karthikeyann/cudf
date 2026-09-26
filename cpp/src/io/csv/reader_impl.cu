@@ -824,24 +824,31 @@ void infer_column_types(parse_options const& parse_opts,
 }
 
 /**
+ * @brief Result of decode_data containing column buffers
+ */
+struct decode_result {
+  std::vector<column_buffer> buffers;
+};
+
+/**
  * @brief Decodes the selected rows into column buffers.
  *
  * Quoted string fields are unescaped into `unescaped` (see `decode_row_column_data`), so the
  * returned string buffers reference `data` and `unescaped`, and are only valid while both are alive
  * and unmodified.
  */
-std::vector<column_buffer> decode_data(parse_options const& parse_opts,
-                                       host_span<column_parse::flags const> column_flags,
-                                       std::vector<std::string> const& column_names,
-                                       device_span<char const> data,
-                                       device_span<char> unescaped,
-                                       device_span<uint64_t const> row_offsets,
-                                       host_span<data_type const> column_types,
-                                       int32_t num_records,
-                                       int32_t num_actual_columns,
-                                       int32_t num_active_columns,
-                                       cuda::stream_ref stream,
-                                       rmm::device_async_resource_ref mr)
+decode_result decode_data(parse_options const& parse_opts,
+                          host_span<column_parse::flags const> column_flags,
+                          std::vector<std::string> const& column_names,
+                          device_span<char const> data,
+                          device_span<char> unescaped,
+                          device_span<uint64_t const> row_offsets,
+                          host_span<data_type const> column_types,
+                          int32_t num_records,
+                          int32_t num_actual_columns,
+                          int32_t num_active_columns,
+                          cuda::stream_ref stream,
+                          rmm::device_async_resource_ref mr)
 {
   // Alloc output; columns' data memory is still expected for empty dataframe
   std::vector<column_buffer> out_buffers;
@@ -890,7 +897,7 @@ std::vector<column_buffer> decode_data(parse_options const& parse_opts,
     out_buffers[i].null_count() = num_records - h_valid_counts[i];
   }
 
-  return out_buffers;
+  return {std::move(out_buffers)};
 }
 
 cudf::detail::host_vector<data_type> determine_column_types(
@@ -1170,7 +1177,7 @@ table_with_metadata read_csv(cudf::io::datasource* source,
     auto scratch = rmm::device_uvector<char>(
       input.source_buffer && parse_opts.doublequote && has_strings ? data.size() : 0, stream);
     auto const unescaped = input.source_buffer ? device_span<char>{scratch} : input.copy;
-    auto out_buffers     = decode_data(  //
+    auto decode_result   = decode_data(  //
       parse_opts,
       column_flags,
       column_names,
@@ -1183,6 +1190,8 @@ table_with_metadata read_csv(cudf::io::datasource* source,
       num_active_columns,
       stream,
       mr);
+
+    auto& out_buffers = decode_result.buffers;
 
     // Build the string columns from their (pointer, length) pairs in one batch, which synchronizes
     // the stream once for all of them rather than for each column. The batch takes the length of a

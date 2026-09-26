@@ -114,25 +114,17 @@ namespace detail {
 /// Number of successive divisions of 1 by 10 with a nonzero double result
 inline constexpr cuda::std::size_t num_fraction_place_values = 323;
 
-/**
- * @brief Computes the place values of the digits of a decimal fraction.
- *
- * Element `i` is 1 divided by 10 `i + 1` times, every division rounded to the nearest double (ties
- * to even, with subnormals), as `parse_numeric` computes the place value that multiplies the
- * `i`-th fraction digit.
- */
-constexpr cuda::std::array<double, num_fraction_place_values> make_fraction_place_values()
-{
+/// The place values of the digits of a decimal fraction: element `i` is 1 divided by 10 `i + 1`
+/// times, every division rounded to the nearest double (ties to even, with subnormals), as
+/// `parse_numeric` computes the place value that multiplies the `i`-th fraction digit.
+inline constexpr auto host_fraction_place_values = [] {
   cuda::std::array<double, num_fraction_place_values> place_values{};
   double place_value = 1;
   for (auto& element : place_values) {
-    place_value /= 10;
-    element = place_value;
+    element = place_value /= 10;
   }
   return place_values;
-}
-
-inline constexpr auto host_fraction_place_values = make_fraction_place_values();
+}();
 
 // A division of a double not above 5 * denorm_min by 10 rounds to zero, so every place value past
 // the table is zero
