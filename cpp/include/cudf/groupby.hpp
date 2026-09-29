@@ -576,6 +576,28 @@ class streaming_groupby {
     rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;
 
   /**
+   * @brief Finalize results and release all accumulated state.
+   *
+   * Unlike finalize(), this is a terminal operation: lookup structures are released
+   * before output allocation, and all remaining state is released before returning.
+   * Subsequent aggregate(), merge(), finalize(), or finalize_and_release() calls on
+   * this object throw. distinct_keys() returns zero afterward.
+   *
+   * The caller must not access this object concurrently and must order all prior
+   * operations (including reads by merge()) before `stream`. This call synchronizes
+   * `stream` before releasing lookup structures and again before releasing state
+   * used to construct the output. The object is consumed even if finalization fails.
+   *
+   * @param stream CUDA stream ordered after all prior operations on this object
+   * @param mr Device memory resource used to allocate the returned table and columns
+   * @return Pair of distinct keys table and aggregation results
+   * @throws cudf::logic_error if no data has been accumulated or the object was consumed
+   */
+  [[nodiscard]] std::pair<std::unique_ptr<table>, std::vector<aggregation_result>>
+  finalize_and_release(cuda::stream_ref stream           = cudf::get_default_stream(),
+                       rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+  /**
    * @brief Returns the number of distinct keys accumulated so far.
    *
    * Returns 0 before any successful `aggregate()` or `merge()` call.
@@ -592,6 +614,8 @@ class streaming_groupby {
   void do_merge(streaming_groupby const& other, cuda::stream_ref stream);
   [[nodiscard]] std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> do_finalize(
     cuda::stream_ref stream, rmm::device_async_resource_ref mr) const;
+  [[nodiscard]] std::pair<std::unique_ptr<table>, std::vector<aggregation_result>>
+  do_finalize_and_release(cuda::stream_ref stream, rmm::device_async_resource_ref mr);
 };
 
 /**

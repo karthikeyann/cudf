@@ -376,23 +376,49 @@ streaming_groupby& streaming_groupby::operator=(streaming_groupby&&) noexcept = 
 // The public API wrappers in streaming_groupby.cpp call these.
 void streaming_groupby::do_aggregate(table_view const& data, cuda::stream_ref stream)
 {
+  CUDF_EXPECTS(_impl != nullptr, "streaming_groupby has been consumed");
   _impl->do_aggregate(data, stream);
 }
 
 void streaming_groupby::do_merge(streaming_groupby const& other, cuda::stream_ref stream)
 {
+  CUDF_EXPECTS(_impl != nullptr && other._impl != nullptr, "streaming_groupby has been consumed");
   _impl->do_merge(*other._impl, stream);
 }
 
 std::pair<std::unique_ptr<table>, std::vector<aggregation_result>> streaming_groupby::do_finalize(
   cuda::stream_ref stream, rmm::device_async_resource_ref mr) const
 {
+  CUDF_EXPECTS(_impl != nullptr, "streaming_groupby has been consumed");
   return _impl->do_finalize(stream, mr);
+}
+
+std::pair<std::unique_ptr<table>, std::vector<aggregation_result>>
+streaming_groupby::do_finalize_and_release(cuda::stream_ref stream,
+                                         rmm::device_async_resource_ref mr)
+{
+  CUDF_EXPECTS(_impl != nullptr, "streaming_groupby has been consumed");
+  // Persistent buffers may have been allocated on different streams. All prior
+  // uses must finish before destroying lookup structures on their owning streams.
+  stream.sync();
+  auto state = std::move(_impl);
+  state->_key_set.reset();
+  state->_key_loc.reset();
+  state->_preprocessed_batches.clear();
+  try {
+    auto result = state->do_finalize(stream, mr);
+    // Finalization copies keys and accumulators asynchronously.
+    stream.sync();
+    return result;
+  } catch (...) {
+    stream.sync();
+    throw;
+  }
 }
 
 size_type streaming_groupby::distinct_keys() const noexcept
 {
-  return _impl->_distinct_keys.load(std::memory_order_relaxed);
+  return _impl ? _impl->_distinct_keys.load(std::memory_order_relaxed) : 0;
 }
 
 bool is_streaming_groupby_supported(data_type values_type, aggregation::Kind kind)
