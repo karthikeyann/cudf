@@ -630,35 +630,103 @@ function(precompile_string_kernel_fragments)
   endforeach()
 endfunction()
 
-# This function precompiles the Parquet flat-buffer kernel fragments, which leave their leaf
-# unresolved, and the leaves that are linked into them without any runtime compilation.
+# This function precompiles the fragments the Parquet flat-buffer kernels are linked from: the
+# kernel, which leaves its stages unresolved, and one fragment for each level source, value source
+# and leaf that needs no runtime compilation. A kernel is composed from one fragment of each kind,
+# so a new source or leaf adds one fragment.
 function(precompile_parquet_kernel_fragments)
-  foreach(ENCODING IN ITEMS plain dict)
-    foreach(NUM_BYTES IN ITEMS 4 8)
-      foreach(NULLABLE IN ITEMS false true)
+  add_fragment(
+    cudf_fragments FRAGMENT pq_flat_kernel SOURCE src/io/parquet/jit/flat_buffer_kernel.cu
+    KERNEL_ONLY ON
+  )
+
+  add_fragment(
+    cudf_fragments FRAGMENT pq_flat_level_required SOURCE src/io/parquet/jit/flat_level_source.cu
+  )
+  add_fragment(
+    cudf_fragments FRAGMENT pq_flat_level_optional SOURCE src/io/parquet/jit/flat_level_source.cu
+    DEFINITIONS CUDF_PQ_LEVEL_OPTIONAL
+  )
+
+  foreach(NUM_BYTES IN ITEMS 4 8)
+    math(EXPR NUM_BITS "${NUM_BYTES} * 8")
+    add_fragment(
+      cudf_fragments FRAGMENT pq_flat_value_plain_b${NUM_BITS} SOURCE
+      src/io/parquet/jit/flat_value_source.cu DEFINITIONS CUDF_PQ_VALUE_BYTES=${NUM_BYTES}
+    )
+    add_fragment(
+      cudf_fragments
+      FRAGMENT
+      pq_flat_value_dict_b${NUM_BITS}
+      SOURCE
+      src/io/parquet/jit/flat_value_source.cu
+      DEFINITIONS
+      CUDF_PQ_VALUE_BYTES=${NUM_BYTES}
+      CUDF_PQ_VALUE_DICT
+    )
+  endforeach()
+
+  # The tile decode kernels compile their level source and value source in and leave only the leaf
+  # unresolved, so there is one fragment for each combination of those two stages.
+  foreach(LEVELS IN ITEMS required optional)
+    foreach(ENCODING IN ITEMS plain dict)
+      foreach(NUM_BYTES IN ITEMS 4 8)
         math(EXPR NUM_BITS "${NUM_BYTES} * 8")
-        set(FRAGMENT_NAME pq_flat_${ENCODING}_b${NUM_BITS})
-        if(NULLABLE)
-          string(APPEND FRAGMENT_NAME _nullable)
-        endif()
         if(ENCODING STREQUAL "dict")
           set(IS_DICT true)
         else()
           set(IS_DICT false)
         endif()
+        if(LEVELS STREQUAL "optional")
+          set(NULLABLE true)
+        else()
+          set(NULLABLE false)
+        endif()
         add_fragment(
           cudf_fragments
           FRAGMENT
-          ${FRAGMENT_NAME}
+          pq_decode_${LEVELS}_${ENCODING}_b${NUM_BITS}
           SOURCE
-          src/io/parquet/jit/flat_buffer_kernel.cu
+          src/io/parquet/jit/decode_flat_kernel.cu
           KERNEL_ONLY
           ON
           KERNEL_INSTANCE
-          "cudf::io::parquet::jit::flat_buffer_kernel<${IS_DICT}, ${NUM_BYTES}, ${NULLABLE}>"
+          "${IS_DICT}, ${NUM_BYTES}, ${NULLABLE}"
         )
       endforeach()
     endforeach()
+  endforeach()
+
+  # Comparison leaves for the value types of range and equality filters, so that most scans link
+  # their kernels without compiling a leaf at runtime.
+  foreach(VALUE IN ITEMS int32 int64 uint32 uint64 float32 float64)
+    if(VALUE MATCHES "32$")
+      set(VALUE_BYTES 4)
+    else()
+      set(VALUE_BYTES 8)
+    endif()
+    if(VALUE STREQUAL "float32")
+      set(VALUE_TYPE float)
+    elseif(VALUE STREQUAL "float64")
+      set(VALUE_TYPE double)
+    else()
+      set(VALUE_TYPE ${VALUE}_t)
+    endif()
+    add_fragment(
+      cudf_fragments FRAGMENT pq_leaf_compare_${VALUE} SOURCE src/io/parquet/jit/leaf_compare.cu
+      DEFINITIONS CUDF_PQ_LEAF_VALUE_TYPE=${VALUE_TYPE} CUDF_PQ_LEAF_VALUE_BYTES=${VALUE_BYTES}
+    )
+    add_fragment(
+      cudf_fragments
+      FRAGMENT
+      pq_leaf_compare_${VALUE}_store
+      SOURCE
+      src/io/parquet/jit/leaf_compare.cu
+      DEFINITIONS
+      CUDF_PQ_LEAF_VALUE_TYPE=${VALUE_TYPE}
+      CUDF_PQ_LEAF_VALUE_BYTES=${VALUE_BYTES}
+      CUDF_PQ_LEAF_STORE
+    )
   endforeach()
 
   add_fragment(cudf_fragments FRAGMENT pq_leaf_store SOURCE src/io/parquet/jit/leaf_store.cu)

@@ -22,7 +22,9 @@
 #include <format>
 #include <mutex>
 #include <span>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace cudf::io::parquet::jit {
 
@@ -51,53 +53,78 @@ std::span<uint8_t const> fragment_bytes(std::size_t file_index)
   return cudf_fragments::files.subspan(range[0], range[1]);
 }
 
-// Position of a shape in tables ordered by (is_dict, num_bytes, nullable).
-std::size_t shape_index(flat_buffer_shape shape)
+// An ahead-of-time fragment and the name its content is cached under.
+struct fragment_ref {
+  std::size_t file_index;  // Index of the fragment among the embedded fragments
+  char const* name;        // Name of the fragment, unique among the fragments of its kind
+};
+
+fragment_ref level_fragment(level_source levels)
 {
-  CUDF_EXPECTS(shape.num_bytes == 4 or shape.num_bytes == 8,
+  switch (levels) {
+    case level_source::REQUIRED: return {cudf_fragments::pq_flat_level_required, "required"};
+    case level_source::OPTIONAL: return {cudf_fragments::pq_flat_level_optional, "optional"};
+  }
+  CUDF_FAIL("Unknown level source");
+}
+
+fragment_ref value_fragment(value_source values)
+{
+  CUDF_EXPECTS(values.num_bytes == 4 or values.num_bytes == 8,
                "A flat-buffer kernel reads 4- or 8-byte values",
                std::invalid_argument);
-  return (shape.is_dict ? 4 : 0) + (shape.num_bytes == 8 ? 2 : 0) + (shape.nullable ? 1 : 0);
+  auto const wide = values.num_bytes == 8;
+  switch (values.encoding) {
+    case value_encoding::PLAIN:
+      return wide ? fragment_ref{cudf_fragments::pq_flat_value_plain_b64, "plain_b64"}
+                  : fragment_ref{cudf_fragments::pq_flat_value_plain_b32, "plain_b32"};
+    case value_encoding::DICTIONARY:
+      return wide ? fragment_ref{cudf_fragments::pq_flat_value_dict_b64, "dict_b64"}
+                  : fragment_ref{cudf_fragments::pq_flat_value_dict_b32, "dict_b32"};
+  }
+  CUDF_FAIL("Unknown value encoding");
 }
 
-constexpr std::array<std::size_t, 8> shape_fragments{
-  cudf_fragments::pq_flat_plain_b32,
-  cudf_fragments::pq_flat_plain_b32_nullable,
-  cudf_fragments::pq_flat_plain_b64,
-  cudf_fragments::pq_flat_plain_b64_nullable,
-  cudf_fragments::pq_flat_dict_b32,
-  cudf_fragments::pq_flat_dict_b32_nullable,
-  cudf_fragments::pq_flat_dict_b64,
-  cudf_fragments::pq_flat_dict_b64_nullable,
-};
-
-constexpr std::array<char const*, 8> shape_names{
-  "plain_b32",
-  "plain_b32_nullable",
-  "plain_b64",
-  "plain_b64_nullable",
-  "dict_b32",
-  "dict_b32_nullable",
-  "dict_b64",
-  "dict_b64_nullable",
-};
-
-std::size_t builtin_leaf_fragment(builtin_leaf leaf)
+fragment_ref builtin_leaf_fragment(builtin_leaf leaf)
 {
   switch (leaf) {
-    case builtin_leaf::STORE: return cudf_fragments::pq_leaf_store;
-    case builtin_leaf::DICT_KEEP: return cudf_fragments::pq_leaf_dict_keep;
+    case builtin_leaf::STORE: return {cudf_fragments::pq_leaf_store, "store"};
+    case builtin_leaf::DICT_KEEP: return {cudf_fragments::pq_leaf_dict_keep, "dict_keep"};
   }
   CUDF_FAIL("Unknown leaf");
 }
 
-char const* builtin_leaf_name(builtin_leaf leaf)
+fragment_ref compare_leaf_fragment(compare_leaf leaf)
 {
-  switch (leaf) {
-    case builtin_leaf::STORE: return "store";
-    case builtin_leaf::DICT_KEEP: return "dict_keep";
+  static constexpr std::array<fragment_ref, 12> fragments{{
+    {cudf_fragments::pq_leaf_compare_int32, "compare_int32"},
+    {cudf_fragments::pq_leaf_compare_int32_store, "compare_int32_store"},
+    {cudf_fragments::pq_leaf_compare_int64, "compare_int64"},
+    {cudf_fragments::pq_leaf_compare_int64_store, "compare_int64_store"},
+    {cudf_fragments::pq_leaf_compare_uint32, "compare_uint32"},
+    {cudf_fragments::pq_leaf_compare_uint32_store, "compare_uint32_store"},
+    {cudf_fragments::pq_leaf_compare_uint64, "compare_uint64"},
+    {cudf_fragments::pq_leaf_compare_uint64_store, "compare_uint64_store"},
+    {cudf_fragments::pq_leaf_compare_float32, "compare_float32"},
+    {cudf_fragments::pq_leaf_compare_float32_store, "compare_float32_store"},
+    {cudf_fragments::pq_leaf_compare_float64, "compare_float64"},
+    {cudf_fragments::pq_leaf_compare_float64_store, "compare_float64_store"},
+  }};
+  auto const index = static_cast<std::size_t>(leaf.value) * 2 + (leaf.store ? 1 : 0);
+  CUDF_EXPECTS(index < fragments.size(), "Unknown comparison leaf", std::invalid_argument);
+  return fragments[index];
+}
+
+// The ahead-of-time fragment of a leaf, if the leaf is not compiled at runtime.
+std::optional<fragment_ref> builtin_fragment(leaf_stage const& leaf)
+{
+  if (auto const* builtin = std::get_if<builtin_leaf>(&leaf)) {
+    return builtin_leaf_fragment(*builtin);
   }
-  CUDF_FAIL("Unknown leaf");
+  if (auto const* compare = std::get_if<compare_leaf>(&leaf)) {
+    return compare_leaf_fragment(*compare);
+  }
+  return std::nullopt;
 }
 
 // Failure history of one kernel.
@@ -130,21 +157,32 @@ kernel_identity identity_of_attempt(kernel_identity identity, int attempt)
   return identity;
 }
 
-cudf::kernel link_kernel(flat_buffer_shape shape,
-                         leaf const& leaf,
+// An ahead-of-time fragment as it is passed to the linker.
+struct linked_fragment {
+  std::size_t file_index;   // Index of the fragment among the embedded fragments
+  std::string const* name;  // Name the fragment's content is cached under
+};
+
+// Links ahead-of-time fragments and a leaf into a kernel through the kernel cache.
+cudf::kernel link_kernel(std::span<linked_fragment const> builtin_fragments,
+                         leaf_stage const& leaf,
                          kernel_identity const& names,
                          int attempt)
 {
   CUDF_FUNC_RANGE();
 
-  auto const consumer = fragment_bytes(shape_fragments[shape_index(shape)]);
+  auto fragments = std::vector<rtcx::memory_fragment>{};
+  for (auto const& fragment : builtin_fragments) {
+    fragments.push_back({.data = fragment_bytes(fragment.file_index),
+                         .type = rtcx::binary_type::FATBIN,
+                         .name = fragment.name->c_str()});
+  }
 
   rtcx::blob compiled_leaf;
-  auto leaf_fragment = rtcx::memory_fragment{};
-  if (auto const* builtin = std::get_if<builtin_leaf>(&leaf)) {
-    leaf_fragment = {.data = fragment_bytes(builtin_leaf_fragment(*builtin)),
-                     .type = rtcx::binary_type::FATBIN,
-                     .name = names.leaf.c_str()};
+  if (auto const builtin = builtin_fragment(leaf); builtin.has_value()) {
+    fragments.push_back({.data = fragment_bytes(builtin->file_index),
+                         .type = rtcx::binary_type::FATBIN,
+                         .name = names.leaf.c_str()});
   } else {
     auto const& source = std::get<leaf_source>(leaf);
     // The translation-unit name is part of the fragment's cache key.
@@ -152,54 +190,21 @@ cudf::kernel link_kernel(flat_buffer_shape shape,
                                         : std::format("cudf_pq_leaf_retry{}.cu", attempt);
     compiled_leaf =
       cudf::get_user_fragment(unit_name.c_str(), source.code.c_str(), {}, {}, {}, true);
-    leaf_fragment = {
-      .data = compiled_leaf->view(), .type = rtcx::binary_type::LTO_IR, .name = names.leaf.c_str()};
+    fragments.push_back({.data = compiled_leaf->view(),
+                         .type = rtcx::binary_type::LTO_IR,
+                         .name = names.leaf.c_str()});
   }
-
-  std::array<rtcx::memory_fragment, 2> const fragments{
-    rtcx::memory_fragment{
-      .data = consumer, .type = rtcx::binary_type::FATBIN, .name = names.consumer.c_str()},
-    leaf_fragment};
 
   return cudf::get_lto_linked_kernel(names.link, {}, fragments);
 }
 
-}  // namespace
-
-kernel_identity get_kernel_identity(flat_buffer_shape shape, leaf const& leaf)
+// Returns the kernel `link` builds for an identity, or nothing if it fails or has failed too
+// recently or too often. `link` is called with the names of the attempt and its number.
+template <typename Link>
+std::optional<cudf::kernel> acquire_kernel(kernel_identity const& identity, Link const& link)
 {
-  auto const& ctx      = cudf::get_context();
-  auto const shape_str = shape_names[shape_index(shape)];
-
-  auto consumer = std::format("pq/flat/{}/abi{}/frag{}/lto{}",
-                              shape_str,
-                              leaf_abi_version,
-                              fragments_hash(),
-                              CUDF_LTO_ARCHITECTURE);
-
-  auto leaf_name = std::string{};
-  if (auto const* builtin = std::get_if<builtin_leaf>(&leaf)) {
-    leaf_name = std::format("pqleaf/{}/frag{}", builtin_leaf_name(*builtin), fragments_hash());
-  } else {
-    auto const& code   = std::get<leaf_source>(leaf).code;
-    auto const digest  = XXH3_128bits(code.data(), code.size());
-    auto const version = ctx.nvrtc_version();
-    leaf_name          = std::format(
-      "pqleaf/src/{:016x}{:016x}/nvrtc{}", digest.high64, digest.low64, version.value_or(0));
-  }
-
-  // The linked kernel is fully determined by its two fragments and the linker. The kernel cache
-  // adds the device architecture and the runtime and driver versions.
-  auto link = std::format("cudf/pq/flat/nvjitlink{}", ctx.nvjitlink_version().value_or(0));
-
-  return {std::move(consumer), std::move(leaf_name), std::move(link)};
-}
-
-std::optional<flat_buffer_kernel> get_flat_buffer_kernel(flat_buffer_shape shape, leaf const& leaf)
-{
-  auto const identity = get_kernel_identity(shape, leaf);
-  auto const key      = std::format("{}|{}|{}", identity.link, identity.consumer, identity.leaf);
-  auto& provider      = state();
+  auto const key = identity.key();
+  auto& provider = state();
 
   auto attempt = 0;
   {
@@ -219,8 +224,7 @@ std::optional<flat_buffer_kernel> get_flat_buffer_kernel(flat_buffer_shape shape
   }
 
   try {
-    return flat_buffer_kernel{
-      link_kernel(shape, leaf, identity_of_attempt(identity, attempt), attempt)};
+    return link(identity_of_attempt(identity, attempt), attempt);
   } catch (std::exception const& e) {
     std::lock_guard const lock{provider.mutex};
     auto& failed = provider.failed[key];
@@ -230,16 +234,124 @@ std::optional<flat_buffer_kernel> get_flat_buffer_kernel(flat_buffer_shape shape
       ++provider.stats.failures;
       failed.failed_at = std::chrono::steady_clock::now();
       CUDF_LOG_WARN(std::format(
-        "Parquet reader: cannot build kernel {} with leaf {} (attempt {} of {}); using the "
-        "generic path instead: {}",
-        identity.consumer,
-        identity.leaf,
+        "Parquet reader: cannot build kernel {} (attempt {} of {}); using the generic path "
+        "instead: {}",
+        key,
         attempt + 1,
         provider.policy.max_attempts,
         e.what()));
     }
     return std::nullopt;
   }
+}
+
+// A fragment compiled ahead of time is identified by the hash of all such fragments, which
+// changes whenever any of them does.
+std::string builtin_name(std::string_view family, std::string_view kind, std::string_view name)
+{
+  return std::format("pq/{}/{}/{}/abi{}/frag{}/lto{}",
+                     family,
+                     kind,
+                     name,
+                     leaf_abi_version,
+                     fragments_hash(),
+                     CUDF_LTO_ARCHITECTURE);
+}
+
+std::string leaf_name(leaf_stage const& leaf)
+{
+  if (auto const builtin = builtin_fragment(leaf); builtin.has_value()) {
+    return builtin_name("leaf", "builtin", builtin->name);
+  }
+  auto const& code  = std::get<leaf_source>(leaf).code;
+  auto const digest = XXH3_128bits(code.data(), code.size());
+  return std::format("pq/leaf/src/{:016x}{:016x}/nvrtc{}",
+                     digest.high64,
+                     digest.low64,
+                     cudf::get_context().nvrtc_version().value_or(0));
+}
+
+// The linked kernel is fully determined by its fragments and the linker. The kernel cache adds
+// the device architecture and the runtime and driver versions.
+std::string link_name(std::string_view family)
+{
+  return std::format(
+    "cudf/pq/{}/nvjitlink{}", family, cudf::get_context().nvjitlink_version().value_or(0));
+}
+
+// The tile decode kernel fragment of a pair of level source and value source.
+fragment_ref decode_fragment(level_source levels, value_source values)
+{
+  CUDF_EXPECTS(values.num_bytes == 4 or values.num_bytes == 8,
+               "A tile decode kernel reads 4- or 8-byte values",
+               std::invalid_argument);
+  auto const optional = levels == level_source::OPTIONAL;
+  auto const dict     = values.encoding == value_encoding::DICTIONARY;
+  auto const wide     = values.num_bytes == 8;
+  static constexpr std::array<fragment_ref, 8> fragments{{
+    {cudf_fragments::pq_decode_required_plain_b32, "required_plain_b32"},
+    {cudf_fragments::pq_decode_required_plain_b64, "required_plain_b64"},
+    {cudf_fragments::pq_decode_required_dict_b32, "required_dict_b32"},
+    {cudf_fragments::pq_decode_required_dict_b64, "required_dict_b64"},
+    {cudf_fragments::pq_decode_optional_plain_b32, "optional_plain_b32"},
+    {cudf_fragments::pq_decode_optional_plain_b64, "optional_plain_b64"},
+    {cudf_fragments::pq_decode_optional_dict_b32, "optional_dict_b32"},
+    {cudf_fragments::pq_decode_optional_dict_b64, "optional_dict_b64"},
+  }};
+  return fragments[(optional ? 4 : 0) + (dict ? 2 : 0) + (wide ? 1 : 0)];
+}
+
+}  // namespace
+
+std::string kernel_identity::key() const
+{
+  return std::format("{}|{}|{}|{}|{}", link, kernel, levels, values, leaf);
+}
+
+kernel_identity get_kernel_identity(kernel_stages const& stages)
+{
+  return {.kernel = builtin_name("flat", "kernel", "tile_loop"),
+          .levels = builtin_name("flat", "level", level_fragment(stages.levels).name),
+          .values = builtin_name("flat", "value", value_fragment(stages.values).name),
+          .leaf   = leaf_name(stages.leaf),
+          .link   = link_name("flat")};
+}
+
+std::optional<flat_buffer_kernel> get_flat_buffer_kernel(kernel_stages const& stages)
+{
+  auto kernel =
+    acquire_kernel(get_kernel_identity(stages), [&](kernel_identity const& names, int attempt) {
+      auto const fragments = std::array<linked_fragment, 3>{
+        linked_fragment{cudf_fragments::pq_flat_kernel, &names.kernel},
+        linked_fragment{level_fragment(stages.levels).file_index, &names.levels},
+        linked_fragment{value_fragment(stages.values).file_index, &names.values}};
+      return link_kernel(fragments, stages.leaf, names, attempt);
+    });
+  if (not kernel.has_value()) { return std::nullopt; }
+  return flat_buffer_kernel{std::move(*kernel)};
+}
+
+kernel_identity get_decode_kernel_identity(kernel_stages const& stages)
+{
+  // The level source and the value source are compiled into the kernel fragment.
+  return {
+    .kernel = builtin_name("decode", "kernel", decode_fragment(stages.levels, stages.values).name),
+    .levels = {},
+    .values = {},
+    .leaf   = leaf_name(stages.leaf),
+    .link   = link_name("decode")};
+}
+
+std::optional<decode_flat_kernel> get_decode_flat_kernel(kernel_stages const& stages)
+{
+  auto kernel = acquire_kernel(
+    get_decode_kernel_identity(stages), [&](kernel_identity const& names, int attempt) {
+      auto const fragments = std::array<linked_fragment, 1>{
+        linked_fragment{decode_fragment(stages.levels, stages.values).file_index, &names.kernel}};
+      return link_kernel(fragments, stages.leaf, names, attempt);
+    });
+  if (not kernel.has_value()) { return std::nullopt; }
+  return decode_flat_kernel{std::move(*kernel)};
 }
 
 void launch_flat_buffer_kernel(flat_buffer_kernel const& kernel,

@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -504,6 +505,7 @@ void decode_flat_pages(flat_decode_plan& plan,
                        cudf::detail::hostdevice_span<PageInfo> pages,
                        cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
                        cudf::host_span<void* const> column_data,
+                       cudf::host_span<flat_column_leaf> column_leaves,
                        size_t min_row,
                        size_t num_rows,
                        int level_type_size,
@@ -511,36 +513,78 @@ void decode_flat_pages(flat_decode_plan& plan,
                        cuda::stream_ref stream,
                        cudf::memory_resources mr)
 {
+  for (auto& leaf : column_leaves) {
+    leaf.num_rows_decoded = 0;
+  }
   auto const num_claims = plan.claims.size();
   if (num_claims == 0) { return; }
 
-  // Tiles that overlap the row range, grouped by kernel shape. The host only counts them; the
+  // The tiles of one launch: those of one kernel shape decoded with the store leaf, or those of
+  // one shape of one column decoded by the column's linked kernel.
+  struct launch_group {
+    uint32_t shape;                         // Kernel shape of the tiles
+    jit::decode_flat_kernel const* kernel;  // The linked kernel, or null for the store leaf
+    uint32_t num_tiles = 0;                 // Number of tiles
+    uint32_t begin     = 0;                 // Index of the first tile in the tile list
+  };
+  std::vector<launch_group> groups;
+  for (uint32_t shape = 0; shape < num_flat_shapes; ++shape) {
+    groups.push_back({shape, nullptr});
+  }
+
+  // Tiles that overlap the row range, counted by launch group. The host only counts them; the
   // setup kernel writes the list.
-  std::array<uint32_t, num_flat_shapes> shape_tiles{};
-  auto const range_end   = min_row + num_rows;
-  auto const tile_counts = [&](size_t idx) -> uint32_t {
-    auto const& page        = pages[plan.claims[idx].page_idx];
-    auto const& chunk       = chunks[page.chunk_idx];
+  auto const range_end = min_row + num_rows;
+  std::vector<uint32_t> claim_groups(num_claims);
+  for (size_t idx = 0; idx < num_claims; ++idx) {
+    auto const& claim = plan.claims[idx];
+    auto const& page  = pages[claim.page_idx];
+    auto const& chunk = chunks[page.chunk_idx];
+
+    auto group = claim.shape;
+    if (not column_leaves.empty()) {
+      auto const& leaf = column_leaves[chunk.src_col_index];
+      auto const* kernel =
+        (claim.shape & flat_shape_dict) != 0 ? leaf.dict_kernel : leaf.plain_kernel;
+      if (kernel != nullptr) {
+        auto const it =
+          std::find_if(groups.begin() + num_flat_shapes, groups.end(), [&](auto const& g) {
+            return g.kernel == kernel and g.shape == claim.shape;
+          });
+        group = static_cast<uint32_t>(std::distance(groups.begin(), it));
+        if (it == groups.end()) { groups.push_back({claim.shape, kernel}); }
+      }
+    }
+    claim_groups[idx] = group;
+
     size_t const page_begin = chunk.start_row + page.chunk_row;
     size_t const page_end   = page_begin + page.num_rows;
-    if (page_begin >= range_end or page_end <= min_row) { return 0; }
+    if (page_begin >= range_end or page_end <= min_row) {
+      plan.tile_offsets[idx] = 0;
+      continue;
+    }
     auto const first_row = page_begin >= min_row ? 0 : min_row - page_begin;
     auto const last_row  = std::min(page_end, range_end) - page_begin - 1;
-    return static_cast<uint32_t>(last_row / jit::tile_rows - first_row / jit::tile_rows + 1);
-  };
-  for (size_t idx = 0; idx < num_claims; ++idx) {
-    plan.tile_offsets[idx] = tile_counts(idx);
-    shape_tiles[plan.claims[idx].shape] += plan.tile_offsets[idx];
+    plan.tile_offsets[idx] =
+      static_cast<uint32_t>(last_row / jit::tile_rows - first_row / jit::tile_rows + 1);
+    groups[group].num_tiles += plan.tile_offsets[idx];
+    if (groups[group].kernel != nullptr) {
+      column_leaves[chunk.src_col_index].num_rows_decoded += last_row - first_row + 1;
+    }
   }
-  std::array<uint32_t, num_flat_shapes> shape_begin{};
-  std::exclusive_scan(shape_tiles.begin(), shape_tiles.end(), shape_begin.begin(), uint32_t{0});
-  auto const num_tiles = shape_begin.back() + shape_tiles.back();
+  auto num_tiles = uint32_t{0};
+  for (auto& group : groups) {
+    group.begin = num_tiles;
+    num_tiles += group.num_tiles;
+  }
   {
-    auto next = shape_begin;
+    std::vector<uint32_t> next(groups.size());
+    std::transform(
+      groups.begin(), groups.end(), next.begin(), [](auto const& group) { return group.begin; });
     for (size_t idx = 0; idx < num_claims; ++idx) {
       auto const count       = plan.tile_offsets[idx];
-      plan.tile_offsets[idx] = next[plan.claims[idx].shape];
-      next[plan.claims[idx].shape] += count;
+      plan.tile_offsets[idx] = next[claim_groups[idx]];
+      next[claim_groups[idx]] += count;
     }
   }
   plan.tile_offsets.host_to_device_async(stream);
@@ -549,15 +593,15 @@ void decode_flat_pages(flat_decode_plan& plan,
       cuda::device_buffer<jit::tile_ref>(stream, mr.get_temporary_mr(), num_tiles, cuda::no_init);
   }
 
-  // Every column uses the store leaf, whose context holds only the output pointer.
+  // The store leaf uses only the output pointer of its context.
   if (plan.contexts.size() != column_data.size()) {
     plan.contexts = cudf::detail::hostdevice_vector<jit::leaf_ctx>(column_data.size(), stream, mr);
   }
-  std::transform(column_data.begin(), column_data.end(), plan.contexts.begin(), [](void* out) {
-    jit::leaf_ctx ctx{};
-    ctx.out = out;
-    return ctx;
-  });
+  for (size_t column = 0; column < column_data.size(); ++column) {
+    auto ctx              = column_leaves.empty() ? jit::leaf_ctx{} : column_leaves[column].ctx;
+    ctx.out               = column_data[column];
+    plan.contexts[column] = ctx;
+  }
   plan.contexts.host_to_device_async(stream);
 
   auto const num_page_blocks =
@@ -576,16 +620,30 @@ void decode_flat_pages(flat_decode_plan& plan,
     error_code);
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  for (uint32_t shape = 0; shape < num_flat_shapes; ++shape) {
-    if (shape_tiles[shape] == 0) { continue; }
-    launch_decode_flat_tiles(shape,
-                             plan.page_refs.data(),
-                             plan.tiles.data() + shape_begin[shape],
-                             shape_tiles[shape],
-                             plan.checkpoints.data(),
-                             plan.contexts.device_ptr(),
-                             plan.null_counts.data(),
-                             stream);
+  for (auto const& group : groups) {
+    if (group.num_tiles == 0) { continue; }
+    if (group.kernel == nullptr) {
+      launch_decode_flat_tiles(group.shape,
+                               plan.page_refs.data(),
+                               plan.tiles.data() + group.begin,
+                               group.num_tiles,
+                               plan.checkpoints.data(),
+                               plan.contexts.device_ptr(),
+                               plan.null_counts.data(),
+                               stream);
+    } else {
+      constexpr uint32_t tiles_per_block = jit::decode_flat_block_size / cudf::detail::warp_size;
+      auto const num_blocks = cudf::detail::div_rounding_up_safe(group.num_tiles, tiles_per_block);
+      group.kernel->launch({num_blocks},
+                           {jit::decode_flat_block_size},
+                           stream,
+                           plan.page_refs.data(),
+                           plan.tiles.data() + group.begin,
+                           group.num_tiles,
+                           plan.checkpoints.data(),
+                           plan.contexts.device_ptr(),
+                           plan.null_counts.data());
+    }
   }
 
   finish_flat_pages_kernel<<<num_page_blocks, page_block_size, 0, stream.get()>>>(

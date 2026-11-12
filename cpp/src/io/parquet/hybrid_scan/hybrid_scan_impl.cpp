@@ -993,10 +993,12 @@ void hybrid_scan_reader_impl::initialize_reader_config(parquet_reader_options co
   // Strings may be returned as either string or categorical columns
   _strings_to_categorical = options.is_enabled_convert_strings_to_categories();
 
-  _options.timestamp_type              = cudf::data_type{options.get_timestamp_type().id()};
-  _options.decimal_width               = options.get_decimal_width();
-  _options.use_jit_filter              = options.is_enabled_use_jit_filter();
-  _options.use_jit_decode_filter       = options.is_enabled_use_jit_decode_filter();
+  _options.timestamp_type = cudf::data_type{options.get_timestamp_type().id()};
+  _options.decimal_width  = options.get_decimal_width();
+  _options.use_jit_filter = options.is_enabled_use_jit_filter();
+  _options.use_jit_decode_filter =
+    options.is_enabled_use_jit_decode_filter() or
+    cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_JIT_DECODE_FILTER", false);
   _options.case_sensitive_names        = options.is_enabled_case_sensitive_names();
   _options.prepend_source_index_column = options.is_enabled_prepend_source_index_column();
   _options.prepend_row_index_column    = options.is_enabled_prepend_row_index_column();

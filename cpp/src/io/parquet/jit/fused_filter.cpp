@@ -16,9 +16,11 @@
 #include <cudf/utilities/traits.hpp>
 #include <cudf/utilities/type_dispatcher.hpp>
 
+#include <io/parquet/jit/leaf_compare.hpp>
 #include <jit/row_ir.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <exception>
 #include <format>
@@ -31,6 +33,10 @@ namespace {
 
 // Rows handled by one thread block of a flat-buffer kernel.
 constexpr uint32_t tile_num_rows = 16'384;
+
+// How predicates were evaluated, for `get_fused_filter_stats`.
+std::atomic<uint64_t> num_decoded{0};
+std::atomic<uint64_t> num_evaluated{0};
 
 // Name of the predicate function in a generated leaf.
 constexpr char const* predicate_function = "pq_pred";
@@ -118,6 +124,83 @@ struct pack_literal_fn {
     }
   }
 };
+
+// One or two comparisons of a column with literals, joined by LOGICAL_AND.
+struct comparisons {
+  std::array<compare_operator, 2> operators{compare_operator::NONE, compare_operator::NONE};
+  int num = 0;  // Number of comparisons
+};
+
+// Returns the operator of `column op literal` or, mirrored, of `literal op column`.
+std::optional<compare_operator> match_comparison(ast::expression const& expr)
+{
+  auto const* operation = dynamic_cast<ast::operation const*>(&expr);
+  if (operation == nullptr or operation->get_operands().size() != 2) { return std::nullopt; }
+  auto const& lhs      = operation->get_operands().front().get();
+  auto const& rhs      = operation->get_operands().back().get();
+  auto const is_column = [](ast::expression const& operand) {
+    return dynamic_cast<ast::column_reference const*>(&operand) != nullptr;
+  };
+  auto const is_literal = [](ast::expression const& operand) {
+    return dynamic_cast<ast::literal const*>(&operand) != nullptr;
+  };
+  auto const mirrored = is_literal(lhs) and is_column(rhs);
+  if (not mirrored and not(is_column(lhs) and is_literal(rhs))) { return std::nullopt; }
+  switch (operation->get_operator()) {
+    case ast::ast_operator::EQUAL: return compare_operator::EQUAL;
+    case ast::ast_operator::NOT_EQUAL: return compare_operator::NOT_EQUAL;
+    case ast::ast_operator::LESS:
+      return mirrored ? compare_operator::GREATER : compare_operator::LESS;
+    case ast::ast_operator::GREATER:
+      return mirrored ? compare_operator::LESS : compare_operator::GREATER;
+    case ast::ast_operator::LESS_EQUAL:
+      return mirrored ? compare_operator::GREATER_EQUAL : compare_operator::LESS_EQUAL;
+    case ast::ast_operator::GREATER_EQUAL:
+      return mirrored ? compare_operator::LESS_EQUAL : compare_operator::GREATER_EQUAL;
+    default: return std::nullopt;
+  }
+}
+
+// Returns the comparisons of a predicate that a comparison leaf can evaluate, in the order of
+// their literals.
+std::optional<comparisons> match_comparisons(ast::expression const& expr)
+{
+  if (auto const single = match_comparison(expr); single.has_value()) {
+    return comparisons{.operators = {*single, compare_operator::NONE}, .num = 1};
+  }
+  auto const* operation = dynamic_cast<ast::operation const*>(&expr);
+  if (operation == nullptr or operation->get_operator() != ast::ast_operator::LOGICAL_AND) {
+    return std::nullopt;
+  }
+  auto const first  = match_comparison(operation->get_operands().front().get());
+  auto const second = match_comparison(operation->get_operands().back().get());
+  if (not first.has_value() or not second.has_value()) { return std::nullopt; }
+  return comparisons{.operators = {*first, *second}, .num = 2};
+}
+
+// Returns the type a comparison leaf compares values of a column type as, if it has one.
+std::optional<compare_value> compare_value_of(data_type type)
+{
+  switch (type.id()) {
+    case type_id::INT32:
+    case type_id::TIMESTAMP_DAYS:
+    case type_id::DURATION_DAYS: return compare_value::INT32;
+    case type_id::INT64:
+    case type_id::TIMESTAMP_SECONDS:
+    case type_id::TIMESTAMP_MILLISECONDS:
+    case type_id::TIMESTAMP_MICROSECONDS:
+    case type_id::TIMESTAMP_NANOSECONDS:
+    case type_id::DURATION_SECONDS:
+    case type_id::DURATION_MILLISECONDS:
+    case type_id::DURATION_MICROSECONDS:
+    case type_id::DURATION_NANOSECONDS: return compare_value::INT64;
+    case type_id::UINT32: return compare_value::UINT32;
+    case type_id::UINT64: return compare_value::UINT64;
+    case type_id::FLOAT32: return compare_value::FLOAT32;
+    case type_id::FLOAT64: return compare_value::FLOAT64;
+    default: return std::nullopt;
+  }
+}
 
 // Wraps a generated predicate function in the leaf of a value width.
 // `literal_slots[i]` is the literal slot of the function's i-th input, or unset if that input is
@@ -260,7 +343,7 @@ leaf_ctx make_test_ctx(column_predicate const& predicate, uint8_t* keep)
 }  // namespace
 
 std::optional<column_predicate> make_column_predicate(ast::expression const& predicate,
-                                                      table_view const& table,
+                                                      host_span<data_type const> column_types,
                                                       cuda::stream_ref stream,
                                                       cudf::memory_resources mr)
 {
@@ -269,11 +352,11 @@ std::optional<column_predicate> make_column_predicate(ast::expression const& pre
     return std::nullopt;
   }
   auto const column_index = *inputs.column_index;
-  if (column_index < 0 or column_index >= table.num_columns() or
+  if (column_index < 0 or static_cast<std::size_t>(column_index) >= column_types.size() or
       inputs.literals.size() > static_cast<std::size_t>(max_leaf_literals)) {
     return std::nullopt;
   }
-  auto const column_type = table.column(column_index).type();
+  auto const column_type = column_types[column_index];
   if (not is_leaf_type(column_type)) { return std::nullopt; }
 
   auto result = column_predicate{.column_index = column_index,
@@ -286,6 +369,20 @@ std::optional<column_predicate> make_column_predicate(ast::expression const& pre
     }
     result.literals[i] = cudf::type_dispatcher(
       literal.get_data_type(), pack_literal_fn{}, literal.get_scalar(), stream);
+  }
+
+  // One or two comparisons with literals of the column's type need no generated leaf.
+  auto const same_type_literals = std::ranges::all_of(
+    inputs.literals, [&](auto const* literal) { return literal->get_data_type() == column_type; });
+  if (auto const matched = match_comparisons(predicate);
+      matched.has_value() and same_type_literals and compare_value_of(column_type).has_value() and
+      static_cast<int>(inputs.literals.size()) == matched->num) {
+    auto const value                        = *compare_value_of(column_type);
+    result.literals[compare_operators_slot] = static_cast<uint64_t>(matched->operators[0]) |
+                                              (static_cast<uint64_t>(matched->operators[1]) << 8);
+    result.test_leaf  = compare_leaf{.value = value, .store = false};
+    result.store_leaf = compare_leaf{.value = value, .store = true};
+    return result;
   }
 
   // The predicate function is generated for a non-nullable column: a leaf never sees a null.
@@ -323,10 +420,10 @@ std::optional<column_predicate> make_column_predicate(ast::expression const& pre
     }
     if (static_cast<std::size_t>(next_slot) != inputs.literals.size()) { return std::nullopt; }
 
-    result.test_leaf.code =
-      make_leaf_source(generated.udf, literal_slots, result.num_bytes, leaf_action::TEST);
-    result.store_leaf.code =
-      make_leaf_source(generated.udf, literal_slots, result.num_bytes, leaf_action::STORE_AND_TEST);
+    result.test_leaf = leaf_source{
+      make_leaf_source(generated.udf, literal_slots, result.num_bytes, leaf_action::TEST)};
+    result.store_leaf = leaf_source{make_leaf_source(
+      generated.udf, literal_slots, result.num_bytes, leaf_action::STORE_AND_TEST)};
   } catch (std::exception const&) {
     // The expression is not one the code generator supports for these types.
     return std::nullopt;
@@ -343,7 +440,9 @@ std::optional<rmm::device_uvector<uint8_t>> evaluate_dictionary(column_predicate
   CUDF_FUNC_RANGE();
 
   auto const kernel = get_flat_buffer_kernel(
-    {.is_dict = false, .num_bytes = predicate.num_bytes, .nullable = false}, predicate.test_leaf);
+    {.levels = level_source::REQUIRED,
+     .values = {.encoding = value_encoding::PLAIN, .num_bytes = predicate.num_bytes},
+     .leaf   = predicate.test_leaf});
   if (not kernel.has_value()) { return std::nullopt; }
 
   auto keep = cudf::detail::make_zeroed_device_uvector_async<uint8_t>(
@@ -362,11 +461,17 @@ std::optional<rmm::device_uvector<uint8_t>> evaluate_dictionary(column_predicate
   return keep;
 }
 
+fused_filter_stats get_fused_filter_stats()
+{
+  return {.decoded   = num_decoded.load(std::memory_order_relaxed),
+          .evaluated = num_evaluated.load(std::memory_order_relaxed)};
+}
+
 fused_filter::fused_filter(ast::expression const& filter,
-                           table_view const& table,
+                           host_span<data_type const> column_types,
                            cuda::stream_ref stream,
                            cudf::memory_resources mr)
-  : _num_columns{table.num_columns()}
+  : _num_columns{static_cast<size_type>(column_types.size())}
 {
   auto conjuncts = std::vector<std::reference_wrapper<ast::expression const>>{};
   collect_conjuncts(filter, conjuncts);
@@ -402,7 +507,7 @@ fused_filter::fused_filter(ast::expression const& filter,
 
   for (auto const& candidate : groups) {
     auto const& predicate = conjunction(candidate.conjuncts, _tree);
-    auto fused            = make_column_predicate(predicate, table, stream, mr);
+    auto fused            = make_column_predicate(predicate, column_types, stream, mr);
     if (fused.has_value()) {
       _predicates.push_back(std::move(*fused));
     } else {
@@ -411,6 +516,7 @@ fused_filter::fused_filter(ast::expression const& filter,
   }
 
   _kernels.resize(_predicates.size());
+  _decode_kernels.resize(_predicates.size());
   if (_predicates.empty() or (_predicates.size() == 1 and remainder.empty())) { return; }
   for (std::size_t i = 0; i < _predicates.size(); ++i) {
     remainder.emplace_back(
@@ -419,10 +525,33 @@ fused_filter::fused_filter(ast::expression const& filter,
   _combined = std::cref(conjunction(remainder, _tree));
 }
 
-std::optional<std::unique_ptr<column>> fused_filter::evaluate(table_view const& table,
-                                                              bool use_jit,
-                                                              cuda::stream_ref stream,
-                                                              cudf::memory_resources mr) const
+fused_filter::decode_kernels fused_filter::get_decode_kernels(std::size_t predicate_index,
+                                                              bool nullable) const
+{
+  auto const& predicate = _predicates[predicate_index];
+  auto& kernels         = _decode_kernels[predicate_index][nullable ? 1 : 0];
+  if (not kernels.requested) {
+    kernels.requested = true;
+    auto const link   = [&](value_encoding encoding) {
+      // The leaf stores the value: here it runs in place of the decode kernel's own store.
+      return get_decode_flat_kernel(
+        {.levels = nullable ? level_source::OPTIONAL : level_source::REQUIRED,
+           .values = {.encoding = encoding, .num_bytes = predicate.num_bytes},
+           .leaf   = predicate.store_leaf});
+    };
+    kernels.plain = link(value_encoding::PLAIN);
+    kernels.dict  = link(value_encoding::DICTIONARY);
+  }
+  return {.plain = kernels.plain.has_value() ? &*kernels.plain : nullptr,
+          .dict  = kernels.dict.has_value() ? &*kernels.dict : nullptr};
+}
+
+std::optional<std::unique_ptr<column>> fused_filter::evaluate(
+  table_view const& table,
+  host_span<std::unique_ptr<column>> decode_masks,
+  bool use_jit,
+  cuda::stream_ref stream,
+  cudf::memory_resources mr) const
 {
   CUDF_FUNC_RANGE();
   CUDF_EXPECTS(not _predicates.empty(), "The filter has no conjunct to evaluate with a leaf");
@@ -436,13 +565,23 @@ std::optional<std::unique_ptr<column>> fused_filter::evaluate(table_view const& 
   auto const num_rows = table.num_rows();
   auto masks          = std::vector<std::unique_ptr<column>>{};
   for (std::size_t i = 0; i < _predicates.size(); ++i) {
+    // The leaf already saw every row while the column was decoded.
+    if (i < decode_masks.size() and decode_masks[i] != nullptr and
+        decode_masks[i]->size() == num_rows and decode_masks[i]->type().id() == type_id::BOOL8) {
+      masks.push_back(std::move(decode_masks[i]));
+      num_decoded.fetch_add(1, std::memory_order_relaxed);
+      continue;
+    }
+    num_evaluated.fetch_add(1, std::memory_order_relaxed);
+
     auto const& predicate = _predicates[i];
     auto const& input     = table.column(predicate.column_index);
     auto& kernel          = _kernels[i][input.nullable() ? 1 : 0];
     if (not kernel.has_value()) {
       kernel = get_flat_buffer_kernel(
-        {.is_dict = false, .num_bytes = predicate.num_bytes, .nullable = input.nullable()},
-        predicate.test_leaf);
+        {.levels = input.nullable() ? level_source::OPTIONAL : level_source::REQUIRED,
+         .values = {.encoding = value_encoding::PLAIN, .num_bytes = predicate.num_bytes},
+         .leaf   = predicate.test_leaf});
       if (not kernel.has_value()) { return std::nullopt; }
     }
 

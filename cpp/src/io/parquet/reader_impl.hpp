@@ -23,6 +23,8 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/device_uvector.hpp>
+
 #include <cuda/stream>
 
 #include <memory>
@@ -491,6 +493,16 @@ class reader_impl {
   }
 
   /**
+   * @brief Plans the evaluation of the output filter with kernels linked for the scan
+   *
+   * Does nothing if the filter already has a plan. Leaves `_fused_filter` null if the filter has
+   * no conjunct such a kernel can evaluate.
+   *
+   * @param column_types Types of the output columns that follow the prepended ones
+   */
+  void plan_fused_filter(host_span<data_type const> column_types);
+
+  /**
    * @brief Evaluates the output filter over a decoded table
    *
    * @param table Decoded table, including any prepended columns
@@ -545,7 +557,9 @@ class reader_impl {
     std::vector<std::vector<size_type>> row_group_indices;
     // Whether to use JIT for filtering
     bool use_jit_filter = false;
-    // Whether to evaluate single-column filter conjuncts with kernels linked for the scan
+    // Whether to evaluate single-column filter conjuncts with kernels linked for the scan. Set
+    // from the `use_jit_decode_filter` reader option; LIBCUDF_PARQUET_JIT_DECODE_FILTER turns it
+    // on for every reader.
     bool use_jit_decode_filter = false;
     // Whether to use case-sensitive matching for column names
     bool case_sensitive_names = true;
@@ -566,6 +580,11 @@ class reader_impl {
   std::shared_ptr<jit::fused_filter> _fused_filter;
   // The expression `_fused_filter` was planned for; null if no plan was attempted yet.
   ast::expression const* _fused_filter_expr = nullptr;
+  // For each predicate of `_fused_filter`, the keep flags its leaf wrote while the current output
+  // chunk was decoded; null where the leaf did not see every row of the chunk.
+  std::vector<std::unique_ptr<column>> _decode_masks;
+  // Keep flags of the current output chunk's decode whose leaf did not see every row.
+  std::vector<rmm::device_uvector<bool>> _unused_decode_flags;
 
   std::vector<std::unique_ptr<datasource>> _sources;
   std::shared_ptr<aggregate_reader_metadata> _metadata;
