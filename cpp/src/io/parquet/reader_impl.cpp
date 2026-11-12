@@ -1255,6 +1255,7 @@ std::unique_ptr<column> reader_impl::evaluate_filter(table_view const& table,
       // Without its kernels the plan cannot run; the filter below gives the same rows.
       if (predicate.has_value()) { return std::move(*predicate); }
     }
+    jit::record_filter_fallback();
   }
 
   return use_jit ? cudf::compute_column_jit(table, filter, {}, _stream, _mr.get_temporary_mr())

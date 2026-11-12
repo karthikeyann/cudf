@@ -672,6 +672,28 @@ struct filter_set {
   }
 };
 
+// Returns a filter of the shape a scan pushes down for ranges on several columns: closed and
+// half-open ranges on a date, a floating point and an integer column, joined by the three-valued
+// AND at every level.
+cudf::ast::expression const& make_range_filter(filter_set& set)
+{
+  using op          = cudf::ast::ast_operator;
+  auto const amount = 2, total = 3, day = 4;
+  auto const& day_range = set.apply(
+    op::NULL_LOGICAL_AND,
+    set.apply(
+      op::GREATER_EQUAL, set.column(day), set.literal(cudf::timestamp_D{cudf::duration_D{8'500}})),
+    set.apply(op::LESS, set.column(day), set.literal(cudf::timestamp_D{cudf::duration_D{9'500}})));
+  auto const& amount_range =
+    set.apply(op::NULL_LOGICAL_AND,
+              set.apply(op::GREATER_EQUAL, set.column(amount), set.literal<double>(20.0)),
+              set.apply(op::LESS_EQUAL, set.column(amount), set.literal<double>(90.0)));
+  auto const& total_bound =
+    set.apply(op::LESS, set.column(total), set.literal<int64_t>(5'000'000'200));
+  return set.apply(
+    op::NULL_LOGICAL_AND, set.apply(op::NULL_LOGICAL_AND, day_range, amount_range), total_bound);
+}
+
 filter_set make_filters()
 {
   using op      = cudf::ast::ast_operator;
@@ -737,6 +759,22 @@ filter_set make_filters()
                         set.apply(op::EQUAL, set.column(name), set.literal<std::string>("name3")),
                         set.apply(op::GREATER_EQUAL, set.column(key), set.literal<int32_t>(10))),
               set.apply(op::LESS, set.column(amount), set.literal<double>(100.0))));
+  // The three-valued operators, which keep the same rows at the top of a filter and inside a
+  // predicate whose comparisons all read the column.
+  set.add("10 <= key < 20, three-valued and",
+          set.apply(op::NULL_LOGICAL_AND,
+                    set.apply(op::GREATER_EQUAL, set.column(key), set.literal<int32_t>(10)),
+                    set.apply(op::LESS, set.column(key), set.literal<int32_t>(20))));
+  set.add("key < 5 or key > 45, three-valued or",
+          set.apply(op::NULL_LOGICAL_OR,
+                    set.apply(op::LESS, set.column(key), set.literal<int32_t>(5)),
+                    set.apply(op::GREATER, set.column(key), set.literal<int32_t>(45))));
+  set.add("closed ranges on three columns, three-valued and", make_range_filter(set));
+  // A comparison of two literals is true for a null key too, so a leaf must not evaluate this.
+  set.add("key < 5 or 3 < 4, three-valued or",
+          set.apply(op::NULL_LOGICAL_OR,
+                    set.apply(op::LESS, set.column(key), set.literal<int32_t>(5)),
+                    set.apply(op::LESS, set.literal<int32_t>(3), set.literal<int32_t>(4))));
   // Nothing a leaf can evaluate.
   set.add("name == name3",
           set.apply(op::EQUAL, set.column(name), set.literal<std::string>("name3")));
@@ -768,8 +806,8 @@ TEST_F(ParquetJitTest, FusedFilterMatchesExpression)
     auto const expected_kept = cudf::apply_retention_mask(table->view(), expected->view());
     CUDF_TEST_EXPECT_TABLES_EQUAL(kept->view(), expected_kept->view());
   }
-  // Every filter but the last has a conjunct for a leaf.
-  EXPECT_EQ(num_fused, static_cast<int>(filters.filters.size()) - 1);
+  // Every filter but the last two has a conjunct for a leaf.
+  EXPECT_EQ(num_fused, static_cast<int>(filters.filters.size()) - 2);
 }
 
 TEST_F(ParquetJitTest, ReaderResultsMatch)
@@ -832,6 +870,46 @@ TEST_F(ParquetJitTest, ReaderResultsMatch)
   auto const after = jit::get_fused_filter_stats();
   EXPECT_GT(after.decoded, before.decoded);
   EXPECT_GT(after.evaluated, before.evaluated);
+}
+
+TEST_F(ParquetJitTest, ReaderDecodesRangeFilterOfSeveralColumns)
+{
+  auto const table    = make_filter_table(50'000);
+  auto const filepath = temp_env->get_temp_filepath("ReaderDecodesRangeFilter.parquet");
+  cudf::io::write_parquet(
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, table->view()));
+
+  auto set           = filter_set{};
+  auto const& filter = make_range_filter(set);
+  auto const read    = [&](bool enabled) {
+    return cudf::io::read_parquet(
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+        .filter(filter)
+        .use_jit_decode_filter(enabled)
+        .use_tile_decode(enabled));
+  };
+  auto const expected = read(false);
+  EXPECT_GT(expected.tbl->num_rows(), 0);
+  EXPECT_LT(expected.tbl->num_rows(), 50'000);
+
+  auto const before          = jit::get_fused_filter_stats();
+  auto const provider_before = jit::get_kernel_provider_stats();
+  auto const result          = read(true);
+  CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), expected.tbl->view());
+
+  // The file is read as one output chunk. Each of the three columns has one predicate, all three
+  // were answered while their columns were decoded, and nothing was evaluated afterwards.
+  auto const after = jit::get_fused_filter_stats();
+  EXPECT_EQ(after.decoded, before.decoded + 3);
+  EXPECT_EQ(after.evaluated, before.evaluated);
+  EXPECT_EQ(after.fallback, before.fallback);
+  EXPECT_EQ(jit::get_kernel_provider_stats().failures, provider_before.failures);
+
+  // The public counters report the same.
+  auto const public_stats = cudf::io::get_parquet_jit_filter_stats();
+  EXPECT_EQ(public_stats.decoded, after.decoded);
+  EXPECT_EQ(public_stats.evaluated, after.evaluated);
+  EXPECT_EQ(public_stats.fallback, after.fallback);
 }
 
 TEST_F(ParquetJitTest, ReaderWithFilterOnlyAndPrependedColumns)

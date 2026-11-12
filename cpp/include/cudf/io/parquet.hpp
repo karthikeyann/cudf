@@ -1129,6 +1129,26 @@ table_with_metadata read_parquet(
   cudf::memory_resources mr = cudf::get_current_device_resource_ref());
 
 /**
+ * @brief Counts of how filters were evaluated by readers with `use_jit_decode_filter` enabled.
+ *
+ * A filter is evaluated once per output chunk. Each of its predicates that a kernel linked for
+ * the scan can evaluate is counted as `decoded` or `evaluated`; a filter evaluated entirely as an
+ * ordinary expression is counted as `fallback`.
+ */
+struct parquet_jit_filter_stats {
+  uint64_t decoded;    ///< Predicates answered by flags written while their column was decoded
+  uint64_t evaluated;  ///< Predicates evaluated by a kernel over the decoded column
+  uint64_t fallback;   ///< Filters evaluated entirely as an expression
+};
+
+/**
+ * @brief Returns how filters were evaluated by readers with `use_jit_decode_filter` enabled.
+ *
+ * @return Counts since the process started
+ */
+[[nodiscard]] parquet_jit_filter_stats get_parquet_jit_filter_stats();
+
+/**
  * @brief The chunked parquet reader class to read Parquet file iteratively in to a series of
  * tables, chunk by chunk.
  *

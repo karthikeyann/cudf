@@ -10,6 +10,7 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/transform.hpp>
 #include <cudf/detail/utilities/vector_factories.hpp>
+#include <cudf/io/parquet.hpp>
 #include <cudf/scalar/scalar.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/utilities/error.hpp>
@@ -37,6 +38,7 @@ constexpr uint32_t tile_num_rows = 16'384;
 // How predicates were evaluated, for `get_fused_filter_stats`.
 std::atomic<uint64_t> num_decoded{0};
 std::atomic<uint64_t> num_evaluated{0};
+std::atomic<uint64_t> num_fallback{0};
 
 // Name of the predicate function in a generated leaf.
 constexpr char const* predicate_function = "pq_pred";
@@ -55,53 +57,83 @@ struct predicate_inputs {
   std::vector<ast::literal const*> literals;  // Its literals in evaluation order
 };
 
+// Whether an operator joins two conditions with AND; the three-valued operator agrees with the
+// plain one when no operand is null, which is how a leaf evaluates it.
+bool is_conjunction(ast::ast_operator op)
+{
+  return op == ast::ast_operator::LOGICAL_AND or op == ast::ast_operator::NULL_LOGICAL_AND;
+}
+
+// Whether an operator joins two conditions with OR, in either its plain or three-valued form.
+bool is_disjunction(ast::ast_operator op)
+{
+  return op == ast::ast_operator::LOGICAL_OR or op == ast::ast_operator::NULL_LOGICAL_OR;
+}
+
+bool is_comparison(ast::ast_operator op)
+{
+  switch (op) {
+    case ast::ast_operator::EQUAL:
+    case ast::ast_operator::NOT_EQUAL:
+    case ast::ast_operator::LESS:
+    case ast::ast_operator::GREATER:
+    case ast::ast_operator::LESS_EQUAL:
+    case ast::ast_operator::GREATER_EQUAL: return true;
+    default: return false;
+  }
+}
+
 // Collects the inputs of a predicate; returns false if it holds anything a leaf cannot evaluate.
+//
+// A predicate is comparisons joined by AND, OR and NOT. Every comparison must read the column
+// directly: it is then null for a null row, and so is any combination of such comparisons, even
+// under the three-valued operators. That is what allows a leaf to skip null rows.
 bool collect_inputs(ast::expression const& expr, predicate_inputs& inputs)
 {
-  if (auto const* operation = dynamic_cast<ast::operation const*>(&expr)) {
-    switch (operation->get_operator()) {
-      case ast::ast_operator::EQUAL:
-      case ast::ast_operator::NOT_EQUAL:
-      case ast::ast_operator::LESS:
-      case ast::ast_operator::GREATER:
-      case ast::ast_operator::LESS_EQUAL:
-      case ast::ast_operator::GREATER_EQUAL:
-      case ast::ast_operator::LOGICAL_AND:
-      case ast::ast_operator::LOGICAL_OR:
-      case ast::ast_operator::NOT: break;
-      default: return false;
-    }
-    return std::ranges::all_of(operation->get_operands(), [&](auto const& operand) {
-      return collect_inputs(operand.get(), inputs);
-    });
+  auto const* operation = dynamic_cast<ast::operation const*>(&expr);
+  if (operation == nullptr) { return false; }
+  auto const op        = operation->get_operator();
+  auto const& operands = operation->get_operands();
+
+  if (is_conjunction(op) or is_disjunction(op) or op == ast::ast_operator::NOT) {
+    return std::ranges::all_of(
+      operands, [&](auto const& operand) { return collect_inputs(operand.get(), inputs); });
   }
-  if (auto const* column = dynamic_cast<ast::column_reference const*>(&expr)) {
-    if (column->get_table_source() != ast::table_reference::LEFT) { return false; }
-    if (inputs.column_index.has_value() and *inputs.column_index != column->get_column_index()) {
+  if (not is_comparison(op)) { return false; }
+
+  auto reads_column = false;
+  for (auto const& operand : operands) {
+    if (auto const* column = dynamic_cast<ast::column_reference const*>(&operand.get())) {
+      if (column->get_table_source() != ast::table_reference::LEFT) { return false; }
+      if (inputs.column_index.has_value() and *inputs.column_index != column->get_column_index()) {
+        return false;
+      }
+      inputs.column_index = column->get_column_index();
+      reads_column        = true;
+    } else if (auto const* literal = dynamic_cast<ast::literal const*>(&operand.get())) {
+      if (literal->is_scalar_column_view()) { return false; }
+      inputs.literals.push_back(literal);
+    } else {
       return false;
     }
-    inputs.column_index = column->get_column_index();
-    return true;
   }
-  if (auto const* literal = dynamic_cast<ast::literal const*>(&expr)) {
-    if (literal->is_scalar_column_view()) { return false; }
-    inputs.literals.push_back(literal);
-    return true;
-  }
-  return false;
+  return reads_column;
 }
 
 // Copies a predicate on one column, making it reference column zero.
 ast::expression const& rebase(ast::expression const& expr, ast::tree& tree)
 {
   if (auto const* operation = dynamic_cast<ast::operation const*>(&expr)) {
+    // A leaf never sees a null, so the three-valued operators become the plain ones, which
+    // generate code without null handling.
+    auto op = operation->get_operator();
+    if (is_conjunction(op)) { op = ast::ast_operator::LOGICAL_AND; }
+    if (is_disjunction(op)) { op = ast::ast_operator::LOGICAL_OR; }
     auto const& operands = operation->get_operands();
     auto const& first    = rebase(operands.front().get(), tree);
-    if (operands.size() == 1) {
-      return tree.push(ast::operation{operation->get_operator(), first});
-    }
+    if (operands.size() == 1) { return tree.push(ast::operation{op, first}); }
     auto const& second = rebase(operands.back().get(), tree);
-    return tree.push(ast::operation{operation->get_operator(), first, second});
+    return tree.push(ast::operation{op, first, second});
   }
   if (dynamic_cast<ast::column_reference const*>(&expr) != nullptr) {
     return tree.push(ast::column_reference{0});
@@ -169,7 +201,7 @@ std::optional<comparisons> match_comparisons(ast::expression const& expr)
     return comparisons{.operators = {*single, compare_operator::NONE}, .num = 1};
   }
   auto const* operation = dynamic_cast<ast::operation const*>(&expr);
-  if (operation == nullptr or operation->get_operator() != ast::ast_operator::LOGICAL_AND) {
+  if (operation == nullptr or not is_conjunction(operation->get_operator())) {
     return std::nullopt;
   }
   auto const first  = match_comparison(operation->get_operands().front().get());
@@ -283,12 +315,13 @@ extern "C" __device__ uint32_t cudf_pq_leaf_v{2}_b{3}(cudf::io::parquet::jit::le
                      arguments);
 }
 
-// Splits a filter at its top-level LOGICAL_AND operators.
+// Splits a filter at its top-level AND operators. A row is kept if the filter is valid and true,
+// which for either kind of AND means that both operands are valid and true.
 void collect_conjuncts(ast::expression const& expr,
                        std::vector<std::reference_wrapper<ast::expression const>>& conjuncts)
 {
   if (auto const* operation = dynamic_cast<ast::operation const*>(&expr);
-      operation != nullptr and operation->get_operator() == ast::ast_operator::LOGICAL_AND) {
+      operation != nullptr and is_conjunction(operation->get_operator())) {
     for (auto const& operand : operation->get_operands()) {
       collect_conjuncts(operand.get(), conjuncts);
     }
@@ -464,8 +497,25 @@ std::optional<rmm::device_uvector<uint8_t>> evaluate_dictionary(column_predicate
 fused_filter_stats get_fused_filter_stats()
 {
   return {.decoded   = num_decoded.load(std::memory_order_relaxed),
-          .evaluated = num_evaluated.load(std::memory_order_relaxed)};
+          .evaluated = num_evaluated.load(std::memory_order_relaxed),
+          .fallback  = num_fallback.load(std::memory_order_relaxed)};
 }
+
+void record_filter_fallback() { num_fallback.fetch_add(1, std::memory_order_relaxed); }
+
+}  // namespace cudf::io::parquet::jit
+
+namespace cudf::io {
+
+parquet_jit_filter_stats get_parquet_jit_filter_stats()
+{
+  auto const stats = parquet::jit::get_fused_filter_stats();
+  return {.decoded = stats.decoded, .evaluated = stats.evaluated, .fallback = stats.fallback};
+}
+
+}  // namespace cudf::io
+
+namespace cudf::io::parquet::jit {
 
 fused_filter::fused_filter(ast::expression const& filter,
                            host_span<data_type const> column_types,

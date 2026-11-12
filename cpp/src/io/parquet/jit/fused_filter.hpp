@@ -69,7 +69,8 @@ struct column_predicate {
  * @brief Converts a predicate on one column to leaves.
  *
  * A predicate qualifies if it reads exactly one column of a 4- or 8-byte numeric, timestamp or
- * duration type, combines only comparisons with `LOGICAL_AND`, `LOGICAL_OR` and `NOT`, and
+ * duration type, combines only comparisons of the column with literals using `LOGICAL_AND`,
+ * `LOGICAL_OR`, their three-valued forms `NULL_LOGICAL_AND` and `NULL_LOGICAL_OR`, and `NOT`, and
  * compares against at most `max_leaf_literals` valid literals. Such a predicate is null when
  * its column is null, so a null row is never kept.
  *
@@ -106,7 +107,8 @@ struct column_predicate {
 /**
  * @brief A row filter whose single-column conjuncts are evaluated by leaves.
  *
- * The filter is split at its top-level `LOGICAL_AND` operators. Conjuncts that qualify as a
+ * The filter is split at its top-level `LOGICAL_AND` and `NULL_LOGICAL_AND` operators, which keep
+ * the same rows: those for which every operand is valid and true. Conjuncts that qualify as a
  * `column_predicate` are grouped by column and evaluated by one kernel per column; the remaining
  * conjuncts stay an ordinary expression that is evaluated together with the kernels' results.
  *
@@ -203,7 +205,13 @@ class fused_filter {
 struct fused_filter_stats {
   uint64_t decoded   = 0;  ///< Predicate evaluations taken from flags written during decode
   uint64_t evaluated = 0;  ///< Predicate evaluations run over a decoded column
+  uint64_t fallback  = 0;  ///< Filter evaluations that ran the whole filter as an expression
 };
+
+/**
+ * @brief Records that a filter with the JIT decode filter enabled was evaluated as an expression.
+ */
+void record_filter_fallback();
 
 /**
  * @brief Returns how the predicates of all fused filters were evaluated.
