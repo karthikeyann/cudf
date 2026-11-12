@@ -61,22 +61,27 @@ struct tile_ref {
 };
 
 /**
- * @brief Entry point into a page's serial streams, recorded once per `tile_rows` values.
+ * @brief Resume state of one sequential stream of a page, recorded every `tile_rows` values.
  *
- * A page has `checkpoint_stride` entries per tile. A dictionary entry `k` locates the run that
- * holds value `k * tile_rows` of the index stream. A rank entry `k` uses only `first_value`,
- * which holds the number of non-null rows before page row `k * tile_rows`.
+ * A stream that can only be read front to back (run headers of a dictionary index stream, the
+ * non-null count of a level stream, and later the mini-blocks of a delta stream or the lengths
+ * of a string page) is walked once per subpass. The walk stores what a tile needs to start in
+ * the middle of the stream. Each stage of a kernel declares how many entries per tile it uses
+ * and gives the two fields the meaning its stream needs:
+ * - dictionary indices: entry `k` locates the run that holds value `k * tile_rows`;
+ * - definition levels: entry `k` holds, in `first_value`, the number of non-null rows before
+ *   page row `k * tile_rows`.
+ *
+ * Tile `k` of a page owns entries `[first_checkpoint + k * stride, + stride)`, the value
+ * stream's entry first and the level stream's after it.
  */
 struct checkpoint {
-  uint32_t byte_offset;  ///< Offset of a run header from `page_ref::values`
-  uint32_t first_value;  ///< Index of the first value of that run, or a rank
+  uint32_t byte_offset;  ///< Offset from `page_ref::values` at which to resume
+  uint32_t first_value;  ///< Stream position at `byte_offset`, or a count of earlier values
 };
 
 /**
- * @brief Returns the number of checkpoint entries a page has per tile.
- *
- * Tile `k` of a page has its dictionary entry at `first_checkpoint + k * stride` and its rank
- * entry directly after the dictionary entry, or in its place for a PLAIN page.
+ * @brief Returns the number of checkpoint entries a flat fixed-width page has per tile.
  *
  * @param is_dict Whether the page is dictionary encoded
  * @param nullable Whether the page's column is nullable

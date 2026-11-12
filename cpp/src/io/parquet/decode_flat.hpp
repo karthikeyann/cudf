@@ -7,14 +7,12 @@
 
 #include "error.hpp"
 #include "io/utilities/hostdevice_vector.hpp"
-#include "jit/kernel_abi.hpp"
 #include "parquet_gpu.hpp"
 
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
-#include <cuda/buffer>
 #include <cuda/stream>
 
 #include <cstdint>
@@ -23,44 +21,9 @@
 namespace cudf::io::parquet::detail {
 
 /**
- * @brief Identifies one page claimed by the tile decode kernels.
- */
-struct flat_page_claim {
-  uint32_t page_idx;          ///< Index of the page in the subpass page array
-  uint32_t first_checkpoint;  ///< Index of the page's first checkpoint entry
-  uint32_t shape;             ///< Combination of `flat_shape_*`
-};
-
-/// Set in `flat_page_claim::shape` for a dictionary encoded page.
-inline constexpr uint32_t flat_shape_dict = 1;
-/// Set in `flat_page_claim::shape` for a page of 8-byte values.
-inline constexpr uint32_t flat_shape_wide = 2;
-/// Set in `flat_page_claim::shape` for a page of a nullable column.
-inline constexpr uint32_t flat_shape_nullable = 4;
-/// Number of distinct `flat_page_claim::shape` values.
-inline constexpr uint32_t num_flat_shapes = 8;
-
-/**
  * @brief State the tile decode kernels keep for the claimed pages of one subpass.
  */
-struct flat_decode_plan {
-  /**
-   * @brief Constructs an empty plan.
-   *
-   * @param stream CUDA stream used for device memory operations
-   * @param mr Memory resources used to allocate the plan's device memory
-   */
-  flat_decode_plan(cuda::stream_ref stream, cudf::memory_resources mr);
-
-  /// Claimed pages, in subpass page order.
-  cudf::detail::hostdevice_vector<flat_page_claim> claims;
-  /// Checkpoints of every claimed page, filled once per subpass.
-  cuda::device_buffer<jit::checkpoint> checkpoints;
-  /// One descriptor per claimed page, rewritten for every decode call.
-  cuda::device_buffer<jit::page_ref> page_refs;
-  /// One null counter per claimed page, rewritten for every decode call.
-  cuda::device_buffer<int32_t> null_counts;
-};
+struct flat_decode_plan;
 
 /**
  * @brief Returns whether the tile decode kernels can decode a page.
@@ -90,7 +53,7 @@ struct flat_decode_plan {
  * @param mr Memory resources used to allocate the plan's device memory
  * @return The plan
  */
-[[nodiscard]] std::unique_ptr<flat_decode_plan> prepare_flat_decode(
+[[nodiscard]] std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   cudf::detail::hostdevice_span<PageInfo const> pages,
   cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
   int level_type_size,
@@ -101,7 +64,8 @@ struct flat_decode_plan {
  * @brief Decodes the claimed pages of a subpass for one decode call.
  *
  * Writes the values and validity of the rows in `[min_row, min_row + num_rows)` and sets the
- * null count of every claimed page, including pages outside of that range.
+ * null count of every claimed page, including pages outside of that range. The kernels are
+ * queued on `stream`; `plan` must stay untouched until they have finished.
  *
  * @param plan Plan of the subpass
  * @param pages Pages of the subpass

@@ -20,21 +20,21 @@
 
 namespace cudf::io::parquet::jit {
 
-/// Number of runs a warp keeps in shared memory. A group of 32 values spans at most 32 runs, so
-/// any size above 33 lets every refill make progress.
-inline constexpr uint32_t run_table_size = 64;
-
 /**
  * @brief Runs of a dictionary index stream that cover the values a warp is decoding.
+ *
+ * @tparam size Number of runs the table holds. The values of one loop turn span at most
+ * `32 * steps` runs, so any size above `32 * steps + 1` lets every refill make progress.
  */
+template <uint32_t size>
 struct run_table {
-  uint32_t start[run_table_size + 1];  ///< First value index of each run; `start[count]` is the
-                                       ///< end of the last run
-  uint32_t data[run_table_size];       ///< Bit-packed run: offset of its payload from
-                                       ///< `page_ref::values`. Repeated run: the index
-  uint8_t packed[run_table_size];      ///< Whether each run is bit-packed
-  uint32_t count;                      ///< Number of runs in the table
-  uint32_t next_offset;                ///< Offset of the first run header not yet parsed
+  uint32_t start[size + 1];  ///< First value index of each run; `start[count]` is the end of the
+                             ///< last run
+  uint32_t data[size];       ///< Bit-packed run: offset of its payload from `page_ref::values`.
+                             ///< Repeated run: the index
+  uint8_t packed[size];      ///< Whether each run is bit-packed
+  uint32_t count;            ///< Number of runs in the table
+  uint32_t next_offset;      ///< Offset of the first run header not yet parsed
 };
 
 /**
@@ -100,7 +100,8 @@ __device__ inline uint32_t extract_bits(uint8_t const* base, uint64_t bit_offset
  * @param need Lowest value index still to be decoded
  * @param target Value index up to which coverage is useful
  */
-__device__ inline void refill_runs(run_table& table,
+template <uint32_t capacity>
+__device__ inline void refill_runs(run_table<capacity>& table,
                                    page_ref const& page,
                                    uint32_t need,
                                    uint32_t target)
@@ -122,7 +123,7 @@ __device__ inline void refill_runs(run_table& table,
   uint32_t offset          = table.next_offset;
   uint32_t const size      = page.values_size;
   uint32_t const bit_width = page.bit_width;
-  while (kept < run_table_size && end < target) {
+  while (kept < capacity && end < target) {
     if (offset >= size) {
       table.start[kept]  = end;
       table.data[kept]   = 0;
@@ -184,21 +185,420 @@ __device__ inline void refill_runs(run_table& table,
 }
 
 /**
- * @brief Decodes tiles of flat fixed-width pages, one tile per warp.
+ * @brief Rows of one tile that belong to the decode call, and where they are stored.
+ */
+struct tile_range {
+  uint32_t tile_begin;  ///< First page row of the tile
+  uint32_t row_begin;   ///< First page row to decode
+  uint32_t row_end;     ///< One past the last page row to decode
+  int32_t out_begin;    ///< Output row of `row_begin`
+  int32_t out_end;      ///< Output row of `row_end`
+};
+
+/**
+ * @name Stages of tile decode
+ *
+ * `decode_tiles` is written once against three stages. A kernel for a column is a composition
+ * of one type per stage, chosen at compile time; today's kernels are the compositions listed
+ * under `decode_flat_tiles`.
+ *
+ * **Level source**: turns rows into validity and value stream positions.
+ * - `static constexpr uint32_t checkpoints_per_tile`: checkpoint entries it needs per tile.
+ * - Constructor `(page, tile, range, entries, stride, slot, lane)`: `entries` are the page's
+ *   checkpoint entries, of which tile `k` owns `entries[k * stride + slot]`. Called by all
+ *   lanes of the warp; holds the per-tile state.
+ * - `uint32_t position() const`: position in the value stream of the next non-null row. The
+ *   same in every lane.
+ * - `bool step(out_base, lane, out_row, value_index)`: handles the 32 output rows starting at
+ *   `out_base`, a multiple of 32, of which lane `l` owns row `out_base + l`. Sets `out_row`,
+ *   and returns whether that row is a non-null row of the decode call; if so, `value_index`
+ *   is the position of its value. Stores the validity of the rows. Called by all lanes.
+ * - `void finish(null_count, lane)`: adds the nulls of the tile to `*null_count`.
+ * `required_levels` and `optional_levels` cover flat columns. A source for nested columns
+ * would read repetition levels as well, map rows to positions through the offsets it writes,
+ * and hand out more than one value per row.
+ *
+ * **Value source**: returns the value at a position of the value stream. One per encoding.
+ * - `using value_type`: `uint32_t` or `uint64_t`, the physical value zero extended.
+ * - `static constexpr uint32_t checkpoints_per_tile`.
+ * - `static constexpr uint32_t max_turn_values`: most positions one `prepare` may span.
+ * - Constructor `(page, entries, stride, slot, position, lane)`: `position` is the first
+ *   position the tile needs. Called by all lanes; holds the per-tile state, in registers or
+ *   in shared memory it declares itself.
+ * - `void prepare(need_begin, need_end, target, lane)`: makes positions
+ *   `[need_begin, need_end)` readable; positions below `need_begin` are not read again and
+ *   coverage up to `target` will be asked for later. Arguments are the same in every lane.
+ * - `value_type get(position, dict_idx) const`: the value at a prepared position. Sets
+ *   `dict_idx` on dictionary pages and leaves it alone otherwise. Reads must stay inside the
+ *   page; a position the page does not hold yields 0.
+ * `plain_values` and `dictionary_values` exist. DELTA_BINARY_PACKED fits as a source whose
+ * checkpoint is the value before a mini-block and whose `prepare` unpacks and prefix-sums the
+ * mini-blocks of the turn; BYTE_STREAM_SPLIT and BOOLEAN need no checkpoint.
+ *
+ * **Leaf**: transform, predicate and sink, called as `leaf(ctx, out_row, value, dict_idx)`
+ * once per non-null row, with the ABI of `abi/leaf_abi.cuh`. A value wider than 64 bits
+ * (DECIMAL128, FIXED_LEN_BYTE_ARRAY, INT96) needs a `value_type` of that width and a third
+ * leaf symbol for it. A variable-width sink (strings) is two compositions over the same
+ * sources: a leaf that only adds up sizes per row, then, once offsets are known, a leaf that
+ * copies bytes; the value source then returns a pointer and a length instead of the bits.
+ *
+ * Encoding, value width and nullability are compile-time properties of the stage types, so a
+ * composition contains only the code of its stages.
+ * @{
+ */
+
+/**
+ * @brief Level source of a REQUIRED column: every row is valid and holds value `row`.
+ */
+struct required_levels {
+  static constexpr uint32_t checkpoints_per_tile = 0;
+
+  __device__ required_levels(page_ref const& page,
+                             tile_ref,
+                             tile_range const& range,
+                             checkpoint const*,
+                             uint32_t,
+                             uint32_t,
+                             uint32_t)
+    : _row_base{page.row_base},
+      _out_begin{range.out_begin},
+      _out_end{range.out_end},
+      _position{range.row_begin}
+  {
+  }
+
+  [[nodiscard]] __device__ uint32_t position() const { return _position; }
+
+  __device__ bool step(int32_t out_base, uint32_t lane, int32_t& out_row, uint32_t& value_index)
+  {
+    out_row            = out_base + static_cast<int32_t>(lane);
+    value_index        = static_cast<uint32_t>(out_row - _row_base);
+    int32_t const next = out_base + 32 < _out_end ? out_base + 32 : _out_end;
+    if (next > _out_begin) { _position = static_cast<uint32_t>(next - _row_base); }
+    return out_row >= _out_begin && out_row < _out_end;
+  }
+
+  __device__ void finish(int32_t*, uint32_t) const {}
+
+ private:
+  int32_t _row_base;
+  int32_t _out_begin;
+  int32_t _out_end;
+  uint32_t _position;
+};
+
+/**
+ * @brief Level source of a flat OPTIONAL column, reading pre-decoded definition levels.
+ *
+ * Its checkpoint entry holds the number of non-null rows before the tile. A page marked
+ * `page_flag_no_nulls` behaves like a REQUIRED page.
+ */
+struct optional_levels {
+  static constexpr uint32_t checkpoints_per_tile = 1;
+
+  __device__ optional_levels(page_ref const& page,
+                             tile_ref tile,
+                             tile_range const& range,
+                             checkpoint const* entries,
+                             uint32_t stride,
+                             uint32_t slot,
+                             uint32_t lane)
+    : _levels{page.levels},
+      _valid{page.valid},
+      _row_base{page.row_base},
+      _out_begin{range.out_begin},
+      _out_end{range.out_end},
+      _position{range.row_begin},
+      _num_nulls{0},
+      _level_shift{(page.flags & page_flag_wide_levels) != 0 ? 1u : 0u},
+      _has_nulls{(page.flags & page_flag_no_nulls) == 0}
+  {
+    if (_has_nulls) {
+      _position = entries[tile.tile * stride + slot].first_value;
+      // The decode call starts inside this tile: count the non-null rows before it.
+      for (uint32_t base = range.tile_begin; base < range.row_begin; base += 32) {
+        uint32_t const row = base + lane;
+        bool const valid   = row < range.row_begin && _levels[size_t{row} << _level_shift] != 0;
+        _position += __popc(__ballot_sync(0xffff'ffffu, valid));
+      }
+    }
+  }
+
+  [[nodiscard]] __device__ uint32_t position() const { return _position; }
+
+  __device__ bool step(int32_t out_base, uint32_t lane, int32_t& out_row, uint32_t& value_index)
+  {
+    out_row           = out_base + static_cast<int32_t>(lane);
+    value_index       = static_cast<uint32_t>(out_row - _row_base);
+    bool const active = out_row >= _out_begin && out_row < _out_end;
+    if (not _has_nulls) {
+      int32_t const next = out_base + 32 < _out_end ? out_base + 32 : _out_end;
+      if (next > _out_begin) { _position = static_cast<uint32_t>(next - _row_base); }
+      return active;
+    }
+    bool const valid           = active && _levels[size_t{value_index} << _level_shift] != 0;
+    uint32_t const active_mask = __ballot_sync(0xffff'ffffu, active);
+    uint32_t const valid_mask  = __ballot_sync(0xffff'ffffu, valid);
+    uint32_t const null_mask   = active_mask & ~valid_mask;
+    value_index                = _position + __popc(valid_mask & ((uint32_t{1} << lane) - 1));
+    _position += __popc(valid_mask);
+    _num_nulls += __popc(null_mask);
+    // The mask starts out all valid. A word this warp shares with another tile or page is
+    // updated atomically.
+    if (lane == 0 && _valid != nullptr) {
+      uint32_t* const word = _valid + (out_base >> 5);
+      if (active_mask == 0xffff'ffffu) {
+        *word = valid_mask;
+      } else if (null_mask != 0) {
+        atomicAnd(word, ~null_mask);
+      }
+    }
+    return valid;
+  }
+
+  __device__ void finish(int32_t* null_count, uint32_t lane) const
+  {
+    if (lane == 0 && _num_nulls != 0) { atomicAdd(null_count, static_cast<int32_t>(_num_nulls)); }
+  }
+
+ private:
+  uint8_t const* _levels;
+  uint32_t* _valid;
+  int32_t _row_base;
+  int32_t _out_begin;
+  int32_t _out_end;
+  uint32_t _position;
+  uint32_t _num_nulls;
+  uint32_t _level_shift;
+  bool _has_nulls;
+};
+
+/**
+ * @brief Value source of PLAIN pages: value `i` is stored at byte `i * in_bytes`.
+ *
+ * @tparam in_bytes Size of a physical value, 4 or 8
+ */
+template <int in_bytes>
+struct plain_values {
+  using value_type                               = decltype(load_value<in_bytes>(nullptr));
+  static constexpr uint32_t checkpoints_per_tile = 0;
+  static constexpr uint32_t max_turn_values      = 0xffff'ffffu;
+
+  __device__ plain_values(
+    page_ref const& page, checkpoint const*, uint32_t, uint32_t, uint32_t, uint32_t)
+    : _values{page.values}, _num_values{page.values_size / in_bytes}
+  {
+  }
+
+  __device__ void prepare(uint32_t, uint32_t, uint32_t, uint32_t) const {}
+
+  [[nodiscard]] __device__ value_type get(uint32_t position, uint32_t&) const
+  {
+    return position < _num_values ? load_value<in_bytes>(_values + size_t{position} * in_bytes)
+                                  : value_type{0};
+  }
+
+ private:
+  uint8_t const* _values;
+  uint32_t _num_values;
+};
+
+/**
+ * @brief Value source of RLE_DICTIONARY pages.
+ *
+ * Keeps the runs of the index stream that cover the current turn in a shared-memory table
+ * owned by the warp. Its checkpoint entry locates the run that holds value `k * tile_rows`.
+ * An index without a dictionary entry yields 0.
+ *
+ * @tparam in_bytes Size of a physical value, 4 or 8
+ * @tparam turn_values Most positions one `prepare` may span
+ */
+template <int in_bytes, uint32_t turn_values>
+struct dictionary_values {
+  using value_type                               = decltype(load_value<in_bytes>(nullptr));
+  static constexpr uint32_t checkpoints_per_tile = 1;
+  static constexpr uint32_t max_turn_values      = turn_values;
+
+  __device__ dictionary_values(page_ref const& page,
+                               checkpoint const* entries,
+                               uint32_t stride,
+                               uint32_t slot,
+                               uint32_t position,
+                               uint32_t lane)
+    : _page{&page}, _covered_end{0}, _run{0}
+  {
+    __shared__ table_type tables[decode_flat_block_size / 32];
+    _table = &tables[(threadIdx.x % decode_flat_block_size) / 32];
+    if (lane == 0) {
+      checkpoint const entry = entries[(position >> tile_rows_log2) * stride + slot];
+      _table->count          = 0;
+      _table->start[0]       = entry.first_value;
+      _table->next_offset    = entry.byte_offset;
+    }
+  }
+
+  __device__ void prepare(uint32_t need_begin, uint32_t need_end, uint32_t target, uint32_t lane)
+  {
+    if (need_end > _covered_end) {
+      if (lane == 0) { refill_runs(*_table, *_page, need_begin, target); }
+      __syncwarp();
+      _covered_end = _table->start[_table->count];
+      _run         = 0;
+    }
+  }
+
+  [[nodiscard]] __device__ value_type get(uint32_t position, uint32_t& dict_idx)
+  {
+    while (_table->start[_run + 1] <= position) {
+      ++_run;
+    }
+    uint32_t index = _table->data[_run];
+    if (_table->packed[_run] != 0) {
+      index =
+        _page->bit_width == 0
+          ? 0
+          : extract_bits(_page->values + index,
+                         static_cast<uint64_t>(position - _table->start[_run]) * _page->bit_width,
+                         _page->bit_width);
+    }
+    if (index < _page->dict_entries) {
+      dict_idx = index + _page->dict_first;
+      return load_value<in_bytes>(_page->dict + size_t{index} * in_bytes);
+    }
+    dict_idx = _page->dict_entries + _page->dict_first;
+    return value_type{0};
+  }
+
+ private:
+  using table_type = run_table<turn_values + 32>;
+  page_ref const* _page;
+  table_type* _table;
+  uint32_t _covered_end;
+  uint32_t _run;
+};
+
+/** @} */
+
+/**
+ * @brief Decodes tiles of pages, one tile per warp.
  *
  * Must be called by every thread of a block of `decode_flat_block_size` threads. Warp `w` of
  * the grid decodes `tiles[w]`. Rows are handled in groups of 32 aligned to the words of the
  * output validity mask, so that lane `l` of a warp owns output row `32 * j + l`.
  *
- * `leaf` is called once per non-null row of the decode call as
- * `leaf(ctx, output_row, value, dict_idx)` and stores the value.
+ * See "Stages of tile decode" for the contracts of the three stage types.
+ *
+ * @tparam LevelSource Level source of the pages
+ * @tparam ValueSource Value source of the pages
+ * @tparam steps Number of 32-row groups a warp decodes per loop turn. The loads of one turn are
+ * issued before its stores, so this sets how many independent loads each lane has in flight
+ * @tparam Leaf Callable with the signature of the leaf ABI for `ValueSource::value_type`
+ * @param pages Page descriptors of this decode call
+ * @param tiles Tiles to decode, all of pages this composition can decode
+ * @param num_tiles Number of entries in `tiles`
+ * @param checkpoints Checkpoints of all pages. A page has
+ * `ValueSource::checkpoints_per_tile + LevelSource::checkpoints_per_tile` entries per tile,
+ * the value source's first
+ * @param contexts Leaf contexts, indexed by `page_ref::ctx_idx`
+ * @param null_counts One counter per entry of `pages`; the nulls found are added to it
+ * @param leaf The leaf
+ */
+template <typename LevelSource, typename ValueSource, uint32_t steps, typename Leaf>
+__device__ inline void decode_tiles(page_ref const* pages,
+                                    tile_ref const* tiles,
+                                    uint32_t num_tiles,
+                                    checkpoint const* checkpoints,
+                                    leaf_ctx const* contexts,
+                                    int32_t* null_counts,
+                                    Leaf leaf)
+{
+  constexpr uint32_t warp_size = 32;
+  constexpr uint32_t stride = ValueSource::checkpoints_per_tile + LevelSource::checkpoints_per_tile;
+  static_assert(ValueSource::max_turn_values >= warp_size * steps);
+
+  uint32_t const lane       = threadIdx.x % warp_size;
+  uint32_t const warp       = threadIdx.x / warp_size;
+  uint32_t const tile_index = blockIdx.x * (decode_flat_block_size / warp_size) + warp;
+  if (tile_index >= num_tiles) { return; }
+
+  tile_ref const tile = tiles[tile_index];
+  page_ref const page = pages[tile.page];
+  leaf_ctx const ctx  = contexts[page.ctx_idx];
+
+  tile_range range;
+  range.tile_begin         = tile.tile * tile_rows;
+  uint32_t const range_end = page.first_row + page.num_rows;
+  range.row_begin          = range.tile_begin > page.first_row ? range.tile_begin : page.first_row;
+  range.row_end =
+    range.tile_begin + tile_rows < range_end ? range.tile_begin + tile_rows : range_end;
+  if (range.row_begin >= range.row_end) { return; }
+  range.out_begin = static_cast<int32_t>(range.row_begin) + page.row_base;
+  range.out_end   = static_cast<int32_t>(range.row_end) + page.row_base;
+
+  checkpoint const* const entries = checkpoints + page.first_checkpoint;
+  LevelSource levels(page, tile, range, entries, stride, ValueSource::checkpoints_per_tile, lane);
+  ValueSource values(page, entries, stride, 0, levels.position(), lane);
+
+  constexpr auto turn_rows = static_cast<int32_t>(warp_size * steps);
+  for (int32_t turn_base = range.out_begin & ~31; turn_base < range.out_end;
+       turn_base += turn_rows) {
+    // Output row, validity and value stream position of this lane for each step of the turn.
+    int32_t out_row[steps];
+    bool valid[steps];
+    uint32_t value_index[steps];
+    uint32_t const need_begin = levels.position();
+    for (uint32_t step = 0; step < steps; ++step) {
+      valid[step] = levels.step(
+        turn_base + static_cast<int32_t>(step * warp_size), lane, out_row[step], value_index[step]);
+    }
+    int32_t const first      = turn_base > range.out_begin ? turn_base : range.out_begin;
+    uint32_t const remaining = static_cast<uint32_t>(range.out_end - first);
+    values.prepare(need_begin, levels.position(), need_begin + remaining, lane);
+
+    // Load every value of the turn before any is stored, so that the loads overlap.
+    typename ValueSource::value_type value[steps];
+    uint32_t dict_idx[steps];
+    for (uint32_t step = 0; step < steps; ++step) {
+      value[step]    = 0;
+      dict_idx[step] = 0;
+      if (valid[step]) { value[step] = values.get(value_index[step], dict_idx[step]); }
+    }
+    for (uint32_t step = 0; step < steps; ++step) {
+      if (valid[step]) {
+        leaf(ctx, static_cast<uint32_t>(out_row[step]), value[step], dict_idx[step]);
+      }
+    }
+  }
+  levels.finish(null_counts + tile.page, lane);
+}
+
+/// Steps per loop turn of the compositions named by `decode_flat_tiles`.
+inline constexpr uint32_t flat_steps_per_turn = 1;
+
+/**
+ * @brief Selects one of two types at compile time.
+ */
+template <bool condition, typename True, typename False>
+struct select_stage {
+  using type = True;  ///< The selected type
+};
+
+/// @copydoc select_stage
+template <typename True, typename False>
+struct select_stage<false, True, False> {
+  using type = False;  ///< The selected type
+};
+
+/**
+ * @brief Decodes tiles of flat fixed-width pages: the compositions for PLAIN or dictionary
+ * encoding, 4- or 8-byte values, and REQUIRED or OPTIONAL columns.
  *
  * @tparam is_dict Whether the pages are dictionary encoded; PLAIN otherwise
  * @tparam in_bytes Size of a physical value, 4 or 8
  * @tparam nullable Whether the pages' columns have a maximum definition level of 1
  * @tparam Leaf Callable with the signature of the leaf ABI for `in_bytes`
  * @param pages Page descriptors of this decode call
- * @param tiles Tiles to decode, all of pages with this kernel's encoding, width and nullability
+ * @param tiles Tiles to decode, all of pages with this encoding, width and nullability
  * @param num_tiles Number of entries in `tiles`
  * @param checkpoints Checkpoints of all pages
  * @param contexts Leaf contexts, indexed by `page_ref::ctx_idx`
@@ -214,144 +614,12 @@ __device__ inline void decode_flat_tiles(page_ref const* pages,
                                          int32_t* null_counts,
                                          Leaf leaf)
 {
-  constexpr uint32_t warp_size = 32;
-  constexpr uint32_t stride    = checkpoint_stride(is_dict, nullable);
-
-  uint32_t const lane       = threadIdx.x % warp_size;
-  uint32_t const warp       = threadIdx.x / warp_size;
-  uint32_t const tile_index = blockIdx.x * (decode_flat_block_size / warp_size) + warp;
-  if (tile_index >= num_tiles) { return; }
-
-  tile_ref const tile = tiles[tile_index];
-  page_ref const page = pages[tile.page];
-  leaf_ctx const ctx  = contexts[page.ctx_idx];
-
-  uint32_t const tile_begin = tile.tile * tile_rows;
-  uint32_t const range_end  = page.first_row + page.num_rows;
-  uint32_t const row_begin  = tile_begin > page.first_row ? tile_begin : page.first_row;
-  uint32_t const row_end = tile_begin + tile_rows < range_end ? tile_begin + tile_rows : range_end;
-  if (row_begin >= row_end) { return; }
-
-  int32_t const out_begin = static_cast<int32_t>(row_begin) + page.row_base;
-  int32_t const out_end   = static_cast<int32_t>(row_end) + page.row_base;
-
-  // Index of the next value in the page's value stream.
-  uint32_t rank                         = row_begin;
-  [[maybe_unused]] bool has_nulls       = false;
-  [[maybe_unused]] uint32_t num_nulls   = 0;
-  [[maybe_unused]] uint32_t level_shift = 0;
-  if constexpr (nullable) {
-    has_nulls   = (page.flags & page_flag_no_nulls) == 0;
-    level_shift = (page.flags & page_flag_wide_levels) != 0 ? 1 : 0;
-    if (has_nulls) {
-      rank = checkpoints[page.first_checkpoint + tile.tile * stride + (stride - 1)].first_value;
-      // The decode call starts inside this tile: count the non-null rows before it.
-      for (uint32_t base = tile_begin; base < row_begin; base += warp_size) {
-        uint32_t const row = base + lane;
-        bool const valid   = row < row_begin && page.levels[size_t{row} << level_shift] != 0;
-        rank += __popc(__ballot_sync(0xffff'ffffu, valid));
-      }
-    }
-  }
-
-  [[maybe_unused]] run_table* table     = nullptr;
-  [[maybe_unused]] uint32_t covered_end = 0;
-  [[maybe_unused]] uint32_t run         = 0;
-  if constexpr (is_dict) {
-    __shared__ run_table tables[decode_flat_block_size / warp_size];
-    table = &tables[warp];
-    if (lane == 0) {
-      checkpoint const entry =
-        checkpoints[page.first_checkpoint + (rank >> tile_rows_log2) * stride];
-      table->count       = 0;
-      table->start[0]    = entry.first_value;
-      table->next_offset = entry.byte_offset;
-    }
-  }
-
-  for (int32_t out_base = out_begin & ~31; out_base < out_end; out_base += warp_size) {
-    int32_t const out_row = out_base + static_cast<int32_t>(lane);
-    bool const active     = out_row >= out_begin && out_row < out_end;
-    bool valid            = active;
-    // Position of this lane's value in the value stream, and the positions the warp needs.
-    uint32_t value_index = static_cast<uint32_t>(out_row - page.row_base);
-    int32_t const first  = out_base > out_begin ? out_base : out_begin;
-    uint32_t need_begin  = static_cast<uint32_t>(first - page.row_base);
-    uint32_t need_end =
-      static_cast<uint32_t>((out_base + 32 < out_end ? out_base + 32 : out_end) - page.row_base);
-
-    if constexpr (nullable) {
-      if (has_nulls) {
-        valid                      = active && page.levels[size_t{value_index} << level_shift] != 0;
-        uint32_t const active_mask = __ballot_sync(0xffff'ffffu, active);
-        uint32_t const valid_mask  = __ballot_sync(0xffff'ffffu, valid);
-        uint32_t const null_mask   = active_mask & ~valid_mask;
-        value_index                = rank + __popc(valid_mask & ((uint32_t{1} << lane) - 1));
-        need_begin                 = rank;
-        rank += __popc(valid_mask);
-        need_end = rank;
-        num_nulls += __popc(null_mask);
-        // The mask starts out all valid. A word this warp shares with another tile or page is
-        // updated atomically.
-        if (lane == 0 && page.valid != nullptr) {
-          uint32_t* const word = page.valid + (out_base >> 5);
-          if (active_mask == 0xffff'ffffu) {
-            *word = valid_mask;
-          } else if (null_mask != 0) {
-            atomicAnd(word, ~null_mask);
-          }
-        }
-      }
-    }
-
-    if constexpr (is_dict) {
-      if (need_end > covered_end) {
-        if (lane == 0) {
-          uint32_t const remaining = static_cast<uint32_t>(out_end - first);
-          refill_runs(*table, page, need_begin, need_begin + remaining);
-        }
-        __syncwarp();
-        covered_end = table->start[table->count];
-        run         = 0;
-      }
-    }
-
-    if (valid) {
-      uint32_t dict_idx                             = 0;
-      decltype(load_value<in_bytes>(nullptr)) value = 0;
-      if constexpr (is_dict) {
-        while (table->start[run + 1] <= value_index) {
-          ++run;
-        }
-        uint32_t index = table->data[run];
-        if (table->packed[run] != 0) {
-          index = page.bit_width == 0
-                    ? 0
-                    : extract_bits(
-                        page.values + index,
-                        static_cast<uint64_t>(value_index - table->start[run]) * page.bit_width,
-                        page.bit_width);
-        }
-        if (index < page.dict_entries) {
-          value    = load_value<in_bytes>(page.dict + size_t{index} * in_bytes);
-          dict_idx = index + page.dict_first;
-        } else {
-          dict_idx = page.dict_entries + page.dict_first;
-        }
-      } else {
-        if (value_index < page.values_size / in_bytes) {
-          value = load_value<in_bytes>(page.values + size_t{value_index} * in_bytes);
-        }
-      }
-      leaf(ctx, static_cast<uint32_t>(out_row), value, dict_idx);
-    }
-  }
-
-  if constexpr (nullable) {
-    if (lane == 0 && num_nulls != 0) {
-      atomicAdd(null_counts + tile.page, static_cast<int32_t>(num_nulls));
-    }
-  }
+  using level_source = typename select_stage<nullable, optional_levels, required_levels>::type;
+  using value_source = typename select_stage<is_dict,
+                                             dictionary_values<in_bytes, 32 * flat_steps_per_turn>,
+                                             plain_values<in_bytes>>::type;
+  decode_tiles<level_source, value_source, flat_steps_per_turn>(
+    pages, tiles, num_tiles, checkpoints, contexts, null_counts, leaf);
 }
 
 }  // namespace cudf::io::parquet::jit
