@@ -535,7 +535,6 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
                       column_leaves,
                       skip_rows,
                       num_rows,
-                      level_type_size,
                       error_code.data(),
                       decode_stream,
                       _mr.as_temporary());

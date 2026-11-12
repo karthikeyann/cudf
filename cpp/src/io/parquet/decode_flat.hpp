@@ -45,11 +45,11 @@ struct flat_decode_plan;
 /**
  * @brief Builds the plan for the claimed pages of a subpass and records their checkpoints.
  *
- * Must be called after the definition levels of the subpass have been decoded.
+ * The definition levels of claimed pages are read from the page data; they are not
+ * pre-decoded.
  *
  * @param pages Pages of the subpass; claimed pages have the `FLAT_TILES` kernel mask
  * @param chunks Column chunks of the pass
- * @param level_type_size Size in bytes of a pre-decoded level
  * @param stream CUDA stream used for device memory operations and kernel launches
  * @param mr Memory resources used to allocate the plan's device memory
  * @return The plan
@@ -57,7 +57,6 @@ struct flat_decode_plan;
 [[nodiscard]] std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   cudf::detail::hostdevice_span<PageInfo const> pages,
   cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
-  int level_type_size,
   cuda::stream_ref stream,
   cudf::memory_resources mr);
 
@@ -93,7 +92,6 @@ struct flat_column_leaf {
  * @param column_leaves Leaf of each input column, or empty to store the values of every column
  * @param min_row First row to decode
  * @param num_rows Number of rows to decode
- * @param level_type_size Size in bytes of a pre-decoded level
  * @param error_code Error code to set if an error is encountered
  * @param stream CUDA stream used for device memory operations and kernel launches
  * @param mr Memory resources used to allocate temporary device memory
@@ -105,7 +103,6 @@ void decode_flat_pages(flat_decode_plan& plan,
                        cudf::host_span<flat_column_leaf> column_leaves,
                        size_t min_row,
                        size_t num_rows,
-                       int level_type_size,
                        kernel_error::pointer error_code,
                        cuda::stream_ref stream,
                        cudf::memory_resources mr);

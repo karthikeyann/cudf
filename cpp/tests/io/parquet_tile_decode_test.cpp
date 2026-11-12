@@ -18,6 +18,7 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/span.hpp>
+#include <cudf/wrappers/timestamps.hpp>
 
 #include <algorithm>
 #include <array>
@@ -389,6 +390,47 @@ TEST_F(ParquetTileDecodeTest, DictionaryIndexOutOfRange)
     }
   }
   EXPECT_EQ(num_changed, 1);
+}
+
+TEST_F(ParquetTileDecodeTest, TimestampsAndDates)
+{
+  // With a timestamp type requested, a timestamp column in that unit and a date column are
+  // stored as they are; a timestamp column in another unit is rescaled by the generic decoders.
+  constexpr cudf::size_type num_rows = 20'000;
+  std::vector<int64_t> ticks(num_rows);
+  std::vector<int32_t> days(num_rows);
+  std::vector<bool> valid(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    ticks[i] = 1'600'000'000'000 + (i % 500) * 1'000;
+    days[i]  = 18'000 + i % 400;
+    valid[i] = i % 13 != 0;
+  }
+  cudf::test::fixed_width_column_wrapper<cudf::timestamp_ms, int64_t> millis(
+    ticks.begin(), ticks.end(), valid.begin());
+  cudf::test::fixed_width_column_wrapper<cudf::timestamp_us, int64_t> micros(ticks.begin(),
+                                                                             ticks.end());
+  cudf::test::fixed_width_column_wrapper<cudf::timestamp_D, int32_t> dates(
+    days.begin(), days.end(), valid.begin());
+  cudf::table_view const expected{{millis, micros, dates}};
+  write_config config;
+  config.page_rows  = 3'000;
+  auto const buffer = write_buffer(expected, config);
+
+  for (auto const type : {cudf::type_id::EMPTY,
+                          cudf::type_id::TIMESTAMP_MILLISECONDS,
+                          cudf::type_id::TIMESTAMP_MICROSECONDS}) {
+    auto const read = [&](bool use_tile_decode) {
+      auto const options = cudf::io::parquet_reader_options::builder(source_of(buffer))
+                             .use_tile_decode(use_tile_decode)
+                             .timestamp_type(cudf::data_type{type})
+                             .build();
+      return cudf::io::read_parquet(options).tbl;
+    };
+    SCOPED_TRACE("timestamp_type=" + std::to_string(static_cast<int>(type)));
+    auto const generic = read(false);
+    auto const tiles   = read(true);
+    expect_identical(generic->view(), tiles->view());
+  }
 }
 
 TEST_F(ParquetTileDecodeTest, MixedWithOtherColumns)
