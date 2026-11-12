@@ -734,6 +734,8 @@ void hybrid_scan_reader_impl::prepare_materialization(
   // Normalize the input expression (must be done after column selection)
   if (columns_mode != read_columns_mode::PAYLOAD_COLUMNS) {
     _expr_conv = build_normalized_expression(options);
+    _fused_filter.reset();
+    _fused_filter_expr = nullptr;
   }
 
   // Return early if all rows are pruned
@@ -967,6 +969,7 @@ void hybrid_scan_reader_impl::reset_internal_state()
   _options.num_rows       = std::nullopt;
   _options.row_group_indices.clear();
   _options.use_jit_filter              = false;
+  _options.use_jit_decode_filter       = false;
   _options.case_sensitive_names        = true;
   _options.prepend_source_index_column = false;
   _options.prepend_row_index_column    = false;
@@ -980,7 +983,9 @@ void hybrid_scan_reader_impl::reset_internal_state()
   _row_mask_offset = 0;
 
   _expr_conv = parquet_filter_normalizer{};
-  _mr        = cudf::get_current_device_resource_ref();
+  _fused_filter.reset();
+  _fused_filter_expr = nullptr;
+  _mr                = cudf::get_current_device_resource_ref();
 }
 
 void hybrid_scan_reader_impl::initialize_reader_config(parquet_reader_options const& options)
@@ -991,6 +996,7 @@ void hybrid_scan_reader_impl::initialize_reader_config(parquet_reader_options co
   _options.timestamp_type              = cudf::data_type{options.get_timestamp_type().id()};
   _options.decimal_width               = options.get_decimal_width();
   _options.use_jit_filter              = options.is_enabled_use_jit_filter();
+  _options.use_jit_decode_filter       = options.is_enabled_use_jit_decode_filter();
   _options.case_sensitive_names        = options.is_enabled_case_sensitive_names();
   _options.prepend_source_index_column = options.is_enabled_prepend_source_index_column();
   _options.prepend_row_index_column    = options.is_enabled_prepend_row_index_column();
@@ -1262,15 +1268,7 @@ table_with_metadata hybrid_scan_reader_impl::finalize_output(
     auto const final_filter      = compute_offset_filter();
     auto const final_filter_expr = final_filter.get_converted_expr();
 
-    auto const use_jit = cudf::get_context().use_jit() or _options.use_jit_filter;
-    auto final_row_mask =
-      use_jit ? cudf::compute_column_jit(read_table->view(),
-                                         final_filter_expr.value().get(),
-                                         {},
-                                         _stream,
-                                         _mr.get_temporary_mr())
-              : cudf::detail::compute_column(
-                  *read_table, final_filter_expr.value().get(), _stream, _mr.get_temporary_mr());
+    auto final_row_mask = evaluate_filter(read_table->view(), final_filter_expr.value().get());
     CUDF_EXPECTS(final_row_mask->view().type().id() == type_id::BOOL8,
                  "Predicate filter should return a boolean");
 

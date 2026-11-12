@@ -476,6 +476,13 @@ rtcx_embed_includes(
   cudf/cpp/src/transform/jit INCLUDE_DIRECTORIES cudf/cpp/src
 )
 
+# Only the leaf ABI header of the Parquet kernels is embedded. The bundle's hash is part of every
+# JIT cache key, so embedding the kernel sources would invalidate all cached kernels on each edit.
+rtcx_embed_includes(
+  cudf_cuda_embed SOURCE_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/src/io/parquet/jit/abi
+  DEST_DIRECTORY cudf/cpp/src/io/parquet/jit/abi INCLUDE_DIRECTORIES cudf/cpp/src
+)
+
 get_target_property(LIBCUDACXX_RAW_INCLUDE_DIRS CCCL::libcudacxx INTERFACE_INCLUDE_DIRECTORIES)
 
 foreach(INC_DIR IN LISTS LIBCUDACXX_RAW_INCLUDE_DIRS)
@@ -623,8 +630,47 @@ function(precompile_string_kernel_fragments)
   endforeach()
 endfunction()
 
+# This function precompiles the Parquet flat-buffer kernel fragments, which leave their leaf
+# unresolved, and the leaves that are linked into them without any runtime compilation.
+function(precompile_parquet_kernel_fragments)
+  foreach(ENCODING IN ITEMS plain dict)
+    foreach(NUM_BYTES IN ITEMS 4 8)
+      foreach(NULLABLE IN ITEMS false true)
+        math(EXPR NUM_BITS "${NUM_BYTES} * 8")
+        set(FRAGMENT_NAME pq_flat_${ENCODING}_b${NUM_BITS})
+        if(NULLABLE)
+          string(APPEND FRAGMENT_NAME _nullable)
+        endif()
+        if(ENCODING STREQUAL "dict")
+          set(IS_DICT true)
+        else()
+          set(IS_DICT false)
+        endif()
+        add_fragment(
+          cudf_fragments
+          FRAGMENT
+          ${FRAGMENT_NAME}
+          SOURCE
+          src/io/parquet/jit/flat_buffer_kernel.cu
+          KERNEL_ONLY
+          ON
+          KERNEL_INSTANCE
+          "cudf::io::parquet::jit::flat_buffer_kernel<${IS_DICT}, ${NUM_BYTES}, ${NULLABLE}>"
+        )
+      endforeach()
+    endforeach()
+  endforeach()
+
+  add_fragment(cudf_fragments FRAGMENT pq_leaf_store SOURCE src/io/parquet/jit/leaf_store.cu)
+  add_fragment(
+    cudf_fragments FRAGMENT pq_leaf_dict_keep SOURCE src/io/parquet/jit/leaf_store.cu DEFINITIONS
+    CUDF_PQ_LEAF_DICT_KEEP
+  )
+endfunction()
+
 precompile_fixed_width_kernel_fragments()
 precompile_string_kernel_fragments()
+precompile_parquet_kernel_fragments()
 
 rtcx_embed(cudf_fragments COMPRESSION none OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/embed")
 
@@ -852,6 +898,8 @@ add_library(
   src/io/parquet/hybrid_scan/page_index_filter.cu
   src/io/parquet/hybrid_scan/page_index_filter_utils.cu
   src/io/parquet/io_utils/parquet_io_utils.cpp
+  src/io/parquet/jit/fused_filter.cpp
+  src/io/parquet/jit/kernel_provider.cpp
   src/io/parquet/page_data.cu
   src/io/parquet/chunk_dict.cu
   src/io/parquet/page_enc.cu

@@ -110,6 +110,8 @@ class parquet_reader_options {
   type_id _decimal_width{type_id::EMPTY};
   // Whether to use JIT compilation for filtering
   bool _use_jit_filter = false;
+  // Whether to evaluate single-column filter conjuncts with kernels linked at runtime for the scan
+  bool _use_jit_decode_filter = false;
   // Whether to output flat string columns as DICT32 encoded columns
   bool _output_dict_columns = false;
   // Whether column name matching is case sensitive. In case of multiple
@@ -307,6 +309,14 @@ class parquet_reader_options {
    * @return `true` if JIT compilation should be used for filtering
    */
   [[nodiscard]] bool is_enabled_use_jit_filter() const { return _use_jit_filter; }
+
+  /**
+   * @brief Returns whether single-column filter conjuncts are evaluated by kernels linked at
+   * runtime for the scan.
+   *
+   * @return `true` if such kernels should be used for filtering
+   */
+  [[nodiscard]] bool is_enabled_use_jit_decode_filter() const { return _use_jit_decode_filter; }
 
   /**
    * @brief Returns whether column name matching is case sensitive.
@@ -639,6 +649,19 @@ class parquet_reader_options {
   void enable_use_jit_filter(bool val) { _use_jit_filter = val; }
 
   /**
+   * @brief Sets whether single-column filter conjuncts are evaluated by kernels linked at runtime
+   * for the scan.
+   *
+   * Each conjunct of the filter that compares one fixed-width column with literals is evaluated
+   * by a kernel specialized for it, which is linked when first needed and cached. The rest of the
+   * filter, and the whole filter if such a kernel cannot be built, is evaluated as it is without
+   * this option. The rows read are the same either way.
+   *
+   * @param val Boolean indicating whether to enable these kernels.
+   */
+  void enable_use_jit_decode_filter(bool val) { _use_jit_decode_filter = val; }
+
+  /**
    * @brief Sets whether column name matching is case sensitive.
    *
    * @note When disabled, if there are multiple case-insensitive matches, the first
@@ -931,6 +954,20 @@ class parquet_reader_options_builder {
   parquet_reader_options_builder& use_jit_filter(bool val)
   {
     options.enable_use_jit_filter(val);
+    return *this;
+  }
+
+  /**
+   * @brief Sets whether single-column filter conjuncts are evaluated by kernels linked at runtime
+   * for the scan.
+   *
+   * @copydetails parquet_reader_options::enable_use_jit_decode_filter
+   *
+   * @return this for chaining
+   */
+  parquet_reader_options_builder& use_jit_decode_filter(bool val)
+  {
+    options.enable_use_jit_decode_filter(val);
     return *this;
   }
 

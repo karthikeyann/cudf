@@ -760,6 +760,16 @@ foreach(test AST_TEST JOIN_TEST MIXED_JOIN_TEST)
 endforeach()
 
 # ##################################################################################################
+# * Parquet JIT tests
+# -------------------------------------------------------------------------------
+ConfigureTest(PARQUET_JIT_TEST io/parquet_jit_test.cpp)
+# The tests call the kernel provider, which is internal to libcudf and whose headers use rtcx types.
+target_include_directories(
+  PARQUET_JIT_TEST PRIVATE "$<BUILD_INTERFACE:${CUDF_SOURCE_DIR}/src>"
+                           "$<TARGET_PROPERTY:rtcx::rtcx,INTERFACE_INCLUDE_DIRECTORIES>"
+)
+
+# ##################################################################################################
 # * lists tests ----------------------------------------------------------------------------------
 ConfigureTest(
   LISTS_TEST

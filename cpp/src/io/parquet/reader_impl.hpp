@@ -29,6 +29,10 @@
 #include <optional>
 #include <vector>
 
+namespace cudf::io::parquet::jit {
+class fused_filter;
+}  // namespace cudf::io::parquet::jit
+
 namespace cudf::io::parquet::detail {
 
 /**
@@ -487,6 +491,16 @@ class reader_impl {
   }
 
   /**
+   * @brief Evaluates the output filter over a decoded table
+   *
+   * @param table Decoded table, including any prepended columns
+   * @param filter The output filter, with column references offset for the prepended columns
+   * @return A BOOL8 column that is valid and true for the rows the filter keeps
+   */
+  [[nodiscard]] std::unique_ptr<column> evaluate_filter(table_view const& table,
+                                                        ast::expression const& filter);
+
+  /**
    * @brief Calculate the number of rows read from each source in the output chunk
    *
    * @param chunk_start_row The offset of the first row in the output chunk
@@ -531,6 +545,8 @@ class reader_impl {
     std::vector<std::vector<size_type>> row_group_indices;
     // Whether to use JIT for filtering
     bool use_jit_filter = false;
+    // Whether to evaluate single-column filter conjuncts with kernels linked for the scan
+    bool use_jit_decode_filter = false;
     // Whether to use case-sensitive matching for column names
     bool case_sensitive_names = true;
     // Whether to prepend the source file index column to the output
@@ -543,6 +559,13 @@ class reader_impl {
 
   // Converts the input filter to AST output filter.
   parquet_filter_normalizer _expr_conv{std::nullopt, table_metadata{}, true};
+
+  // Plan for evaluating the output filter with kernels linked for the scan. Null if the filter
+  // has no conjunct such a kernel can evaluate. A shared pointer keeps the plan's definition out
+  // of this header.
+  std::shared_ptr<jit::fused_filter> _fused_filter;
+  // The expression `_fused_filter` was planned for; null if no plan was attempted yet.
+  ast::expression const* _fused_filter_expr = nullptr;
 
   std::vector<std::unique_ptr<datasource>> _sources;
   std::shared_ptr<aggregate_reader_metadata> _metadata;

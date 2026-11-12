@@ -7,6 +7,7 @@
 
 #include "column_path_helpers.hpp"
 #include "error.hpp"
+#include "jit/fused_filter.hpp"
 #include "runtime/context.hpp"
 #include "synthetic_column_helpers.hpp"
 
@@ -615,6 +616,7 @@ reader_impl::reader_impl(std::size_t chunk_read_limit,
              options.get_num_bytes(),
              options.get_row_groups(),
              options.is_enabled_use_jit_filter(),
+             options.is_enabled_use_jit_decode_filter(),
              options.is_enabled_case_sensitive_names(),
              options.is_enabled_prepend_source_index_column(),
              options.is_enabled_prepend_row_index_column(),
@@ -1102,15 +1104,7 @@ table_with_metadata reader_impl::finalize_output(read_mode mode,
     // Clear the number of rows per source as it is not valid after filtering
     out_metadata.num_rows_per_source.clear();
 
-    auto const use_jit = cudf::get_context().use_jit() or _options.use_jit_filter;
-    auto predicate =
-      use_jit ? cudf::compute_column_jit(read_table->view(),
-                                         final_filter_expr.value().get(),
-                                         {},
-                                         _stream,
-                                         _mr.get_temporary_mr())
-              : cudf::detail::compute_column(
-                  *read_table, final_filter_expr.value().get(), _stream, _mr.get_temporary_mr());
+    auto predicate = evaluate_filter(read_table->view(), final_filter_expr.value().get());
 
     CUDF_EXPECTS(predicate->view().type().id() == type_id::BOOL8,
                  "Predicate filter should return a boolean");
@@ -1121,6 +1115,41 @@ table_with_metadata reader_impl::finalize_output(read_mode mode,
   }
   return {encode_output_dict_columns(std::make_unique<table>(std::move(out_columns))),
           std::move(out_metadata)};
+}
+
+std::unique_ptr<column> reader_impl::evaluate_filter(table_view const& table,
+                                                     ast::expression const& filter)
+{
+  auto const use_jit = cudf::get_context().use_jit() or _options.use_jit_filter;
+
+  if (_options.use_jit_decode_filter) {
+    // The plan refers to the normalized filter, which outlives every output chunk and references
+    // the columns that follow the prepended ones.
+    auto const normalized_filter_ref = _expr_conv.get_converted_expr().value();
+    auto const& normalized_filter    = normalized_filter_ref.get();
+    auto const num_prepended = static_cast<size_type>(_options.prepend_source_index_column) +
+                               static_cast<size_type>(_options.prepend_row_index_column);
+    auto const counting_it = cuda::counting_iterator<size_type>{0};
+    auto const filter_table =
+      table.select(counting_it + num_prepended, counting_it + table.num_columns());
+
+    if (_fused_filter_expr != &normalized_filter) {
+      _fused_filter_expr = &normalized_filter;
+      _fused_filter      = std::make_shared<jit::fused_filter>(
+        normalized_filter, filter_table, _stream, _mr.get_temporary_mr());
+      if (_fused_filter->predicates().empty()) { _fused_filter.reset(); }
+    }
+
+    if (_fused_filter != nullptr) {
+      auto predicate =
+        _fused_filter->evaluate(filter_table, use_jit, _stream, _mr.get_temporary_mr());
+      // Without its kernels the plan cannot run; the filter below gives the same rows.
+      if (predicate.has_value()) { return std::move(*predicate); }
+    }
+  }
+
+  return use_jit ? cudf::compute_column_jit(table, filter, {}, _stream, _mr.get_temporary_mr())
+                 : cudf::detail::compute_column(table, filter, _stream, _mr.get_temporary_mr());
 }
 
 std::unique_ptr<table> retain_rows(std::unique_ptr<table>&& input,
