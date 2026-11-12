@@ -534,6 +534,11 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
     for (uint32_t tile = first_tile; tile <= last_tile; ++tile) {
       out[tile - first_tile] = {static_cast<uint32_t>(idx), tile};
     }
+    // A flat page holds one value per row. Rows that a malformed page claims beyond its values
+    // have no checkpoints and are not decoded.
+    auto const num_values = static_cast<uint32_t>(page.num_input_values);
+    ref.num_rows =
+      ref.first_row < num_values ? cuda::std::min(ref.num_rows, num_values - ref.first_row) : 0;
 
     value_section const section = locate_value_section(page, chunk, is_dict);
     if (section.error != 0) {
