@@ -35,6 +35,7 @@ namespace {
 enum class value_pattern {
   RANDOM,      // few distinct values in random order: bit-packed runs
   SHORT_RUNS,  // each value repeated 12 times: repeated runs
+  MIXED_RUNS,  // runs of 1 to 40 equal values: short repeated and bit-packed runs
   MIXED,       // long constant stretches between random stretches
   CONSTANT,    // one distinct value: index bit width 0
   DISTINCT,    // every value different
@@ -59,12 +60,21 @@ std::unique_ptr<cudf::column> make_column(cudf::size_type num_rows,
 {
   std::mt19937 engine(seed);
   std::uniform_int_distribution<int> few(0, 199);
+  std::uniform_int_distribution<int> run_length(1, 40);
   std::vector<T> data(num_rows);
+  int run_left  = 0;
+  int run_value = 0;
   for (cudf::size_type i = 0; i < num_rows; ++i) {
+    if (run_left == 0) {
+      run_left  = run_length(engine);
+      run_value = few(engine);
+    }
+    --run_left;
     int value = 0;
     switch (values) {
       case value_pattern::RANDOM: value = few(engine); break;
       case value_pattern::SHORT_RUNS: value = (i / 12) % 37; break;
+      case value_pattern::MIXED_RUNS: value = run_value; break;
       case value_pattern::MIXED: value = (i / 2500) % 2 == 0 ? i / 2500 : few(engine); break;
       case value_pattern::CONSTANT: value = 42; break;
       case value_pattern::DISTINCT: value = i; break;
@@ -193,6 +203,7 @@ std::string describe(value_pattern values, null_pattern nulls, write_config cons
 
 constexpr std::array all_values{value_pattern::RANDOM,
                                 value_pattern::SHORT_RUNS,
+                                value_pattern::MIXED_RUNS,
                                 value_pattern::MIXED,
                                 value_pattern::CONSTANT,
                                 value_pattern::DISTINCT};
@@ -247,6 +258,26 @@ TEST_F(ParquetTileDecodeTest, PageSizes)
         auto const result = read_both(buffer, 0, -1);
         CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected->view(), result->view());
       }
+    }
+  }
+}
+
+TEST_F(ParquetTileDecodeTest, LongRunStreams)
+{
+  // Pages whose index and level streams hold thousands of short runs, so that the checkpoints
+  // of a page come from many windows of its streams.
+  constexpr cudf::size_type num_rows = 400'000;
+  for (auto const values : {value_pattern::SHORT_RUNS, value_pattern::MIXED_RUNS}) {
+    for (auto const nulls :
+         {null_pattern::REQUIRED, null_pattern::SPARSE, null_pattern::HALF, null_pattern::ENDS}) {
+      auto const expected = make_table(num_rows, values, nulls);
+      write_config config;
+      config.page_rows = 200'000;
+      SCOPED_TRACE(describe(values, nulls, config));
+      auto const buffer = write_buffer(expected->view(), config);
+      auto const result = read_both(buffer, 0, -1);
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected->view(), result->view());
+      read_both(buffer, 123'457, 200'001);
     }
   }
 }

@@ -34,7 +34,7 @@ struct page_ref {
   uint8_t const* values;      ///< PLAIN: the values. Dictionary: the index stream after its bit
                               ///< width byte
   uint8_t const* dict;        ///< Dictionary values; unused for PLAIN pages
-  uint8_t const* levels;      ///< Definition level stream, which ends at `values`; nullable only
+  uint8_t const* levels;      ///< Definition level stream, read up to `values`; nullable only
   uint32_t* valid;            ///< Validity mask of the output column; nullable only
   uint32_t values_size;       ///< Size of `values` in bytes
   uint32_t dict_entries;      ///< Number of entries in `dict`

@@ -276,6 +276,8 @@ constexpr uint32_t walk_chunk_bytes = 32;
 constexpr uint32_t walk_window_bytes = walk_chunk_bytes * prepare_block_size;
 // Run headers the walking thread reads on its own before it judges how dense the runs are.
 constexpr uint32_t walk_probe_runs = 16;
+// Run headers the walking thread follows before it lets the block check for the end.
+constexpr uint32_t walk_serial_runs = 1024;
 // The runs are dense if the probe advanced by less than this many bytes per run.
 constexpr uint32_t walk_dense_run_bytes = 12;
 // A window pays off while the chain of run headers enters at least this many chunks.
@@ -306,17 +308,42 @@ __device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
     bool window;      // whether the block works on a window next
     bool done;
   };
-  // Follows up to `max_runs` run headers one by one.
-  auto const walk_serial = [&](walk_state& state, uint32_t max_runs) {
-    for (uint32_t run = 0;
-         run < max_runs and state.offset < section.size and state.value < num_values;
-         ++run) {
-      auto const extent = parse_run(section, state.offset);
-      writer.record(state.offset, state.value, extent.count);
-      state.value += extent.count;
-      state.offset = extent.next;
+  // Follows up to `max_runs` run headers one by one. With `stop_when_dense`, stops as soon as
+  // `walk_probe_runs` consecutive runs turn out to be short and asks for a window.
+  auto const walk_serial = [&](walk_state& result, uint32_t max_runs, bool stop_when_dense) {
+    // Works on register copies: `result` may live in shared memory. `value` stays below
+    // `num_values` and a run holds less than 2^31 values, so 32 bits are enough.
+    uint32_t offset      = result.offset;
+    auto value           = static_cast<uint32_t>(result.value);
+    uint32_t probe_begin = offset;
+    uint32_t probe_runs  = 0;
+    bool window          = false;
+    // First tile that starts at or after `value`, and the value it starts at.
+    uint32_t tile       = (value + jit::tile_rows - 1) >> jit::tile_rows_log2;
+    uint32_t tile_value = tile << jit::tile_rows_log2;
+    for (uint32_t run = 0; run < max_runs and offset < section.size and value < num_values; ++run) {
+      auto const extent  = parse_run(section, offset);
+      uint32_t const end = value + extent.count;
+      while (tile_value < end and tile < writer.num_tiles) {
+        writer.first[tile * writer.stride] = {offset, value};
+        ++tile;
+        tile_value += jit::tile_rows;
+      }
+      value  = end;
+      offset = extent.next;
+      if (stop_when_dense and ++probe_runs == walk_probe_runs) {
+        if (offset - probe_begin < walk_probe_runs * walk_dense_run_bytes) {
+          window = true;
+          break;
+        }
+        probe_begin = offset;
+        probe_runs  = 0;
+      }
     }
-    state.done = not(state.offset < section.size and state.value < num_values);
+    result.offset = offset;
+    result.value  = value;
+    result.window = window;
+    result.done   = not(offset < section.size and value < num_values);
   };
   // Tiles past the end of the stream start where it ends.
   auto const finish = [&](walk_state const& state) {
@@ -333,7 +360,7 @@ __device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
   if constexpr (not windowed) {
     if (threadIdx.x == 0) {
       walk_state state{0, 0, false, false};
-      walk_serial(state, cuda::std::numeric_limits<uint32_t>::max());
+      walk_serial(state, cuda::std::numeric_limits<uint32_t>::max(), false);
       finish(state);
     }
   } else {
@@ -350,11 +377,7 @@ __device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
     uint32_t const t = threadIdx.x;
     if (t == 0) { state = walk_state{0, 0, false, false}; }
     while (true) {
-      if (t == 0 and not state.window) {
-        uint32_t const begin = state.offset;
-        walk_serial(state, walk_probe_runs);
-        state.window = state.offset - begin < walk_probe_runs * walk_dense_run_bytes;
-      }
+      if (t == 0 and not state.window) { walk_serial(state, walk_serial_runs, true); }
       __syncthreads();
       if (state.done) { break; }
       if (state.window) {
@@ -535,6 +558,11 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
     for (uint32_t tile = first_tile; tile <= last_tile; ++tile) {
       out[tile - first_tile] = {static_cast<uint32_t>(idx), tile};
     }
+    // A flat page holds one value per row. Rows that a malformed page claims beyond its values
+    // have no checkpoints and are not decoded.
+    auto const num_values = static_cast<uint32_t>(page.num_input_values);
+    ref.num_rows =
+      ref.first_row < num_values ? cuda::std::min(ref.num_rows, num_values - ref.first_row) : 0;
 
     value_section const section = locate_value_section(page, chunk, is_dict);
     if (section.error != 0) {
