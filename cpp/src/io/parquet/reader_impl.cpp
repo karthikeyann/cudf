@@ -20,6 +20,8 @@
 #include <cudf/io/parquet_schema.hpp>
 #include <cudf/logger.hpp>
 #include <cudf/null_mask.hpp>
+#include <cudf/reduction/detail/reduction_functions.hpp>
+#include <cudf/scalar/scalar.hpp>
 #include <cudf/stream_compaction.hpp>
 #include <cudf/strings/detail/utilities.hpp>
 #include <cudf/unary.hpp>
@@ -1093,9 +1095,7 @@ table_with_metadata reader_impl::finalize_output(read_mode mode,
   // check if the output filter AST expression (= _expr_conv.get_converted_expr()) exists
   if (final_filter_expr.has_value()) {
     auto read_table         = std::make_unique<table>(std::move(out_columns));
-    auto counting_it        = cuda::counting_iterator<std::size_t>{0};
     auto const output_count = read_table->num_columns() - _num_filter_only_columns;
-    auto only_output        = read_table->select(counting_it, counting_it + output_count);
 
     if (_num_filter_only_columns > 0) { out_metadata.schema_info.resize(output_count); }
 
@@ -1115,12 +1115,43 @@ table_with_metadata reader_impl::finalize_output(read_mode mode,
     CUDF_EXPECTS(predicate->view().type().id() == type_id::BOOL8,
                  "Predicate filter should return a boolean");
     // Exclude columns present in filter only in output
-    auto output_table = cudf::detail::apply_mask(
-      only_output, *predicate, cudf::detail::mask_type::RETENTION, _stream, _mr);
+    auto output_table =
+      retain_rows(std::move(read_table), output_count, predicate->view(), _stream, _mr);
     return {encode_output_dict_columns(std::move(output_table)), std::move(out_metadata)};
   }
   return {encode_output_dict_columns(std::make_unique<table>(std::move(out_columns))),
           std::move(out_metadata)};
+}
+
+std::unique_ptr<table> retain_rows(std::unique_ptr<table>&& input,
+                                   size_type num_columns,
+                                   column_view const& retention_mask,
+                                   cuda::stream_ref stream,
+                                   cudf::memory_resources mr)
+{
+  auto const keeps_every_row = [&] {
+    // A table without columns cannot carry its row count through a column vector.
+    if (num_columns == 0 or retention_mask.is_empty() or retention_mask.has_nulls() or
+        retention_mask.size() != input->num_rows()) {
+      return false;
+    }
+    auto const all_true = cudf::reduction::detail::all(
+      retention_mask, data_type{type_id::BOOL8}, std::nullopt, stream, mr.get_temporary_mr());
+    return static_cast<numeric_scalar<bool> const&>(*all_true).value(stream);
+  }();
+
+  if (keeps_every_row) {
+    auto columns = input->release();
+    columns.resize(num_columns);
+    return std::make_unique<table>(std::move(columns));
+  }
+
+  auto const counting_it = cuda::counting_iterator<std::size_t>{0};
+  return cudf::detail::apply_mask(input->select(counting_it, counting_it + num_columns),
+                                  retention_mask,
+                                  cudf::detail::mask_type::RETENTION,
+                                  stream,
+                                  mr);
 }
 
 table_with_metadata reader_impl::read()

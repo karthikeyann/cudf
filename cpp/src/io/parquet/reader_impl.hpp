@@ -612,4 +612,22 @@ class reader_impl {
   bool _nz_map_enabled{cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_NZ_MAP", false)};
 };
 
+/**
+ * @brief Selects the leading columns of a table and the rows kept by a retention mask
+ *
+ * Returns the selected columns without copying them when the mask keeps every row.
+ *
+ * @param input Table to filter
+ * @param num_columns Number of leading columns of @p input to return
+ * @param retention_mask BOOL8 column; a row is kept if its element is valid and `true`
+ * @param stream CUDA stream used for device memory operations and kernel launches
+ * @param mr Memory resources used for temporary allocations and the returned table
+ * @return The first @p num_columns columns of @p input holding only the kept rows
+ */
+[[nodiscard]] std::unique_ptr<table> retain_rows(std::unique_ptr<table>&& input,
+                                                 size_type num_columns,
+                                                 column_view const& retention_mask,
+                                                 cuda::stream_ref stream,
+                                                 cudf::memory_resources mr);
+
 }  // namespace cudf::io::parquet::detail

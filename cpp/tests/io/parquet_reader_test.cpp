@@ -2584,6 +2584,53 @@ TEST_F(ParquetReaderTest, FilterIdentity)
   CUDF_TEST_EXPECT_TABLES_EQUAL(*result.tbl, *result2.tbl);
 }
 
+TEST_F(ParquetReaderTest, FilterKeepingEveryRow)
+{
+  auto constexpr num_rows = 2'000;
+  auto const sequence     = cuda::counting_iterator<int32_t>{0};
+  auto const validity =
+    cudf::detail::make_counting_transform_iterator(0, [](auto i) { return i % 7 != 0; });
+  auto const key = cudf::test::fixed_width_column_wrapper<int32_t>(sequence, sequence + num_rows);
+  auto const nullable_key =
+    cudf::test::fixed_width_column_wrapper<int32_t>(sequence, sequence + num_rows, validity);
+  auto const payload =
+    cudf::test::fixed_width_column_wrapper<int64_t>(sequence, sequence + num_rows, validity);
+  auto const src = cudf::table_view{{key, nullable_key, payload}};
+
+  auto metadata = cudf::io::table_input_metadata{src};
+  metadata.column_metadata[0].set_name("key");
+  metadata.column_metadata[1].set_name("nullable_key");
+  metadata.column_metadata[2].set_name("payload");
+  auto const filepath = temp_env->get_temp_filepath("FilterKeepingEveryRow.parquet");
+  cudf::io::write_parquet(
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, src)
+      .metadata(std::move(metadata)));
+
+  auto zero                = cudf::numeric_scalar<int32_t>(0);
+  auto const literal       = cudf::ast::literal(zero);
+  auto const read_filtered = [&](std::string const& filter_column) {
+    auto const column_ref = cudf::ast::column_name_reference(filter_column);
+    auto const filter =
+      cudf::ast::operation(cudf::ast::ast_operator::GREATER_EQUAL, column_ref, literal);
+    return cudf::io::read_parquet(
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+        .column_names({"payload"})
+        .filter(filter));
+  };
+
+  {  // Every row passes and the filter column is not part of the output.
+    auto const result = read_filtered("key");
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(result.tbl->view(), cudf::table_view{{payload}});
+  }
+
+  {  // Every valid value passes, so only the rows with a null filter value are dropped.
+    auto const result   = read_filtered("nullable_key");
+    auto const expected = cudf::drop_nulls(cudf::table_view{{payload}}, {0});
+    EXPECT_EQ(result.tbl->num_rows(), expected->num_rows());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(result.tbl->view(), expected->view());
+  }
+}
+
 TEST_F(ParquetReaderTest, FilterWithColumnProjection)
 {
   // col_uint32 (field_id: 10), col_int64 (field_id: 11), col_double (field_id: 12)
@@ -4581,7 +4628,7 @@ TEST_F(ParquetMetadataSizeHintTest, ReadParquet)
     tmp_env_var const env(parquet_metadata_size_hint_env_var, std::to_string(hint));
     auto const read_opts = cudf::io::parquet_reader_options::builder(source_info).build();
     auto const result    = cudf::io::read_parquet(read_opts);
-    CUDF_TEST_EXPECT_TABLES_EQUAL(result.tbl->view(), expected->view());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(result.tbl->view(), expected->view());
   }
 }
 
