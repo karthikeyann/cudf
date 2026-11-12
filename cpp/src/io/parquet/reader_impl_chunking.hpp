@@ -75,6 +75,8 @@ struct row_range {
 /**
  * @brief Passes are broken down into subpasses based on temporary memory constraints.
  */
+struct flat_decode_plan;
+
 struct subpass_intermediate_data {
   subpass_intermediate_data()                                            = delete;
   subpass_intermediate_data(subpass_intermediate_data const&)            = delete;
@@ -131,6 +133,9 @@ struct subpass_intermediate_data {
   std::vector<size_t> column_page_count{};
   cudf::detail::hostdevice_vector<PageNestingInfo> page_nesting_info;
   cudf::detail::hostdevice_vector<PageNestingDecodeInfo> page_nesting_decode_info;
+
+  // Pages claimed by the tile decode kernels and their checkpoints. Null if no page is claimed.
+  std::shared_ptr<flat_decode_plan> flat_decode{};
 
   std::vector<row_range> output_chunk_read_info{};
 

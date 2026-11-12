@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "decode_flat.hpp"
 #include "error.hpp"
 #include "io/comp/common.hpp"
 #include "page_decode.cuh"
@@ -350,6 +351,14 @@ void reader_impl::allocate_level_decode_space()
     }
 
     auto const& chunk = pass.chunks[page.chunk_idx];
+    // Hand the page to the tile decode kernels if they can decode it. The claim persists on the
+    // pass pages when the subpass aliases them, so an already claimed page is left alone.
+    if (_tile_decode_enabled and page.kernel_mask != decode_kernel_mask::FLAT_TILES and
+        is_flat_decode_eligible(
+          page, chunk, _output_buffers[_input_columns[chunk.src_col_index].nesting[0]].type)) {
+      page.kernel_mask = decode_kernel_mask::FLAT_TILES;
+    }
+
     // A masked-out page is never classified, so it is never selected and never allocated for.
     if (_nz_map_enabled) { page.map_kind = classify_nz_map_kind(page, chunk); }
 
@@ -860,6 +869,13 @@ void reader_impl::preprocess_subpass_pages(read_mode mode, size_t chunk_read_lim
                               pass.num_rows,
                               pass.level_type_size,
                               _stream);
+  }
+
+  // Record the checkpoints of the pages claimed by the tile decode kernels.
+  subpass.flat_decode.reset();
+  if (BitAnd(subpass.kernel_mask, decode_kernel_mask::FLAT_TILES) != 0) {
+    subpass.flat_decode = prepare_flat_decode(
+      subpass.pages, pass.chunks, pass.level_type_size, _stream, _mr.as_temporary());
   }
 
   // iterate over all input columns and determine if they contain lists.
