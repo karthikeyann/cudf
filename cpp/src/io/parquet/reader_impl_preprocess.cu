@@ -358,6 +358,12 @@ void reader_impl::allocate_level_decode_space()
           page, chunk, _output_buffers[_input_columns[chunk.src_col_index].nesting[0]].type)) {
       page.kernel_mask = decode_kernel_mask::FLAT_TILES;
     }
+    // The tile decode kernels read the levels of their pages from the page data.
+    if (page.kernel_mask == decode_kernel_mask::FLAT_TILES) {
+      def_level_sizes[idx] = 0;
+      rep_level_sizes[idx] = 0;
+      continue;
+    }
 
     // A masked-out page is never classified, so it is never selected and never allocated for.
     if (_nz_map_enabled) { page.map_kind = classify_nz_map_kind(page, chunk); }
@@ -874,8 +880,8 @@ void reader_impl::preprocess_subpass_pages(read_mode mode, size_t chunk_read_lim
   // Record the checkpoints of the pages claimed by the tile decode kernels.
   subpass.flat_decode.reset();
   if (BitAnd(subpass.kernel_mask, decode_kernel_mask::FLAT_TILES) != 0) {
-    subpass.flat_decode = prepare_flat_decode(
-      subpass.pages, pass.chunks, pass.level_type_size, _stream, _mr.as_temporary());
+    subpass.flat_decode =
+      prepare_flat_decode(subpass.pages, pass.chunks, _stream, _mr.as_temporary());
   }
 
   // iterate over all input columns and determine if they contain lists.

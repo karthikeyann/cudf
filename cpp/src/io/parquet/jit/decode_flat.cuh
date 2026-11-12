@@ -21,7 +21,7 @@
 namespace cudf::io::parquet::jit {
 
 /**
- * @brief Runs of a dictionary index stream that cover the values a warp is decoding.
+ * @brief Runs of a hybrid stream that cover the values a warp is decoding.
  *
  * @tparam size Number of runs the table holds. The values of one loop turn span at most
  * `32 * steps` runs, so any size above `32 * steps + 1` lets every refill make progress.
@@ -30,11 +30,20 @@ template <uint32_t size>
 struct run_table {
   uint32_t start[size + 1];  ///< First value index of each run; `start[count]` is the end of the
                              ///< last run
-  uint32_t data[size];       ///< Bit-packed run: offset of its payload from `page_ref::values`.
-                             ///< Repeated run: the index
+  uint32_t data[size];       ///< Bit-packed run: offset of its payload in the stream.
+                             ///< Repeated run: the value
   uint8_t packed[size];      ///< Whether each run is bit-packed
   uint32_t count;            ///< Number of runs in the table
   uint32_t next_offset;      ///< Offset of the first run header not yet parsed
+};
+
+/**
+ * @brief An RLE / bit-packed hybrid stream: dictionary indices or levels.
+ */
+struct hybrid_stream {
+  uint8_t const* data;  ///< First run header
+  uint32_t size;        ///< Size in bytes
+  uint32_t bit_width;   ///< Width of a value, at most 32
 };
 
 /**
@@ -89,20 +98,20 @@ __device__ inline uint32_t extract_bits(uint8_t const* base, uint64_t bit_offset
 }
 
 /**
- * @brief Moves a warp's run table forward along the index stream.
+ * @brief Moves a warp's run table forward along its stream.
  *
  * Drops the runs that end at or before `need`, then parses run headers until the table covers
  * every value below `target` or is full. Values past the end of the stream, or past the part of
- * a run that the stream holds, decode as index 0.
+ * a run that the stream holds, decode as 0.
  *
  * @param table The warp's run table
- * @param page The page being decoded
+ * @param stream The stream the table describes
  * @param need Lowest value index still to be decoded
  * @param target Value index up to which coverage is useful
  */
 template <uint32_t capacity>
 __device__ inline void refill_runs(run_table<capacity>& table,
-                                   page_ref const& page,
+                                   hybrid_stream const& stream,
                                    uint32_t need,
                                    uint32_t target)
 {
@@ -121,8 +130,8 @@ __device__ inline void refill_runs(run_table<capacity>& table,
   }
 
   uint32_t offset          = table.next_offset;
-  uint32_t const size      = page.values_size;
-  uint32_t const bit_width = page.bit_width;
+  uint32_t const size      = stream.size;
+  uint32_t const bit_width = stream.bit_width;
   while (kept < capacity && end < target) {
     if (offset >= size) {
       table.start[kept]  = end;
@@ -136,7 +145,7 @@ __device__ inline void refill_runs(run_table<capacity>& table,
     uint32_t shift  = 0;
     uint32_t byte;
     do {
-      byte = page.values[offset++];
+      byte = stream.data[offset++];
       header |= (byte & 0x7f) << shift;
       shift += 7;
     } while ((byte & 0x80) != 0 && offset < size && shift < 35);
@@ -161,7 +170,7 @@ __device__ inline void refill_runs(run_table<capacity>& table,
       data                     = 0;
       if (size - offset >= num_bytes) {
         for (uint32_t i = 0; i < num_bytes; ++i) {
-          data |= static_cast<uint32_t>(page.values[offset + i]) << (8 * i);
+          data |= static_cast<uint32_t>(stream.data[offset + i]) << (8 * i);
         }
         offset += num_bytes;
       } else {
@@ -288,13 +297,15 @@ struct required_levels {
 };
 
 /**
- * @brief Level source of a flat OPTIONAL column, reading pre-decoded definition levels.
+ * @brief Level source of a flat OPTIONAL column, reading the definition level stream.
  *
- * Its checkpoint entry holds the number of non-null rows before the tile. A page marked
- * `page_flag_no_nulls` behaves like a REQUIRED page.
+ * Keeps the runs of the level stream that cover the current step in a shared-memory table
+ * owned by the warp. It uses two checkpoint entries per tile: the first locates the run that
+ * holds the level of page row `k * tile_rows`, the second holds the number of non-null rows
+ * before that row. A page marked `page_flag_no_nulls` behaves like a REQUIRED page.
  */
 struct optional_levels {
-  static constexpr uint32_t checkpoints_per_tile = 1;
+  static constexpr uint32_t checkpoints_per_tile = 2;
 
   __device__ optional_levels(page_ref const& page,
                              tile_ref tile,
@@ -303,22 +314,34 @@ struct optional_levels {
                              uint32_t stride,
                              uint32_t slot,
                              uint32_t lane)
-    : _levels{page.levels},
+    : _stream{page.levels, static_cast<uint32_t>(page.values - page.levels), 1},
       _valid{page.valid},
+      _table{nullptr},
       _row_base{page.row_base},
       _out_begin{range.out_begin},
       _out_end{range.out_end},
       _position{range.row_begin},
       _num_nulls{0},
-      _level_shift{(page.flags & page_flag_wide_levels) != 0 ? 1u : 0u},
+      _covered_end{0},
+      _run{0},
       _has_nulls{(page.flags & page_flag_no_nulls) == 0}
   {
     if (_has_nulls) {
-      _position = entries[tile.tile * stride + slot].first_value;
+      __shared__ table_type tables[decode_flat_block_size / 32];
+      _table                       = &tables[(threadIdx.x % decode_flat_block_size) / 32];
+      checkpoint const* const mine = entries + tile.tile * stride + slot;
+      if (lane == 0) {
+        _table->count       = 0;
+        _table->start[0]    = mine[0].first_value;
+        _table->next_offset = mine[0].byte_offset;
+      }
+      _position = mine[1].first_value;
       // The decode call starts inside this tile: count the non-null rows before it.
       for (uint32_t base = range.tile_begin; base < range.row_begin; base += 32) {
+        uint32_t const end = base + 32 < range.row_begin ? base + 32 : range.row_begin;
+        cover(base, end, range.row_end, lane);
         uint32_t const row = base + lane;
-        bool const valid   = row < range.row_begin && _levels[size_t{row} << _level_shift] != 0;
+        bool const valid   = row < end && level_at(row) != 0;
         _position += __popc(__ballot_sync(0xffff'ffffu, valid));
       }
     }
@@ -328,15 +351,22 @@ struct optional_levels {
 
   __device__ bool step(int32_t out_base, uint32_t lane, int32_t& out_row, uint32_t& value_index)
   {
-    out_row           = out_base + static_cast<int32_t>(lane);
-    value_index       = static_cast<uint32_t>(out_row - _row_base);
-    bool const active = out_row >= _out_begin && out_row < _out_end;
+    out_row             = out_base + static_cast<int32_t>(lane);
+    value_index         = static_cast<uint32_t>(out_row - _row_base);
+    bool const active   = out_row >= _out_begin && out_row < _out_end;
+    int32_t const first = out_base > _out_begin ? out_base : _out_begin;
+    int32_t const last  = out_base + 32 < _out_end ? out_base + 32 : _out_end;
     if (not _has_nulls) {
-      int32_t const next = out_base + 32 < _out_end ? out_base + 32 : _out_end;
-      if (next > _out_begin) { _position = static_cast<uint32_t>(next - _row_base); }
+      if (last > _out_begin) { _position = static_cast<uint32_t>(last - _row_base); }
       return active;
     }
-    bool const valid           = active && _levels[size_t{value_index} << _level_shift] != 0;
+    if (last > first) {
+      cover(static_cast<uint32_t>(first - _row_base),
+            static_cast<uint32_t>(last - _row_base),
+            static_cast<uint32_t>(_out_end - _row_base),
+            lane);
+    }
+    bool const valid           = active && level_at(value_index) != 0;
     uint32_t const active_mask = __ballot_sync(0xffff'ffffu, active);
     uint32_t const valid_mask  = __ballot_sync(0xffff'ffffu, valid);
     uint32_t const null_mask   = active_mask & ~valid_mask;
@@ -362,14 +392,41 @@ struct optional_levels {
   }
 
  private:
-  uint8_t const* _levels;
+  using table_type = run_table<64>;
+
+  // Makes the levels of page rows `[begin, end)` readable. The same in every lane.
+  __device__ void cover(uint32_t begin, uint32_t end, uint32_t target, uint32_t lane)
+  {
+    if (end > _covered_end) {
+      if (lane == 0) { refill_runs(*_table, _stream, begin, target); }
+      __syncwarp();
+      _covered_end = _table->start[_table->count];
+      _run         = 0;
+    }
+  }
+
+  // Returns the level of a covered page row.
+  [[nodiscard]] __device__ uint32_t level_at(uint32_t row)
+  {
+    while (_table->start[_run + 1] <= row) {
+      ++_run;
+    }
+    uint32_t const data = _table->data[_run];
+    if (_table->packed[_run] == 0) { return data; }
+    uint32_t const bit = row - _table->start[_run];
+    return (_stream.data[data + (bit >> 3)] >> (bit & 7)) & 1;
+  }
+
+  hybrid_stream _stream;
   uint32_t* _valid;
+  table_type* _table;
   int32_t _row_base;
   int32_t _out_begin;
   int32_t _out_end;
   uint32_t _position;
   uint32_t _num_nulls;
-  uint32_t _level_shift;
+  uint32_t _covered_end;
+  uint32_t _run;
   bool _has_nulls;
 };
 
@@ -425,7 +482,7 @@ struct dictionary_values {
                                uint32_t slot,
                                uint32_t position,
                                uint32_t lane)
-    : _page{&page}, _covered_end{0}, _run{0}
+    : _page{&page}, _stream{page.values, page.values_size, page.bit_width}, _covered_end{0}, _run{0}
   {
     __shared__ table_type tables[decode_flat_block_size / 32];
     _table = &tables[(threadIdx.x % decode_flat_block_size) / 32];
@@ -440,7 +497,7 @@ struct dictionary_values {
   __device__ void prepare(uint32_t need_begin, uint32_t need_end, uint32_t target, uint32_t lane)
   {
     if (need_end > _covered_end) {
-      if (lane == 0) { refill_runs(*_table, *_page, need_begin, target); }
+      if (lane == 0) { refill_runs(*_table, _stream, need_begin, target); }
       __syncwarp();
       _covered_end = _table->start[_table->count];
       _run         = 0;
@@ -472,6 +529,7 @@ struct dictionary_values {
  private:
   using table_type = run_table<turn_values + 32>;
   page_ref const* _page;
+  hybrid_stream _stream;
   table_type* _table;
   uint32_t _covered_end;
   uint32_t _run;
@@ -572,7 +630,8 @@ __device__ inline void decode_tiles(page_ref const* pages,
   levels.finish(null_counts + tile.page, lane);
 }
 
-/// Steps per loop turn of the compositions named by `decode_flat_tiles`.
+/// Steps per loop turn of the compositions named by `decode_flat_tiles`. More steps keep more
+/// loads in flight per lane and cost registers and a larger run table.
 inline constexpr uint32_t flat_steps_per_turn = 1;
 
 /**

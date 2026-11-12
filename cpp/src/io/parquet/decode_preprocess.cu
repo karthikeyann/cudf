@@ -529,6 +529,9 @@ CUDF_KERNEL void __launch_bounds__(level_decode_block_size)
   // Return early if this page is pruned
   if (not page_mask.empty() and not page_mask[page_idx]) { return; }
 
+  // The tile decode kernels read the levels of their pages from the page data.
+  if (pp->kernel_mask == decode_kernel_mask::FLAT_TILES) { return; }
+
   // setup page info - use all_types_filter since we need to preprocess levels for all page types
   if (!setup_local_page_info(
         s, pp, chunks, min_row, num_rows, all_types_filter{}, page_processing_stage::PREPROCESS)) {

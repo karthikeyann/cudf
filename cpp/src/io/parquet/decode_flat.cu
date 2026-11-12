@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -55,6 +56,7 @@ struct flat_decode_plan {
    */
   flat_decode_plan(cuda::stream_ref stream, cudf::memory_resources mr)
     : claims(0, stream, mr),
+      prepare_order(0, stream, mr),
       tile_offsets(0, stream, mr),
       contexts(0, stream, mr),
       tiles(stream, mr.get_temporary_mr(), 0, cuda::no_init),
@@ -66,6 +68,8 @@ struct flat_decode_plan {
 
   /// Claimed pages, in subpass page order.
   cudf::detail::hostdevice_vector<flat_page_claim> claims;
+  /// Indices of the claims that need checkpoints, in the order the prepare kernels take them.
+  cudf::detail::hostdevice_vector<uint32_t> prepare_order;
   /// Position of each claimed page's first tile in `tiles`, rewritten for every decode call.
   cudf::detail::hostdevice_vector<uint32_t> tile_offsets;
   /// One leaf context per input column, rewritten for every decode call.
@@ -92,7 +96,9 @@ struct value_section {
   uint8_t const* values;  ///< PLAIN values, or the index stream after its bit width byte
   uint32_t size;          ///< Size of `values` in bytes
   uint32_t bit_width;     ///< Dictionary index bit width
-  bool has_nulls;         ///< Whether the definition levels were decoded and may hold nulls
+  uint8_t const* levels;  ///< Definition level stream of a nullable page
+  uint32_t levels_size;   ///< Size of `levels` in bytes
+  bool has_nulls;         ///< Whether the definition levels may hold nulls
   uint32_t error;         ///< `decode_error` bits; the page must not be decoded if not 0
 };
 
@@ -106,7 +112,7 @@ __device__ value_section locate_value_section(PageInfo const& page,
                                               ColumnChunkDesc const& chunk,
                                               bool is_dict)
 {
-  value_section result{nullptr, 0, 0, false, 0};
+  value_section result{nullptr, 0, 0, nullptr, 0, false, 0};
   uint8_t const* cur       = page.page_data;
   uint8_t const* const end = cur + page.uncompressed_page_size;
 
@@ -127,12 +133,14 @@ __device__ value_section locate_value_section(PageInfo const& page,
       }
     }
     if (lvl == level_type::DEFINITION and chunk.max_level[lvl] > 0) {
-      // The levels are decoded unless one repeated run of the maximum level covers the page.
+      // The page has no nulls if one repeated run of the maximum level covers it.
       result.has_nulls                = true;
       uint8_t const* const levels_end = levels_begin + length;
       if (length > 0 and levels_end <= end) {
-        uint32_t run   = 0;
-        uint32_t shift = 0;
+        result.levels      = levels_begin;
+        result.levels_size = static_cast<uint32_t>(length);
+        uint32_t run       = 0;
+        uint32_t shift     = 0;
         uint32_t byte;
         do {
           byte = *levels_begin++;
@@ -143,6 +151,8 @@ __device__ value_section locate_value_section(PageInfo const& page,
           uint32_t const value = levels_begin < levels_end ? *levels_begin : 0;
           result.has_nulls     = value != static_cast<uint32_t>(chunk.max_level[lvl]);
         }
+      } else {
+        result.error |= static_cast<uint32_t>(decode_error::LEVEL_STREAM_OVERRUN);
       }
     }
   }
@@ -162,20 +172,264 @@ __device__ value_section locate_value_section(PageInfo const& page,
 }
 
 /**
- * @brief Records the checkpoints of the claimed pages, one block per page.
- *
- * For a nullable page the block counts the non-null rows of every tile and turns the counts
- * into ranks. For a dictionary page one thread walks the run headers of the index stream.
+ * @brief One run of an RLE / bit-packed hybrid stream.
  */
+struct run_extent {
+  uint32_t next;     ///< Offset of the next run header, at most the stream size
+  uint32_t count;    ///< Number of values in the run
+  uint32_t payload;  ///< Offset of the bit-packed values or of the repeated value
+  bool packed;       ///< Whether the run is bit-packed
+};
+
+/**
+ * @brief Parses the run header at `offset`, which must be inside the stream.
+ *
+ * The header takes at least one byte, so `next` is always past `offset`.
+ */
+__device__ inline run_extent parse_run(jit::hybrid_stream const& stream, uint32_t offset)
+{
+  uint32_t header = 0;
+  uint32_t shift  = 0;
+  uint32_t byte;
+  do {
+    byte = stream.data[offset++];
+    header |= (byte & 0x7f) << shift;
+    shift += 7;
+  } while ((byte & 0x80) != 0 and offset < stream.size and shift < 35);
+  bool const packed    = (header & 1) != 0;
+  uint64_t const count = packed ? uint64_t{header >> 1} * 8 : header >> 1;
+  uint64_t const bytes =
+    packed ? uint64_t{header >> 1} * stream.bit_width : (stream.bit_width + 7) / 8;
+  return {static_cast<uint32_t>(cuda::std::min<uint64_t>(offset + bytes, stream.size)),
+          static_cast<uint32_t>(
+            cuda::std::min<uint64_t>(count, cuda::std::numeric_limits<int32_t>::max())),
+          offset,
+          packed};
+}
+
+/**
+ * @brief Counts the non-null rows among page rows `[begin, end)` of a definition level
+ * stream with one bit per level, starting from the run at `entry`.
+ */
+__device__ inline uint32_t count_valid_rows(jit::hybrid_stream const& stream,
+                                            jit::checkpoint entry,
+                                            uint32_t begin,
+                                            uint32_t end)
+{
+  uint32_t offset = entry.byte_offset;
+  uint64_t row    = entry.first_value;
+  uint32_t count  = 0;
+  while (row < end and offset < stream.size) {
+    auto const extent = parse_run(stream, offset);
+    uint64_t const lo = cuda::std::max<uint64_t>(row, begin);
+    uint64_t const hi = cuda::std::min<uint64_t>(row + extent.count, end);
+    if (hi > lo) {
+      if (extent.packed) {
+        uint64_t const last = hi - row;
+        for (uint64_t bit = lo - row; bit < last;) {
+          uint64_t const byte_offset = extent.payload + (bit >> 3);
+          if (byte_offset >= stream.size) { break; }
+          auto const take =
+            static_cast<uint32_t>(cuda::std::min<uint64_t>(8 - (bit & 7), last - bit));
+          count += __popc((stream.data[byte_offset] >> (bit & 7)) & ((1u << take) - 1));
+          bit += take;
+        }
+      } else if (extent.payload < stream.size and stream.data[extent.payload] != 0) {
+        count += static_cast<uint32_t>(hi - lo);
+      }
+    }
+    row += extent.count;
+    offset = extent.next;
+  }
+  return count;
+}
+
+/**
+ * @brief Checkpoints of a walked stream of one page: entry `k * stride` resumes the stream at
+ * value `k * tile_rows`.
+ */
+struct checkpoint_writer {
+  jit::checkpoint* first;  ///< The page's first checkpoint entry
+  uint32_t stride;         ///< Entries per tile
+  uint32_t num_tiles;      ///< Tiles of the page
+
+  /**
+   * @brief Records the run at `offset` that holds values `[value, value + count)` for every
+   * tile that starts inside it.
+   */
+  __device__ void record(uint32_t offset, uint64_t value, uint64_t count) const
+  {
+    uint64_t const end = value + count;
+    for (uint64_t tile = (value + jit::tile_rows - 1) >> jit::tile_rows_log2;
+         tile < num_tiles and (tile << jit::tile_rows_log2) < end;
+         ++tile) {
+      first[tile * stride] = {offset, static_cast<uint32_t>(value)};
+    }
+  }
+};
+
+// Stream bytes each thread owns in one window of the parallel walk.
+constexpr uint32_t walk_chunk_bytes = 32;
+// Stream bytes covered by one window.
+constexpr uint32_t walk_window_bytes = walk_chunk_bytes * prepare_block_size;
+// Run headers the walking thread reads on its own before it judges how dense the runs are.
+constexpr uint32_t walk_probe_runs = 16;
+// The runs are dense if the probe advanced by less than this many bytes per run.
+constexpr uint32_t walk_dense_run_bytes = 12;
+// A window pays off while the chain of run headers enters at least this many chunks.
+constexpr uint32_t walk_min_chunks = 48;
+
+/**
+ * @brief Walks the run headers of a hybrid stream and records its checkpoints.
+ *
+ * The position of a run header depends on every run before it. One thread follows the headers
+ * while runs are long. Where runs are short the block works on a window of the stream: every
+ * thread computes, for each byte of its chunk taken as a run header, where the chain of runs
+ * leaves the chunk and how many values it covers. One thread then follows the chain through
+ * the window in one hop per chunk instead of one per run, and every thread walks its chunk
+ * again from its now known entry to record the checkpoints.
+ *
+ * Must be called by every thread of the block.
+ *
+ * @tparam windowed Whether the block may work on windows; if not, one thread walks the stream
+ */
+template <bool windowed>
+__device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
+                                   checkpoint_writer const& writer,
+                                   uint32_t num_values)
+{
+  struct walk_state {
+    uint64_t value;   // values before `offset`
+    uint32_t offset;  // next run header
+    bool window;      // whether the block works on a window next
+    bool done;
+  };
+  // Follows up to `max_runs` run headers one by one.
+  auto const walk_serial = [&](walk_state& state, uint32_t max_runs) {
+    for (uint32_t run = 0;
+         run < max_runs and state.offset < section.size and state.value < num_values;
+         ++run) {
+      auto const extent = parse_run(section, state.offset);
+      writer.record(state.offset, state.value, extent.count);
+      state.value += extent.count;
+      state.offset = extent.next;
+    }
+    state.done = not(state.offset < section.size and state.value < num_values);
+  };
+  // Tiles past the end of the stream start where it ends.
+  auto const finish = [&](walk_state const& state) {
+    for (uint64_t tile = (state.value + jit::tile_rows - 1) >> jit::tile_rows_log2;
+         tile < writer.num_tiles;
+         ++tile) {
+      writer.first[tile * writer.stride] = {
+        section.size,
+        static_cast<uint32_t>(
+          cuda::std::min<uint64_t>(state.value, cuda::std::numeric_limits<int32_t>::max()))};
+    }
+  };
+
+  if constexpr (not windowed) {
+    if (threadIdx.x == 0) {
+      walk_state state{0, 0, false, false};
+      walk_serial(state, cuda::std::numeric_limits<uint32_t>::max());
+      finish(state);
+    }
+  } else {
+    constexpr uint32_t no_entry = 0xffff'ffffu;
+    __shared__ walk_state state;
+    // Per window byte, taken as a run header: the first run header at or past the end of its
+    // chunk, and the values the chain covers up to there.
+    __shared__ uint32_t exit_offset[walk_window_bytes];
+    __shared__ uint32_t exit_values[walk_window_bytes];
+    // Per chunk: the run header at which the chain enters it, and the values before it.
+    __shared__ uint32_t entry_offset[prepare_block_size];
+    __shared__ uint32_t entry_value[prepare_block_size];
+
+    uint32_t const t = threadIdx.x;
+    if (t == 0) { state = walk_state{0, 0, false, false}; }
+    while (true) {
+      if (t == 0 and not state.window) {
+        uint32_t const begin = state.offset;
+        walk_serial(state, walk_probe_runs);
+        state.window = state.offset - begin < walk_probe_runs * walk_dense_run_bytes;
+      }
+      __syncthreads();
+      if (state.done) { break; }
+      if (state.window) {
+        uint32_t const base        = state.offset;
+        uint32_t const chunk_begin = base + t * walk_chunk_bytes;
+        auto const chunk_end       = static_cast<uint32_t>(
+          cuda::std::min<uint64_t>(uint64_t{chunk_begin} + walk_chunk_bytes, section.size));
+        if (chunk_begin < section.size) {
+          for (uint32_t offset = chunk_end; offset-- > chunk_begin;) {
+            auto const extent = parse_run(section, offset);
+            if (extent.next >= chunk_end) {
+              exit_offset[offset - base] = extent.next;
+              exit_values[offset - base] = extent.count;
+            } else {
+              exit_offset[offset - base] = exit_offset[extent.next - base];
+              exit_values[offset - base] = static_cast<uint32_t>(
+                cuda::std::min<uint64_t>(uint64_t{extent.count} + exit_values[extent.next - base],
+                                         cuda::std::numeric_limits<int32_t>::max()));
+            }
+          }
+        }
+        __syncthreads();
+        if (t == 0) {
+          uint32_t offset  = base;
+          uint64_t value   = state.value;
+          uint32_t entered = 0;
+          for (uint32_t chunk = 0; chunk < prepare_block_size; ++chunk) {
+            uint64_t const end = uint64_t{base} + uint64_t{chunk + 1} * walk_chunk_bytes;
+            if (offset < end and offset < section.size and value < num_values) {
+              entry_offset[chunk] = offset;
+              entry_value[chunk]  = static_cast<uint32_t>(value);
+              value += exit_values[offset - base];
+              offset = exit_offset[offset - base];
+              ++entered;
+            } else {
+              entry_offset[chunk] = no_entry;
+            }
+          }
+          state.offset = offset;
+          state.value  = value;
+          state.window = entered >= walk_min_chunks;
+          state.done   = not(offset < section.size and value < num_values);
+        }
+        __syncthreads();
+        if (entry_offset[t] != no_entry) {
+          uint64_t value = entry_value[t];
+          for (uint32_t offset = entry_offset[t]; offset < chunk_end;) {
+            auto const extent = parse_run(section, offset);
+            writer.record(offset, value, extent.count);
+            value += extent.count;
+            offset = extent.next;
+          }
+        }
+        __syncthreads();
+      }
+    }
+    if (t == 0) { finish(state); }
+  }
+}
+
+/**
+ * @brief Records the checkpoints of claimed pages, one block per page.
+ *
+ * Walks the definition level stream of a nullable page and the index stream of a dictionary
+ * page, and counts the non-null rows before every tile of a nullable page.
+ *
+ * @tparam windowed Whether the walk of a stream may use the whole block
+ */
+template <bool windowed>
 CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   prepare_flat_pages_kernel(PageInfo const* pages,
                             device_span<ColumnChunkDesc const> chunks,
                             flat_page_claim const* claims,
-                            jit::checkpoint* checkpoints,
-                            int level_type_size)
+                            uint32_t const* claim_ids,
+                            jit::checkpoint* checkpoints)
 {
-  constexpr uint32_t warp_size = cudf::detail::warp_size;
-  flat_page_claim const claim  = claims[blockIdx.x];
+  flat_page_claim const claim  = claims[claim_ids[blockIdx.x]];
   PageInfo const& page         = pages[claim.page_idx];
   ColumnChunkDesc const& chunk = chunks[page.chunk_idx];
   bool const is_dict           = (claim.shape & flat_shape_dict) != 0;
@@ -187,27 +441,25 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   value_section const section  = locate_value_section(page, chunk, is_dict);
 
   if (nullable and section.has_nulls) {
-    uint32_t const lane         = threadIdx.x % warp_size;
-    uint32_t const warp         = threadIdx.x / warp_size;
-    uint32_t const num_warps    = prepare_block_size / warp_size;
-    uint8_t const* const levels = page.lvl_decode_buf[level_type::DEFINITION];
-    auto const num_levels       = static_cast<uint32_t>(page.num_decoded_level_values);
-    for (uint32_t tile = warp; tile < num_tiles; tile += num_warps) {
+    // Levels: resume entries from a walk of the level stream, then the non-null rows of
+    // every tile, one tile per thread, turned into ranks by one thread.
+    jit::hybrid_stream const levels{section.levels, section.levels_size, 1};
+    jit::checkpoint* const entries = first + (is_dict ? 1 : 0);
+    walk_hybrid_stream<windowed>(levels, checkpoint_writer{entries, stride, num_tiles}, num_values);
+    __syncthreads();
+    for (uint32_t tile = threadIdx.x; tile < num_tiles; tile += prepare_block_size) {
       uint32_t const tile_begin = tile * jit::tile_rows;
-      uint32_t const tile_end   = cuda::std::min(tile_begin + jit::tile_rows, num_levels);
-      uint32_t count            = 0;
-      for (uint32_t base = tile_begin; base < tile_end; base += warp_size) {
-        uint32_t const row = base + lane;
-        bool const valid   = row < tile_end and levels[size_t{row} * level_type_size] != 0;
-        count += __popc(__ballot_sync(0xffff'ffffu, valid));
-      }
-      if (lane == 0) { first[tile * stride + (stride - 1)].first_value = count; }
+      entries[tile * stride + 1].first_value =
+        count_valid_rows(levels,
+                         entries[tile * stride],
+                         tile_begin,
+                         cuda::std::min(tile_begin + jit::tile_rows, num_values));
     }
     __syncthreads();
     if (threadIdx.x == 0) {
       uint32_t rank = 0;
       for (uint32_t tile = 0; tile < num_tiles; ++tile) {
-        uint32_t& entry      = first[tile * stride + (stride - 1)].first_value;
+        uint32_t& entry      = entries[tile * stride + 1].first_value;
         uint32_t const count = entry;
         entry                = rank;
         rank += count;
@@ -215,35 +467,12 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
     }
   }
 
-  if (is_dict and threadIdx.x == 0) {
-    // Every header takes at least one byte, so the walk ends with the stream.
-    uint32_t offset = 0;
-    uint64_t value  = 0;
-    uint32_t tile   = 0;
-    while (offset < section.size and tile < num_tiles) {
-      uint32_t const header_offset = offset;
-      uint32_t header              = 0;
-      uint32_t shift               = 0;
-      uint32_t byte;
-      do {
-        byte = section.values[offset++];
-        header |= (byte & 0x7f) << shift;
-        shift += 7;
-      } while ((byte & 0x80) != 0 and offset < section.size and shift < 35);
-      uint64_t const count = (header & 1) != 0 ? uint64_t{header >> 1} * 8 : header >> 1;
-      uint64_t const bytes =
-        (header & 1) != 0 ? uint64_t{header >> 1} * section.bit_width : (section.bit_width + 7) / 8;
-      offset = static_cast<uint32_t>(cuda::std::min<uint64_t>(offset + bytes, section.size));
-      while (tile < num_tiles and uint64_t{tile} * jit::tile_rows < value + count) {
-        first[tile * stride] = {header_offset, static_cast<uint32_t>(value)};
-        ++tile;
-      }
-      value = cuda::std::min<uint64_t>(value + count, cuda::std::numeric_limits<int32_t>::max());
-    }
-    // Tiles past the end of the stream start where it ends.
-    for (; tile < num_tiles; ++tile) {
-      first[tile * stride] = {section.size, static_cast<uint32_t>(value)};
-    }
+  if (is_dict) {
+    __syncthreads();
+    walk_hybrid_stream<windowed>(
+      jit::hybrid_stream{section.values, section.size, section.bit_width},
+      checkpoint_writer{first, stride, num_tiles},
+      num_values);
   }
 }
 
@@ -259,7 +488,6 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
                           device_span<flat_page_claim const> claims,
                           size_t min_row,
                           size_t num_rows,
-                          int level_type_size,
                           uint32_t const* tile_offsets,
                           jit::page_ref* page_refs,
                           jit::tile_ref* tiles,
@@ -315,10 +543,9 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
       ref.dict_entries = static_cast<uint32_t>(chunk.dict_page->uncompressed_page_size) / in_bytes;
     }
     if (nullable) {
-      ref.levels = page.lvl_decode_buf[level_type::DEFINITION];
+      ref.levels = section.levels;
       ref.valid  = chunk.valid_map_base[0];
-      ref.flags  = (section.has_nulls ? 0 : jit::page_flag_no_nulls) |
-                  (level_type_size == 2 ? jit::page_flag_wide_levels : 0);
+      ref.flags  = section.has_nulls ? 0 : jit::page_flag_no_nulls;
     }
   }
   ref.first_checkpoint = claim.first_checkpoint;
@@ -456,21 +683,44 @@ bool is_flat_decode_eligible(PageInfo const& page,
 std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   cudf::detail::hostdevice_span<PageInfo const> pages,
   cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
-  int level_type_size,
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
+  // Dictionary sizes, to tell how wide the indices of a page are.
+  std::vector<int32_t> dict_entries(chunks.size(), 0);
+  for (size_t idx = 0; idx < pages.size(); ++idx) {
+    auto const& page = pages[idx];
+    if ((page.flags & PAGEINFO_FLAGS_DICTIONARY) != 0) {
+      dict_entries[page.chunk_idx] = page.num_input_values;
+    }
+  }
+
   std::vector<flat_page_claim> claims;
+  // Claims that need checkpoints, by how their index stream is walked.
+  std::vector<uint32_t> serial_ids;
+  std::vector<uint32_t> windowed_ids;
   size_t num_checkpoints = 0;
   for (size_t idx = 0; idx < pages.size(); ++idx) {
     auto const& page = pages[idx];
     if (page.kernel_mask != decode_kernel_mask::FLAT_TILES) { continue; }
-    auto const& chunk = chunks[page.chunk_idx];
-    auto const shape  = shape_of(page, chunk);
+    auto const& chunk  = chunks[page.chunk_idx];
+    auto const shape   = shape_of(page, chunk);
+    auto const is_dict = (shape & flat_shape_dict) != 0;
+    auto const stride  = jit::checkpoint_stride(is_dict, (shape & flat_shape_nullable) != 0);
+    auto const claim   = static_cast<uint32_t>(claims.size());
     claims.push_back({static_cast<uint32_t>(idx), static_cast<uint32_t>(num_checkpoints), shape});
     num_checkpoints +=
-      cudf::detail::div_rounding_up_safe<size_t>(page.num_input_values, jit::tile_rows) *
-      jit::checkpoint_stride((shape & flat_shape_dict) != 0, (shape & flat_shape_nullable) != 0);
+      cudf::detail::div_rounding_up_safe<size_t>(page.num_input_values, jit::tile_rows) * stride;
+    if (stride == 0) { continue; }
+    // Level streams, and index streams much smaller than their bit-packed size, hold mostly
+    // short runs. Walking those takes the whole block; long runs are walked by one thread.
+    auto const bit_width =
+      std::bit_width(static_cast<uint32_t>(std::max(dict_entries[page.chunk_idx], 1) - 1));
+    auto const packed_bits = static_cast<uint64_t>(page.num_input_values) * bit_width;
+    auto const is_dense =
+      (shape & flat_shape_nullable) != 0 or
+      static_cast<uint64_t>(page.uncompressed_page_size) * 8 * 20 < packed_bits * 19;
+    (is_dense ? windowed_ids : serial_ids).push_back(claim);
   }
   CUDF_EXPECTS(num_checkpoints <= std::numeric_limits<uint32_t>::max(),
                "Too many tiles in a subpass",
@@ -488,13 +738,28 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   plan->null_counts =
     cuda::device_buffer<int32_t>(stream, mr.get_temporary_mr(), claims.size(), cuda::no_init);
 
-  if (not claims.empty() and num_checkpoints != 0) {
-    prepare_flat_pages_kernel<<<claims.size(), prepare_block_size, 0, stream.get()>>>(
+  plan->prepare_order =
+    cudf::detail::hostdevice_vector<uint32_t>(serial_ids.size() + windowed_ids.size(), stream, mr);
+  std::copy(windowed_ids.begin(),
+            windowed_ids.end(),
+            std::copy(serial_ids.begin(), serial_ids.end(), plan->prepare_order.begin()));
+  plan->prepare_order.host_to_device_async(stream);
+  if (not serial_ids.empty()) {
+    prepare_flat_pages_kernel<false>
+      <<<serial_ids.size(), prepare_block_size, 0, stream.get()>>>(pages.device_ptr(),
+                                                                   chunks,
+                                                                   plan->claims.device_ptr(),
+                                                                   plan->prepare_order.device_ptr(),
+                                                                   plan->checkpoints.data());
+    CUDF_CUDA_TRY(cudaGetLastError());
+  }
+  if (not windowed_ids.empty()) {
+    prepare_flat_pages_kernel<true><<<windowed_ids.size(), prepare_block_size, 0, stream.get()>>>(
       pages.device_ptr(),
       chunks,
       plan->claims.device_ptr(),
-      plan->checkpoints.data(),
-      level_type_size);
+      plan->prepare_order.device_ptr(serial_ids.size()),
+      plan->checkpoints.data());
     CUDF_CUDA_TRY(cudaGetLastError());
   }
   return plan;
@@ -506,7 +771,6 @@ void decode_flat_pages(flat_decode_plan& plan,
                        cudf::host_span<void* const> column_data,
                        size_t min_row,
                        size_t num_rows,
-                       int level_type_size,
                        kernel_error::pointer error_code,
                        cuda::stream_ref stream,
                        cudf::memory_resources mr)
@@ -568,7 +832,6 @@ void decode_flat_pages(flat_decode_plan& plan,
     plan.claims,
     min_row,
     num_rows,
-    level_type_size,
     plan.tile_offsets.device_ptr(),
     plan.page_refs.data(),
     plan.tiles.data(),

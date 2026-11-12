@@ -20,12 +20,9 @@ inline constexpr uint32_t tile_rows_log2 = 10;
 /// Thread block size of every tile decode kernel. Warps of a block do not cooperate.
 inline constexpr int decode_flat_block_size = 128;
 
-/// Set in `page_ref::flags` when a page of a nullable column holds no nulls. Such a page has no
-/// level buffer and its rows are not written to the validity mask.
+/// Set in `page_ref::flags` when a page of a nullable column holds no nulls. Its levels are not
+/// read and its rows are not written to the validity mask.
 inline constexpr uint8_t page_flag_no_nulls = 1;
-
-/// Set in `page_ref::flags` when the pre-decoded definition levels are two bytes wide.
-inline constexpr uint8_t page_flag_wide_levels = 2;
 
 /**
  * @brief Describes one flat fixed-width data page for one decode call.
@@ -37,7 +34,7 @@ struct page_ref {
   uint8_t const* values;      ///< PLAIN: the values. Dictionary: the index stream after its bit
                               ///< width byte
   uint8_t const* dict;        ///< Dictionary values; unused for PLAIN pages
-  uint8_t const* levels;      ///< One pre-decoded definition level per page row; nullable only
+  uint8_t const* levels;      ///< Definition level stream, which ends at `values`; nullable only
   uint32_t* valid;            ///< Validity mask of the output column; nullable only
   uint32_t values_size;       ///< Size of `values` in bytes
   uint32_t dict_entries;      ///< Number of entries in `dict`
@@ -69,8 +66,9 @@ struct tile_ref {
  * the middle of the stream. Each stage of a kernel declares how many entries per tile it uses
  * and gives the two fields the meaning its stream needs:
  * - dictionary indices: entry `k` locates the run that holds value `k * tile_rows`;
- * - definition levels: entry `k` holds, in `first_value`, the number of non-null rows before
- *   page row `k * tile_rows`.
+ * - definition levels: two entries; the first locates the run that holds the level of page
+ *   row `k * tile_rows`, the second holds, in `first_value`, the number of non-null rows before
+ *   that row.
  *
  * Tile `k` of a page owns entries `[first_checkpoint + k * stride, + stride)`, the value
  * stream's entry first and the level stream's after it.
@@ -93,7 +91,7 @@ __host__ __device__
   [[nodiscard]] constexpr uint32_t
   checkpoint_stride(bool is_dict, bool nullable)
 {
-  return static_cast<uint32_t>(is_dict) + static_cast<uint32_t>(nullable);
+  return static_cast<uint32_t>(is_dict) + 2 * static_cast<uint32_t>(nullable);
 }
 
 }  // namespace cudf::io::parquet::jit
