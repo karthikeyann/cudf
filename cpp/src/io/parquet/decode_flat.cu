@@ -6,6 +6,7 @@
 #include "decode_flat.hpp"
 #include "io/utilities/hostdevice_vector.hpp"
 #include "jit/decode_flat.cuh"
+#include "timestamp_utils.cuh"
 
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
@@ -658,8 +659,11 @@ bool is_flat_decode_eligible(PageInfo const& page,
     default: return false;
   }
   // The value must be stored as is: no narrowing, widening or timestamp scaling.
-  if (not cudf::is_fixed_width(output_type) or cudf::size_of(output_type) != in_bytes or
-      chunk.ts_clock_rate != 0) {
+  if (not cudf::is_fixed_width(output_type) or cudf::size_of(output_type) != in_bytes) {
+    return false;
+  }
+  if (chunk.physical_type == Type::INT64 and chunk.ts_clock_rate != 0 and
+      calc_timestamp_scale(chunk.logical_type, chunk.ts_clock_rate) != 0) {
     return false;
   }
 
