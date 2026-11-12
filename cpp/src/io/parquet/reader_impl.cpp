@@ -271,6 +271,64 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
       BitAnd(page.kernel_mask, decode_kernel_mask::DELTA_BINARY) != 0 && not mapped;
   });
 
+  // Let the leaves of the output filter's predicates decode their columns: a leaf stores the
+  // value like the default one and also writes whether the row passes its predicate.
+  std::vector<flat_column_leaf> column_leaves;
+  // Keep flags of the predicates whose leaves decode a column, with each predicate's index and
+  // the index of its input column.
+  struct decode_predicate {
+    size_t predicate;
+    size_t column;
+    rmm::device_uvector<bool> keep;
+  };
+  std::vector<decode_predicate> decode_predicates;
+  auto const has_flat_tiles =
+    BitAnd(kernel_mask, decode_kernel_mask::FLAT_TILES) != 0 and subpass.flat_decode != nullptr;
+  if (has_flat_tiles and _options.use_jit_decode_filter and
+      _expr_conv.get_converted_expr().has_value()) {
+    std::vector<data_type> column_types(_output_buffers.size());
+    std::ranges::transform(
+      _output_buffers, column_types.begin(), [](auto const& buffer) { return buffer.type; });
+    plan_fused_filter(column_types);
+  }
+  if (has_flat_tiles and _fused_filter != nullptr) {
+    column_leaves.resize(_input_columns.size());
+    auto const& predicates = _fused_filter->predicates();
+    for (size_t i = 0; i < predicates.size(); ++i) {
+      // A chunk of the flat input column that is decoded into the predicate's output column.
+      auto chunk = std::optional<size_t>{};
+      for (size_t c = 0; c < pass.chunks.size() and not chunk.has_value(); ++c) {
+        auto const& input = _input_columns[pass.chunks[c].src_col_index];
+        if (input.nesting.size() == 1 and input.nesting[0] == predicates[i].column_index) {
+          chunk = c;
+        }
+      }
+      if (not chunk.has_value()) { continue; }
+      auto const column = static_cast<size_t>(pass.chunks[*chunk].src_col_index);
+      auto& leaf        = column_leaves[column];
+      // A column has one leaf; another predicate on it is evaluated after decoding.
+      if (leaf.ctx.keep != nullptr) { continue; }
+      auto const kernels = _fused_filter->get_decode_kernels(
+        i, pass.chunks[*chunk].max_level[level_type::DEFINITION] > 0);
+      if (kernels.plain == nullptr and kernels.dict == nullptr) { continue; }
+
+      // The flags belong to the reader's stream. They are allocated and zeroed on it here,
+      // before the decode streams are forked from it, so the decode kernels run after the
+      // zeroing; and the reader, which reads the flags on its stream after joining the decode
+      // streams, frees them in the order of that stream. Flags owned by a decode stream could be
+      // freed, and given to another reader, while a kernel on this reader's stream still reads
+      // them. Rows a leaf is never called for, the nulls, stay dropped.
+      decode_predicates.push_back({i,
+                                   column,
+                                   cudf::detail::make_zeroed_device_uvector_async<bool>(
+                                     num_rows, _stream, _mr.get_temporary_mr())});
+      leaf.ctx.keep = reinterpret_cast<uint8_t*>(decode_predicates.back().keep.data());
+      std::ranges::copy(predicates[i].literals, leaf.ctx.lit);
+      leaf.plain_kernel = kernels.plain;
+      leaf.dict_kernel  = kernels.dict;
+    }
+  }
+
   // The producer and the consumer that reads its output share a stream, so the other decoders
   // overlap with them rather than queueing behind them.
   int const nkernels = std::bitset<32>(kernel_mask).count();
@@ -476,58 +534,7 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
       column_data[pass.chunks[c].src_col_index] = chunk_nested_data.host_ptr(chunk_offsets[c])[0];
     }
 
-    // Let the leaves of the output filter's predicates decode their columns: a leaf stores the
-    // value like the default one and also writes whether the row passes its predicate.
     auto const decode_stream = streams[s_idx++];
-    std::vector<flat_column_leaf> column_leaves;
-    // Keep flags of the predicates whose leaves decode a column, with each predicate's index and
-    // the index of its input column.
-    struct decode_predicate {
-      size_t predicate;
-      size_t column;
-      rmm::device_uvector<bool> keep;
-    };
-    std::vector<decode_predicate> decode_predicates;
-    if (_options.use_jit_decode_filter and _expr_conv.get_converted_expr().has_value()) {
-      std::vector<data_type> column_types(_output_buffers.size());
-      std::ranges::transform(
-        _output_buffers, column_types.begin(), [](auto const& buffer) { return buffer.type; });
-      plan_fused_filter(column_types);
-    }
-    if (_fused_filter != nullptr) {
-      column_leaves.resize(_input_columns.size());
-      auto const& predicates = _fused_filter->predicates();
-      for (size_t i = 0; i < predicates.size(); ++i) {
-        // A chunk of the flat input column that is decoded into the predicate's output column.
-        auto chunk = std::optional<size_t>{};
-        for (size_t c = 0; c < pass.chunks.size() and not chunk.has_value(); ++c) {
-          auto const& input = _input_columns[pass.chunks[c].src_col_index];
-          if (input.nesting.size() == 1 and input.nesting[0] == predicates[i].column_index) {
-            chunk = c;
-          }
-        }
-        if (not chunk.has_value()) { continue; }
-        auto const column = static_cast<size_t>(pass.chunks[*chunk].src_col_index);
-        auto& leaf        = column_leaves[column];
-        // A column has one leaf; another predicate on it is evaluated after decoding.
-        if (leaf.ctx.keep != nullptr) { continue; }
-        auto const kernels = _fused_filter->get_decode_kernels(
-          i, pass.chunks[*chunk].max_level[level_type::DEFINITION] > 0);
-        if (kernels.plain == nullptr and kernels.dict == nullptr) { continue; }
-
-        // Zeroed on the stream the kernels run on, so that the flags are cleared before any
-        // leaf writes one. Rows a leaf is never called for, the nulls, stay dropped.
-        decode_predicates.push_back({i,
-                                     column,
-                                     cudf::detail::make_zeroed_device_uvector_async<bool>(
-                                       num_rows, decode_stream, _mr.get_temporary_mr())});
-        leaf.ctx.keep = reinterpret_cast<uint8_t*>(decode_predicates.back().keep.data());
-        std::ranges::copy(predicates[i].literals, leaf.ctx.lit);
-        leaf.plain_kernel = kernels.plain;
-        leaf.dict_kernel  = kernels.dict;
-      }
-    }
-
     decode_flat_pages(*subpass.flat_decode,
                       subpass.pages,
                       pass.chunks,

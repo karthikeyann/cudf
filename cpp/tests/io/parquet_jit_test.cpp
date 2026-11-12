@@ -912,6 +912,49 @@ TEST_F(ParquetJitTest, ReaderDecodesRangeFilterOfSeveralColumns)
   EXPECT_EQ(public_stats.fallback, after.fallback);
 }
 
+TEST_F(ParquetJitTest, ConcurrentReadersDecodeRangeFilter)
+{
+  // Readers on several threads share the decode streams. The keep flags a reader's leaves write
+  // must stay its own until the reader has finished using them.
+  auto const table    = make_filter_table(200'000);
+  auto const filepath = temp_env->get_temp_filepath("ConcurrentReadersDecodeRangeFilter.parquet");
+  cudf::io::write_parquet(
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{filepath}, table->view())
+      .row_group_size_rows(50'000));
+
+  auto set           = filter_set{};
+  auto const& filter = make_range_filter(set);
+  auto const read    = [&](bool enabled) {
+    return cudf::io::read_parquet(
+      cudf::io::parquet_reader_options::builder(cudf::io::source_info{filepath})
+        .filter(filter)
+        .use_jit_decode_filter(enabled)
+        .use_tile_decode(enabled));
+  };
+  auto const expected = read(false);
+  ASSERT_GT(expected.tbl->num_rows(), 0);
+  // Link the kernels before the threads start.
+  CUDF_TEST_EXPECT_TABLES_EQUAL(read(true).tbl->view(), expected.tbl->view());
+
+  constexpr int num_threads = 8;
+  constexpr int num_reads   = 40;
+  auto num_mismatches       = std::vector<int>(num_threads, 0);
+  auto threads              = std::vector<std::thread>{};
+  for (auto t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&, t] {
+      for (auto i = 0; i < num_reads; ++i) {
+        auto const result = read(true);
+        if (result.tbl->num_rows() != expected.tbl->num_rows()) { ++num_mismatches[t]; }
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  // A reader that lost its flags to another thread keeps a different set of rows.
+  EXPECT_THAT(num_mismatches, testing::Each(0));
+}
+
 TEST_F(ParquetJitTest, ReaderWithFilterOnlyAndPrependedColumns)
 {
   auto const table    = make_filter_table(30'000);
