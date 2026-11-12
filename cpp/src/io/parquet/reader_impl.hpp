@@ -610,6 +610,10 @@ class reader_impl {
   // be selected. Read here rather than in a constructor body because
   // `hybrid_scan_reader_impl` reaches this class through the default constructor.
   bool _nz_map_enabled{cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_NZ_MAP", false)};
+
+  // Whether flat fixed-width pages are decoded by the tile decode kernels. Set from the
+  // `use_tile_decode` reader option; LIBCUDF_PARQUET_TILE_DECODE turns it on for every reader.
+  bool _tile_decode_enabled{false};
 };
 
 }  // namespace cudf::io::parquet::detail
