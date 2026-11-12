@@ -418,7 +418,9 @@ __device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
  * @brief Records the checkpoints of claimed pages, one block per page.
  *
  * Walks the definition level stream of a nullable page and the index stream of a dictionary
- * page, and counts the non-null rows before every tile of a nullable page.
+ * page, and counts the non-null rows before every tile of a nullable page. Launched with one
+ * row of blocks, a block does all of it for its page; with two rows, block row 0 handles the
+ * levels and block row 1 the index stream.
  *
  * @tparam windowed Whether the walk of a stream may use the whole block
  */
@@ -440,8 +442,12 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   uint32_t const num_tiles     = cudf::detail::div_rounding_up_safe(num_values, jit::tile_rows);
   jit::checkpoint* const first = checkpoints + claim.first_checkpoint;
   value_section const section  = locate_value_section(page, chunk, is_dict);
+  // With two rows of blocks the level stream and the index stream of a page are walked by
+  // different blocks, so that the two walks overlap.
+  bool const walks_levels = gridDim.y == 1 or blockIdx.y == 0;
+  bool const walks_values = gridDim.y == 1 or blockIdx.y == 1;
 
-  if (nullable and section.has_nulls) {
+  if (walks_levels and nullable and section.has_nulls) {
     // Levels: resume entries from a walk of the level stream, then the non-null rows of
     // every tile, one tile per thread, turned into ranks by one thread.
     jit::hybrid_stream const levels{section.levels, section.levels_size, 1};
@@ -468,7 +474,7 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
     }
   }
 
-  if (is_dict) {
+  if (walks_values and is_dict) {
     __syncthreads();
     walk_hybrid_stream<windowed>(
       jit::hybrid_stream{section.values, section.size, section.bit_width},
@@ -758,12 +764,13 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
     CUDF_CUDA_TRY(cudaGetLastError());
   }
   if (not windowed_ids.empty()) {
-    prepare_flat_pages_kernel<true><<<windowed_ids.size(), prepare_block_size, 0, stream.get()>>>(
-      pages.device_ptr(),
-      chunks,
-      plan->claims.device_ptr(),
-      plan->prepare_order.device_ptr(serial_ids.size()),
-      plan->checkpoints.data());
+    prepare_flat_pages_kernel<true>
+      <<<dim3(windowed_ids.size(), 2), prepare_block_size, 0, stream.get()>>>(
+        pages.device_ptr(),
+        chunks,
+        plan->claims.device_ptr(),
+        plan->prepare_order.device_ptr(serial_ids.size()),
+        plan->checkpoints.data());
     CUDF_CUDA_TRY(cudaGetLastError());
   }
   return plan;
