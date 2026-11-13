@@ -27,6 +27,8 @@
 
 #include <cuda/iterator>
 
+#include <src/io/parquet/decode_flat.hpp>
+
 #include <algorithm>
 #include <iterator>
 #include <memory>
@@ -395,6 +397,172 @@ TEST_F(HybridScanMultifileTest, SparseDictionaryEncodedPages)
     cudf::concatenate(std::vector<cudf::table_view>(num_sources, payload_table), stream, mr);
   auto const expected = cudf::apply_retention_mask(input->view(), row_mask, stream, mr);
   CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected->view(), result.tbl->view());
+}
+
+TEST_F(HybridScanMultifileTest, TileDecodeStoresSurvivingPayloadRows)
+{
+  // Two sources of different sizes. The filter keeps scattered rows of a range of an ascending
+  // column, so the row mask of the payload step prunes pages and drops rows inside the others.
+  // With tile decode, the fixed-width payload columns hold the surviving rows as decoded; the
+  // string column is decoded in full and copied. Every payload form must return the same rows.
+  auto constexpr page_rows = cudf::size_type{1'000};
+  std::mt19937 engine(0x51f3);
+  std::uniform_int_distribution<int> percent(0, 99);
+
+  auto parquet_buffers = std::vector<std::vector<char>>{};
+  for (auto const num_rows : {cudf::size_type{20'011}, cudf::size_type{9'973}}) {
+    std::vector<uint32_t> keys(num_rows);
+    std::vector<int32_t> picks(num_rows);
+    std::vector<int64_t> ints(num_rows);
+    std::vector<bool> ints_valid(num_rows);
+    std::vector<double> doubles(num_rows);
+    std::vector<int32_t> distinct(num_rows);
+    std::vector<std::string> strings(num_rows);
+    for (cudf::size_type i = 0; i < num_rows; ++i) {
+      keys[i]       = i;
+      picks[i]      = percent(engine);
+      ints[i]       = (i * 7) % 300;
+      ints_valid[i] = percent(engine) >= 5;
+      doubles[i]    = (i % 97) * 0.5;
+      distinct[i]   = num_rows - i;
+      strings[i]    = "s" + std::to_string(i % 91);
+    }
+    cudf::test::fixed_width_column_wrapper<uint32_t> col0(keys.begin(), keys.end());
+    cudf::test::fixed_width_column_wrapper<int32_t> col1(picks.begin(), picks.end());
+    cudf::test::fixed_width_column_wrapper<int64_t> col2(
+      ints.begin(), ints.end(), ints_valid.begin());
+    cudf::test::fixed_width_column_wrapper<double> col3(doubles.begin(), doubles.end());
+    cudf::test::fixed_width_column_wrapper<int32_t> col4(distinct.begin(), distinct.end());
+    cudf::test::strings_column_wrapper col5(strings.begin(), strings.end());
+    auto const input = cudf::table_view{{col0, col1, col2, col3, col4, col5}};
+
+    auto metadata = cudf::io::table_input_metadata(input);
+    for (std::size_t i = 0; i < metadata.column_metadata.size(); ++i) {
+      metadata.column_metadata[i].set_name("col" + std::to_string(i));
+    }
+    auto& parquet_buffer = parquet_buffers.emplace_back();
+    auto const write_options =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&parquet_buffer}, input)
+        .metadata(std::move(metadata))
+        .row_group_size_rows(num_rows / 2)
+        .max_page_size_rows(page_rows)
+        .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+        .build();
+    cudf::io::write_parquet(write_options);
+  }
+
+  // Filtering AST - 2'345 <= col0 < 8'765 and col1 < 30
+  auto lower_value = cudf::numeric_scalar<uint32_t>(2'345);
+  auto upper_value = cudf::numeric_scalar<uint32_t>(8'765);
+  auto pick_value  = cudf::numeric_scalar<int32_t>(30);
+  auto lower       = cudf::ast::literal(lower_value);
+  auto upper       = cudf::ast::literal(upper_value);
+  auto pick        = cudf::ast::literal(pick_value);
+  auto col_ref_0   = cudf::ast::column_name_reference("col0");
+  auto col_ref_1   = cudf::ast::column_name_reference("col1");
+  auto above       = cudf::ast::operation(cudf::ast::ast_operator::GREATER_EQUAL, col_ref_0, lower);
+  auto below       = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_0, upper);
+  auto picked      = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_1, pick);
+  auto in_range    = cudf::ast::operation(cudf::ast::ast_operator::LOGICAL_AND, above, below);
+  auto filter_expression =
+    cudf::ast::operation(cudf::ast::ast_operator::LOGICAL_AND, in_range, picked);
+
+  auto const source_info = build_source_info(parquet_buffers);
+  auto const stream      = cudf::get_default_stream();
+  auto const mr          = cudf::get_current_device_resource_ref();
+
+  auto const expected = cudf::io::read_parquet(
+    cudf::io::parquet_reader_options::builder(source_info).filter(filter_expression), stream, mr);
+  ASSERT_GT(expected.tbl->num_rows(), 0);
+
+  auto const read = [&](bool use_tile_decode) {
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    auto const add = [&](auto&& filter_and_payload) {
+      tables.push_back(std::move(std::get<0>(filter_and_payload)));
+      tables.push_back(std::move(std::get<1>(filter_and_payload)));
+    };
+    add(
+      hybrid_scan_multifile(source_info, filter_expression, {}, true, stream, mr, use_tile_decode));
+    add(chunked_hybrid_scan_multifile(
+      source_info, filter_expression, {}, true, stream, mr, use_tile_decode));
+    add(chunked_sparse_hybrid_scan_multifile(
+      source_info, filter_expression, {}, true, stream, mr, use_tile_decode));
+    return tables;
+  };
+
+  auto const generic = read(false);
+  // An equal result alone would also pass if no column was stored compacted.
+  auto const num_compacted_before = cudf::io::parquet::detail::num_tile_decode_compacted_columns();
+  auto const tiles                = read(true);
+  EXPECT_GT(cudf::io::parquet::detail::num_tile_decode_compacted_columns(), num_compacted_before);
+  for (std::size_t i = 0; i < generic.size(); ++i) {
+    SCOPED_TRACE("table " + std::to_string(i));
+    CUDF_TEST_EXPECT_TABLES_EQUAL(generic[i]->view(), tiles[i]->view());
+    for (cudf::size_type c = 0; c < generic[i]->num_columns(); ++c) {
+      EXPECT_EQ(generic[i]->get_column(c).null_count(), tiles[i]->get_column(c).null_count());
+    }
+    // Odd entries are the payload tables
+    if (i % 2 == 1) {
+      CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.tbl->select({2, 3, 4, 5}), tiles[i]->view());
+    }
+  }
+}
+
+TEST_F(HybridScanMultifileTest, TileDecodeDoesNotCompactColumnWithOtherPages)
+{
+  // The only payload column has PLAIN pages in one source, which the tile decode kernels
+  // decode, and DELTA_BINARY_PACKED pages in the other, which they do not. Such a column is
+  // decoded in full and its surviving rows are copied.
+  auto constexpr num_rows = cudf::size_type{6'007};
+  auto parquet_buffers    = std::vector<std::vector<char>>{};
+  for (auto const encoding :
+       {cudf::io::column_encoding::PLAIN, cudf::io::column_encoding::DELTA_BINARY_PACKED}) {
+    std::vector<uint32_t> keys(num_rows);
+    std::vector<int64_t> ints(num_rows);
+    std::vector<bool> ints_valid(num_rows);
+    for (cudf::size_type i = 0; i < num_rows; ++i) {
+      keys[i]       = i;
+      ints[i]       = (i * 13) % 1'000;
+      ints_valid[i] = i % 9 != 0;
+    }
+    cudf::test::fixed_width_column_wrapper<uint32_t> col0(keys.begin(), keys.end());
+    cudf::test::fixed_width_column_wrapper<int64_t> col1(
+      ints.begin(), ints.end(), ints_valid.begin());
+    auto const input = cudf::table_view{{col0, col1}};
+    auto metadata    = cudf::io::table_input_metadata(input);
+    metadata.column_metadata[0].set_name("col0");
+    metadata.column_metadata[1].set_name("col1").set_encoding(encoding);
+    auto& parquet_buffer = parquet_buffers.emplace_back();
+    auto const write_options =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&parquet_buffer}, input)
+        .metadata(std::move(metadata))
+        .max_page_size_rows(1'000)
+        .write_v2_headers(encoding != cudf::io::column_encoding::PLAIN)
+        .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+        .build();
+    cudf::io::write_parquet(write_options);
+  }
+
+  // Filtering AST - col0 >= 1'234
+  auto bound_value = cudf::numeric_scalar<uint32_t>(1'234);
+  auto bound       = cudf::ast::literal(bound_value);
+  auto col_ref_0   = cudf::ast::column_name_reference("col0");
+  auto filter_expression =
+    cudf::ast::operation(cudf::ast::ast_operator::GREATER_EQUAL, col_ref_0, bound);
+
+  auto const source_info = build_source_info(parquet_buffers);
+  auto const stream      = cudf::get_default_stream();
+  auto const mr          = cudf::get_current_device_resource_ref();
+  auto const expected    = cudf::io::read_parquet(
+    cudf::io::parquet_reader_options::builder(source_info).filter(filter_expression), stream, mr);
+
+  auto const num_claimed_before   = cudf::io::parquet::detail::num_tile_decode_claimed_pages();
+  auto const num_compacted_before = cudf::io::parquet::detail::num_tile_decode_compacted_columns();
+  auto const [filter_table, payload_table] =
+    hybrid_scan_multifile(source_info, filter_expression, {}, true, stream, mr, true);
+  EXPECT_GT(cudf::io::parquet::detail::num_tile_decode_claimed_pages(), num_claimed_before);
+  EXPECT_EQ(cudf::io::parquet::detail::num_tile_decode_compacted_columns(), num_compacted_before);
+  CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected.tbl->select({1}), payload_table->view());
 }
 
 TEST_F(HybridScanMultifileTest, SparsePayloadWithAsymmetricRowGroupOrdering)

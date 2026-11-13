@@ -203,8 +203,16 @@ struct tile_range {
 /**
  * @name Stages of tile decode
  *
- * `decode_tiles` is written once against three stages. A kernel is a composition of one type
+ * `decode_tiles` is written once against four stages. A kernel is a composition of one type
  * per stage, chosen at compile time.
+ *
+ * **Row selection**: decides which rows of the decode call are stored, and where.
+ * - `static constexpr bool compacts`: whether selected rows are stored next to each other.
+ * - Constructor `(row_selection)`.
+ * - `bool none(out_begin, out_end) const`: whether no row in the range is selected.
+ * - `bool select(out_base, lane, stored_row) const`: whether row `out_base + lane` of the
+ *   decode call is selected; if so, `stored_row` is the row it is stored at.
+ * `all_rows` stores row `r` at `r`. `selected_rows` reads a `row_selection`.
  *
  * **Level source**: turns rows into validity and value stream positions.
  * - `static constexpr uint32_t checkpoints_per_tile`: checkpoint entries it needs per tile.
@@ -213,12 +221,13 @@ struct tile_range {
  *   lanes of the warp; holds the per-tile state.
  * - `uint32_t position() const`: position in the value stream of the next non-null row. The
  *   same in every lane.
- * - `bool step(out_base, lane, out_row, value_index)`: handles the 32 output rows starting at
- *   `out_base`, a multiple of 32, of which lane `l` owns row `out_base + l`. Sets `out_row`,
- *   and returns whether that row is a non-null row of the decode call; if so, `value_index`
- *   is the position of its value. Stores the validity of the rows. Called by all lanes. A
- *   source that keeps state shared by the warp rewrites it in one lane, with a warp barrier
- *   before and after the rewrite.
+ * - `bool step(rows, out_base, lane, stored_row, value_index)`: handles the 32 rows of the
+ *   decode call starting at `out_base`, a multiple of 32, of which lane `l` owns row
+ *   `out_base + l`. Returns whether that row is a selected, non-null row of the decode call;
+ *   if so, `stored_row` is where `rows` stores it and `value_index` is the position of its
+ *   value. Stores the validity of the selected rows. Called by all lanes. A source that keeps
+ *   state shared by the warp rewrites it in one lane, with a warp barrier before and after
+ *   the rewrite.
  * - `void finish(null_count, lane)`: adds the nulls of the tile to `*null_count`.
  * `required_levels` and `optional_levels` cover flat columns.
  *
@@ -239,14 +248,60 @@ struct tile_range {
  *   page; a position the page does not hold yields 0.
  * `plain_values` and `dictionary_values` exist.
  *
- * **Leaf**: stores the value of a non-null row, called as `leaf(out, out_row, value)` with the
- * output data pointer of the page's column.
+ * **Leaf**: stores the value of a selected non-null row, called as
+ * `leaf(out, stored_row, value)` with the output data pointer of the page's column.
  *
  * Encoding, value width and nullability are compile-time properties of the stage types, so a
  * composition contains only the code of its stages. Other encodings and column shapes would
  * be further types for the same stages.
  * @{
  */
+
+/**
+ * @brief Row selection that stores every row of the decode call at its own position.
+ */
+struct all_rows {
+  static constexpr bool compacts = false;
+
+  __device__ explicit all_rows(row_selection const&) {}
+
+  [[nodiscard]] __device__ bool none(int32_t, int32_t) const { return false; }
+
+  [[nodiscard]] __device__ bool select(int32_t out_base, uint32_t lane, int32_t& stored_row) const
+  {
+    stored_row = out_base + static_cast<int32_t>(lane);
+    return true;
+  }
+};
+
+/**
+ * @brief Row selection that stores the rows set in a `row_selection` next to each other.
+ */
+struct selected_rows {
+  static constexpr bool compacts = true;
+
+  __device__ explicit selected_rows(row_selection const& selection)
+    : _mask{selection.mask}, _rank{selection.rank}
+  {
+  }
+
+  [[nodiscard]] __device__ bool none(int32_t out_begin, int32_t out_end) const
+  {
+    return _rank[(out_end + 31) >> 5] == _rank[out_begin >> 5];
+  }
+
+  [[nodiscard]] __device__ bool select(int32_t out_base, uint32_t lane, int32_t& stored_row) const
+  {
+    uint32_t const word = _mask[out_base >> 5];
+    stored_row =
+      static_cast<int32_t>(_rank[out_base >> 5] + __popc(word & ((uint32_t{1} << lane) - 1)));
+    return ((word >> lane) & 1) != 0;
+  }
+
+ private:
+  uint32_t const* _mask;
+  uint32_t const* _rank;
+};
 
 /**
  * @brief Level source of a REQUIRED column: every row is valid and holds value `row`.
@@ -270,13 +325,15 @@ struct required_levels {
 
   [[nodiscard]] __device__ uint32_t position() const { return _position; }
 
-  __device__ bool step(int32_t out_base, uint32_t lane, int32_t& out_row, uint32_t& value_index)
+  template <typename Rows>
+  __device__ bool step(
+    Rows const& rows, int32_t out_base, uint32_t lane, int32_t& stored_row, uint32_t& value_index)
   {
-    out_row            = out_base + static_cast<int32_t>(lane);
-    value_index        = static_cast<uint32_t>(out_row - _row_base);
-    int32_t const next = out_base + 32 < _out_end ? out_base + 32 : _out_end;
+    int32_t const out_row = out_base + static_cast<int32_t>(lane);
+    value_index           = static_cast<uint32_t>(out_row - _row_base);
+    int32_t const next    = out_base + 32 < _out_end ? out_base + 32 : _out_end;
     if (next > _out_begin) { _position = static_cast<uint32_t>(next - _row_base); }
-    return out_row >= _out_begin && out_row < _out_end;
+    return out_row >= _out_begin && out_row < _out_end && rows.select(out_base, lane, stored_row);
   }
 
   __device__ void finish(int32_t*, uint32_t) const {}
@@ -341,16 +398,19 @@ struct optional_levels {
 
   [[nodiscard]] __device__ uint32_t position() const { return _position; }
 
-  __device__ bool step(int32_t out_base, uint32_t lane, int32_t& out_row, uint32_t& value_index)
+  template <typename Rows>
+  __device__ bool step(
+    Rows const& rows, int32_t out_base, uint32_t lane, int32_t& stored_row, uint32_t& value_index)
   {
-    out_row             = out_base + static_cast<int32_t>(lane);
-    value_index         = static_cast<uint32_t>(out_row - _row_base);
-    bool const active   = out_row >= _out_begin && out_row < _out_end;
-    int32_t const first = out_base > _out_begin ? out_base : _out_begin;
-    int32_t const last  = out_base + 32 < _out_end ? out_base + 32 : _out_end;
+    int32_t const out_row = out_base + static_cast<int32_t>(lane);
+    value_index           = static_cast<uint32_t>(out_row - _row_base);
+    bool const active     = out_row >= _out_begin && out_row < _out_end;
+    bool const selected   = active && rows.select(out_base, lane, stored_row);
+    int32_t const first   = out_base > _out_begin ? out_base : _out_begin;
+    int32_t const last    = out_base + 32 < _out_end ? out_base + 32 : _out_end;
     if (not _has_nulls) {
       if (last > _out_begin) { _position = static_cast<uint32_t>(last - _row_base); }
-      return active;
+      return selected;
     }
     if (last > first) {
       cover(static_cast<uint32_t>(first - _row_base),
@@ -358,24 +418,34 @@ struct optional_levels {
             static_cast<uint32_t>(_out_end - _row_base),
             lane);
     }
-    bool const valid           = active && level_at(value_index) != 0;
-    uint32_t const active_mask = __ballot_sync(0xffff'ffffu, active);
-    uint32_t const valid_mask  = __ballot_sync(0xffff'ffffu, valid);
-    uint32_t const null_mask   = active_mask & ~valid_mask;
-    value_index                = _position + __popc(valid_mask & ((uint32_t{1} << lane) - 1));
+    bool const valid          = active && level_at(value_index) != 0;
+    uint32_t const valid_mask = __ballot_sync(0xffff'ffffu, valid);
+    value_index               = _position + __popc(valid_mask & ((uint32_t{1} << lane) - 1));
     _position += __popc(valid_mask);
-    _num_nulls += __popc(null_mask);
-    // The mask starts out all valid. A word this warp shares with another tile or page is
-    // updated atomically.
-    if (lane == 0 && _valid != nullptr) {
-      uint32_t* const word = _valid + (out_base >> 5);
-      if (active_mask == 0xffff'ffffu) {
-        *word = valid_mask;
-      } else if (null_mask != 0) {
-        atomicAnd(word, ~null_mask);
+    // The mask starts out all valid.
+    if constexpr (Rows::compacts) {
+      // Stored rows of one step can share words with any other step, so every stored null
+      // clears its own bit.
+      bool const stored_null = selected && not valid;
+      _num_nulls += __popc(__ballot_sync(0xffff'ffffu, stored_null));
+      if (stored_null && _valid != nullptr) {
+        atomicAnd(_valid + (stored_row >> 5), ~(uint32_t{1} << (stored_row & 31)));
+      }
+    } else {
+      // A word this warp shares with another tile or page is updated atomically.
+      uint32_t const active_mask = __ballot_sync(0xffff'ffffu, active);
+      uint32_t const null_mask   = active_mask & ~valid_mask;
+      _num_nulls += __popc(null_mask);
+      if (lane == 0 && _valid != nullptr) {
+        uint32_t* const word = _valid + (out_base >> 5);
+        if (active_mask == 0xffff'ffffu) {
+          *word = valid_mask;
+        } else if (null_mask != 0) {
+          atomicAnd(word, ~null_mask);
+        }
       }
     }
-    return valid;
+    return valid && selected;
   }
 
   __device__ void finish(int32_t* null_count, uint32_t lane) const
@@ -537,8 +607,9 @@ struct dictionary_values {
  * the grid decodes `tiles[w]`. Rows are handled in groups of 32 aligned to the words of the
  * output validity mask, so that lane `l` of a warp owns output row `32 * j + l`.
  *
- * See "Stages of tile decode" for the contracts of the three stage types.
+ * See "Stages of tile decode" for the contracts of the four stage types.
  *
+ * @tparam Rows Row selection of the decode call
  * @tparam LevelSource Level source of the pages
  * @tparam ValueSource Value source of the pages
  * @tparam steps Number of 32-row groups a warp decodes per loop turn. The loads of one turn are
@@ -551,16 +622,18 @@ struct dictionary_values {
  * `ValueSource::checkpoints_per_tile + LevelSource::checkpoints_per_tile` entries per tile,
  * the value source's first
  * @param outputs Output data pointer of each column, indexed by `page_ref::output_idx`
- * @param null_counts One counter per entry of `pages`; the nulls found are added to it
+ * @param null_counts One counter per entry of `pages`; the stored nulls are added to it
+ * @param selection Rows of the decode call to store; read only if `Rows` needs it
  * @param leaf The leaf
  */
-template <typename LevelSource, typename ValueSource, uint32_t steps, typename Leaf>
+template <typename Rows, typename LevelSource, typename ValueSource, uint32_t steps, typename Leaf>
 __device__ inline void decode_tiles(page_ref const* pages,
                                     tile_ref const* tiles,
                                     uint32_t num_tiles,
                                     checkpoint const* checkpoints,
                                     void* const* outputs,
                                     int32_t* null_counts,
+                                    row_selection selection,
                                     Leaf leaf)
 {
   constexpr uint32_t warp_size = 32;
@@ -586,6 +659,9 @@ __device__ inline void decode_tiles(page_ref const* pages,
   range.out_begin = static_cast<int32_t>(range.row_begin) + page.row_base;
   range.out_end   = static_cast<int32_t>(range.row_end) + page.row_base;
 
+  Rows const rows(selection);
+  if (rows.none(range.out_begin, range.out_end)) { return; }
+
   checkpoint const* const entries = checkpoints + page.first_checkpoint;
   LevelSource levels(page, tile, range, entries, stride, ValueSource::checkpoints_per_tile, lane);
   ValueSource values(page, entries, stride, 0, levels.position(), lane);
@@ -593,14 +669,18 @@ __device__ inline void decode_tiles(page_ref const* pages,
   constexpr auto turn_rows = static_cast<int32_t>(warp_size * steps);
   for (int32_t turn_base = range.out_begin & ~31; turn_base < range.out_end;
        turn_base += turn_rows) {
-    // Output row, validity and value stream position of this lane for each step of the turn.
-    int32_t out_row[steps];
+    // Where this lane's row is stored, whether it holds a value to store, and the position of
+    // that value in the value stream, for each step of the turn.
+    int32_t stored_row[steps];
     bool valid[steps];
     uint32_t value_index[steps];
     uint32_t const need_begin = levels.position();
     for (uint32_t step = 0; step < steps; ++step) {
-      valid[step] = levels.step(
-        turn_base + static_cast<int32_t>(step * warp_size), lane, out_row[step], value_index[step]);
+      valid[step] = levels.step(rows,
+                                turn_base + static_cast<int32_t>(step * warp_size),
+                                lane,
+                                stored_row[step],
+                                value_index[step]);
     }
     int32_t const first      = turn_base > range.out_begin ? turn_base : range.out_begin;
     uint32_t const remaining = static_cast<uint32_t>(range.out_end - first);
@@ -613,7 +693,7 @@ __device__ inline void decode_tiles(page_ref const* pages,
       if (valid[step]) { value[step] = values.get(value_index[step]); }
     }
     for (uint32_t step = 0; step < steps; ++step) {
-      if (valid[step]) { leaf(out, static_cast<uint32_t>(out_row[step]), value[step]); }
+      if (valid[step]) { leaf(out, static_cast<uint32_t>(stored_row[step]), value[step]); }
     }
   }
   levels.finish(null_counts + tile.page, lane);

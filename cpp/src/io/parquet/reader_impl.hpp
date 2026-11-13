@@ -652,6 +652,25 @@ class reader_impl {
 
   // Whether flat fixed-width pages are decoded by the tile decode kernels.
   bool _tile_decode_enabled{false};
+
+  /**
+   * @brief Rows of the current output chunk that a row mask keeps, and the columns that store
+   * only those rows.
+   */
+  struct selected_rows_info {
+    // Per input column, whether its output holds the selected rows only, next to each other
+    std::vector<uint8_t> compacted_columns;
+    // One bit per row of the output chunk, set for the selected rows
+    std::unique_ptr<cuda::device_buffer<bitmask_type>> mask;
+    // Per word of `mask`, the number of selected rows before it, and the total at the end
+    cuda::device_buffer<uint32_t> rank;
+    // Number of selected rows
+    size_type num_selected;
+  };
+
+  // Set by a reader that knows the row mask of an output chunk before it decodes the chunk;
+  // empty otherwise.
+  std::optional<selected_rows_info> _selected_rows;
 };
 
 }  // namespace cudf::io::parquet::detail

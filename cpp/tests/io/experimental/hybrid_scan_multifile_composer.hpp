@@ -25,6 +25,7 @@
  * @param case_sensitive_names Whether column names are case sensitive
  * @param stream CUDA stream for hybrid scan reader
  * @param mr Device memory resource
+ * @param use_tile_decode Whether to set the `use_tile_decode` reader option
  *
  * @return Tuple of filter and payload tables
  */
@@ -34,7 +35,8 @@ std::tuple<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>> hybrid_sc
   std::optional<std::vector<std::string>> const& payload_column_names,
   bool case_sensitive_names,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  bool use_tile_decode = false);
 
 /**
  * @brief Read parquet sources with the hybrid scan multifile reader in a single step
@@ -68,6 +70,7 @@ std::unique_ptr<cudf::table> hybrid_scan_multifile_single_step(
  * @param case_sensitive_names Whether column names are case sensitive
  * @param stream CUDA stream for hybrid scan reader
  * @param mr Device memory resource
+ * @param use_tile_decode Whether to set the `use_tile_decode` reader option
  *
  * @return Tuple of filter and payload tables
  */
@@ -77,7 +80,8 @@ chunked_hybrid_scan_multifile(cudf::io::source_info const& source_info,
                               std::optional<std::vector<std::string>> const& payload_column_names,
                               bool case_sensitive_names,
                               cuda::stream_ref stream,
-                              rmm::device_async_resource_ref mr);
+                              rmm::device_async_resource_ref mr,
+                              bool use_tile_decode = false);
 
 /**
  * @brief Read parquet sources using chunked materialization and page-level payload I/O
@@ -91,6 +95,7 @@ chunked_hybrid_scan_multifile(cudf::io::source_info const& source_info,
  * @param case_sensitive_names Whether column names are case sensitive
  * @param stream CUDA stream for hybrid scan reader
  * @param mr Device memory resource
+ * @param use_tile_decode Whether to set the `use_tile_decode` reader option
  *
  * @return Tuple of filter and payload tables
  */
@@ -101,7 +106,8 @@ chunked_sparse_hybrid_scan_multifile(
   std::optional<std::vector<std::string>> const& payload_column_names,
   bool case_sensitive_names,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr);
+  rmm::device_async_resource_ref mr,
+  bool use_tile_decode = false);
 
 /**
  * @brief Read parquet sources with the hybrid scan multifile reader in a single step using chunked

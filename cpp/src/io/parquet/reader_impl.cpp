@@ -490,15 +490,20 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
     for (size_t c = 0; c < pass.chunks.size(); c++) {
       column_data[pass.chunks[c].src_col_index] = chunk_nested_data.host_ptr(chunk_offsets[c])[0];
     }
-    decode_flat_pages(*subpass.flat_decode,
-                      subpass.pages,
-                      pass.chunks,
-                      column_data,
-                      skip_rows,
-                      num_rows,
-                      error_code.data(),
-                      streams[s_idx++],
-                      _mr.as_temporary());
+    decode_flat_pages(
+      *subpass.flat_decode,
+      subpass.pages,
+      pass.chunks,
+      column_data,
+      _selected_rows ? cudf::host_span<uint8_t const>{_selected_rows->compacted_columns}
+                     : cudf::host_span<uint8_t const>{},
+      _selected_rows ? row_selection{_selected_rows->mask->data(), _selected_rows->rank.data()}
+                     : row_selection{},
+      skip_rows,
+      num_rows,
+      error_code.data(),
+      streams[s_idx++],
+      _mr.as_temporary());
   }
 
   // launch the catch-all page decoder
@@ -1355,6 +1360,11 @@ void reader_impl::update_output_nullmasks_for_pruned_pages(cudf::host_span<bool 
       // Make sure the row bounds are valid
       CUDF_EXPECTS(std::cmp_greater_equal(start_row, 0) and std::cmp_less_equal(end_row, num_rows),
                    "Invalid row bounds");
+
+      // A column that stores selected rows only has no rows of a pruned page
+      if (_selected_rows and _selected_rows->compacted_columns[chunk_idx % num_columns] != 0) {
+        return;
+      }
 
       auto& input_col      = _input_columns[chunk_idx % num_columns];
       auto const max_depth = input_col.nesting_depth();

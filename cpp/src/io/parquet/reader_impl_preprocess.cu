@@ -1132,8 +1132,12 @@ void reader_impl::allocate_columns(read_mode mode,
   auto unwritten_bufs = cudf::detail::make_empty_pinned_vector<cudf::device_span<cuda::std::byte>>(
     _input_columns.size(), _stream);
 
-  for (auto const& input_col : _input_columns) {
+  for (size_t col_idx = 0; col_idx < _input_columns.size(); ++col_idx) {
+    auto const& input_col  = _input_columns[col_idx];
     size_t const max_depth = input_col.nesting_depth();
+    // A column that stores only the rows a row mask keeps is sized for them and is an output
+    auto const stores_selected_rows =
+      _selected_rows and _selected_rows->compacted_columns[col_idx] != 0;
 
     auto* cols                 = &_output_buffers;
     bool has_nullable_ancestor = false;
@@ -1155,15 +1159,18 @@ void reader_impl::allocate_columns(read_mode mode,
         // add 1 for the offset if this is a list column
         // we're going to start null mask as all valid and then turn bits off if necessary
         auto const out_buf_size =
-          out_buf.type.id() == type_id::LIST && l_idx < max_depth ? num_rows + 1 : num_rows;
+          stores_selected_rows
+            ? static_cast<size_t>(_selected_rows->num_selected)
+            : (out_buf.type.id() == type_id::LIST && l_idx < max_depth ? num_rows + 1 : num_rows);
         CUDF_EXPECTS(out_buf_size <= std::numeric_limits<cudf::size_type>::max(),
                      "Number of rows exceeds cudf's column size limit",
                      std::overflow_error);
-        out_buf.create_with_mask(out_buf_size,
-                                 cudf::mask_state::UNINITIALIZED,
-                                 false,
-                                 _stream,
-                                 buffer_mr(out_buf, input_col, l_idx));
+        out_buf.create_with_mask(
+          out_buf_size,
+          cudf::mask_state::UNINITIALIZED,
+          false,
+          _stream,
+          stores_selected_rows ? _mr.get_output_mr() : buffer_mr(out_buf, input_col, l_idx));
         nullmask_bufs.emplace_back(
           out_buf.null_mask(),
           cudf::detail::round_up_safe(out_buf.null_mask_size(), sizeof(cudf::bitmask_type)) /

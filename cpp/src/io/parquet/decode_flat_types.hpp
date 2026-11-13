@@ -57,6 +57,18 @@ struct page_ref {
 static_assert(sizeof(page_ref) == 64);
 
 /**
+ * @brief Rows of a decode call that are stored, for kernels that store selected rows only.
+ *
+ * Selected rows are stored next to each other in row order: row `r` is stored at the number
+ * of selected rows before it.
+ */
+struct row_selection {
+  uint32_t const* mask;  ///< One bit per row of the decode call; set if the row is stored
+  uint32_t const* rank;  ///< Per word of `mask`, the number of set bits in the words before it,
+                         ///< with one more entry for the total
+};
+
+/**
  * @brief Names one tile of one page: page rows `[tile * tile_rows, (tile + 1) * tile_rows)`.
  */
 struct tile_ref {
