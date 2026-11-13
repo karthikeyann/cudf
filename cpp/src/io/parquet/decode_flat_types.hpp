@@ -5,11 +5,18 @@
 
 #pragma once
 
+#include <cudf/types.hpp>
+
 #include <cuda/std/cstdint>
 
 #include <cstdint>
 
-namespace cudf::io::parquet::jit {
+/**
+ * @file decode_flat_types.hpp
+ * @brief Types shared by the host and device sides of tile decode of flat fixed-width pages.
+ */
+
+namespace cudf::io::parquet::detail {
 
 /// Number of page rows covered by one tile. A tile is decoded by one warp.
 inline constexpr uint32_t tile_rows = 1024;
@@ -34,16 +41,16 @@ struct page_ref {
   uint8_t const* values;      ///< PLAIN: the values. Dictionary: the index stream after its bit
                               ///< width byte
   uint8_t const* dict;        ///< Dictionary values; unused for PLAIN pages
-  uint8_t const* levels;      ///< Definition level stream, read up to `values`; nullable only
+  uint8_t const* levels;      ///< Definition level stream; nullable only
   uint32_t* valid;            ///< Validity mask of the output column; nullable only
   uint32_t values_size;       ///< Size of `values` in bytes
   uint32_t dict_entries;      ///< Number of entries in `dict`
-  uint32_t dict_first;        ///< Added to the dictionary index passed to the leaf
+  uint32_t levels_size;       ///< Size of `levels` in bytes
   int32_t row_base;           ///< Output row of page row 0; negative if the page starts earlier
   uint32_t first_row;         ///< First page row of the decode call
   uint32_t num_rows;          ///< Number of page rows of the decode call; 0 skips the page
   uint32_t first_checkpoint;  ///< Index of the page's first entry in the checkpoint array
-  uint16_t ctx_idx;           ///< Index of the page's column in the leaf context array
+  uint16_t output_idx;        ///< Index of the page's column in the array of output pointers
   uint8_t bit_width;          ///< Dictionary index bit width, at most 32
   uint8_t flags;              ///< Combination of `page_flag_*`
 };
@@ -60,11 +67,10 @@ struct tile_ref {
 /**
  * @brief Resume state of one sequential stream of a page, recorded every `tile_rows` values.
  *
- * A stream that can only be read front to back (run headers of a dictionary index stream, the
- * non-null count of a level stream, and later the mini-blocks of a delta stream or the lengths
- * of a string page) is walked once per subpass. The walk stores what a tile needs to start in
- * the middle of the stream. Each stage of a kernel declares how many entries per tile it uses
- * and gives the two fields the meaning its stream needs:
+ * A stream that can only be read front to back (the run headers of a dictionary index stream,
+ * the non-null count of a level stream) is walked once per subpass. The walk stores what a tile
+ * needs to start in the middle of the stream. Each stage of a kernel declares how many entries
+ * per tile it uses and gives the two fields the meaning its stream needs:
  * - dictionary indices: entry `k` locates the run that holds value `k * tile_rows`;
  * - definition levels: two entries; the first locates the run that holds the level of page
  *   row `k * tile_rows`, the second holds, in `first_value`, the number of non-null rows before
@@ -85,13 +91,9 @@ struct checkpoint {
  * @param nullable Whether the page's column is nullable
  * @return Number of checkpoint entries per tile
  */
-#ifdef __CUDACC__
-__host__ __device__
-#endif
-  [[nodiscard]] constexpr uint32_t
-  checkpoint_stride(bool is_dict, bool nullable)
+[[nodiscard]] CUDF_HOST_DEVICE constexpr uint32_t checkpoint_stride(bool is_dict, bool nullable)
 {
   return static_cast<uint32_t>(is_dict) + 2 * static_cast<uint32_t>(nullable);
 }
 
-}  // namespace cudf::io::parquet::jit
+}  // namespace cudf::io::parquet::detail

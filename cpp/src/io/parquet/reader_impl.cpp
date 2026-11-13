@@ -619,6 +619,12 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
   _stream.sync();
 }
 
+bool is_tile_decode_enabled(parquet_reader_options const& options)
+{
+  static bool const forced = cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_TILE_DECODE", false);
+  return forced or options.is_enabled_use_tile_decode();
+}
+
 reader_impl::reader_impl()
   : _stream{cudaStream_t{cudaStreamDefault}},
     _mr{cudf::get_current_device_resource_ref()},
@@ -666,8 +672,7 @@ reader_impl::reader_impl(std::size_t chunk_read_limit,
     _output_chunk_read_limit{chunk_read_limit},
     _input_pass_read_limit{pass_read_limit}
 {
-  _tile_decode_enabled = options.is_enabled_use_tile_decode() or
-                         cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_TILE_DECODE", false);
+  _tile_decode_enabled = is_tile_decode_enabled(options);
 
   // The direct parquet-dict → DICTIONARY32 transcode fast path only supports single-pass,
   // non-chunked reads.

@@ -3,11 +3,12 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "decode_flat.cuh"
 #include "decode_flat.hpp"
 #include "io/utilities/hostdevice_vector.hpp"
-#include "jit/decode_flat.cuh"
 #include "timestamp_utils.cuh"
 
+#include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
 #include <cudf/utilities/error.hpp>
@@ -17,9 +18,11 @@
 #include <cuda/buffer>
 #include <cuda/std/algorithm>
 #include <cuda/std/limits>
+#include <cuda/std/type_traits>
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <limits>
 #include <numeric>
@@ -59,7 +62,7 @@ struct flat_decode_plan {
     : claims(0, stream, mr),
       prepare_order(0, stream, mr),
       tile_offsets(0, stream, mr),
-      contexts(0, stream, mr),
+      outputs(0, stream, mr),
       tiles(stream, mr.get_temporary_mr(), 0, cuda::no_init),
       checkpoints(stream, mr.get_temporary_mr(), 0, cuda::no_init),
       page_refs(stream, mr.get_temporary_mr(), 0, cuda::no_init),
@@ -73,14 +76,14 @@ struct flat_decode_plan {
   cudf::detail::hostdevice_vector<uint32_t> prepare_order;
   /// Position of each claimed page's first tile in `tiles`, rewritten for every decode call.
   cudf::detail::hostdevice_vector<uint32_t> tile_offsets;
-  /// One leaf context per input column, rewritten for every decode call.
-  cudf::detail::hostdevice_vector<jit::leaf_ctx> contexts;
+  /// Output data pointer of each input column, rewritten for every decode call.
+  cudf::detail::hostdevice_vector<void*> outputs;
   /// Tiles of the current decode call, grouped by kernel shape.
-  cuda::device_buffer<jit::tile_ref> tiles;
+  cuda::device_buffer<tile_ref> tiles;
   /// Checkpoints of every claimed page, filled once per subpass.
-  cuda::device_buffer<jit::checkpoint> checkpoints;
+  cuda::device_buffer<checkpoint> checkpoints;
   /// One descriptor per claimed page, rewritten for every decode call.
-  cuda::device_buffer<jit::page_ref> page_refs;
+  cuda::device_buffer<page_ref> page_refs;
   /// One null counter per claimed page, rewritten for every decode call.
   cuda::device_buffer<int32_t> null_counts;
 };
@@ -187,7 +190,7 @@ struct run_extent {
  *
  * The header takes at least one byte, so `next` is always past `offset`.
  */
-__device__ inline run_extent parse_run(jit::hybrid_stream const& stream, uint32_t offset)
+__device__ inline run_extent parse_run(hybrid_stream const& stream, uint32_t offset)
 {
   uint32_t header = 0;
   uint32_t shift  = 0;
@@ -212,8 +215,8 @@ __device__ inline run_extent parse_run(jit::hybrid_stream const& stream, uint32_
  * @brief Counts the non-null rows among page rows `[begin, end)` of a definition level
  * stream with one bit per level, starting from the run at `entry`.
  */
-__device__ inline uint32_t count_valid_rows(jit::hybrid_stream const& stream,
-                                            jit::checkpoint entry,
+__device__ inline uint32_t count_valid_rows(hybrid_stream const& stream,
+                                            checkpoint entry,
                                             uint32_t begin,
                                             uint32_t end)
 {
@@ -250,7 +253,7 @@ __device__ inline uint32_t count_valid_rows(jit::hybrid_stream const& stream,
  * value `k * tile_rows`.
  */
 struct checkpoint_writer {
-  jit::checkpoint* first;  ///< The page's first checkpoint entry
+  checkpoint* first;  ///< The page's first checkpoint entry
   uint32_t stride;         ///< Entries per tile
   uint32_t num_tiles;      ///< Tiles of the page
 
@@ -261,8 +264,8 @@ struct checkpoint_writer {
   __device__ void record(uint32_t offset, uint64_t value, uint64_t count) const
   {
     uint64_t const end = value + count;
-    for (uint64_t tile = (value + jit::tile_rows - 1) >> jit::tile_rows_log2;
-         tile < num_tiles and (tile << jit::tile_rows_log2) < end;
+    for (uint64_t tile = (value + tile_rows - 1) >> tile_rows_log2;
+         tile < num_tiles and (tile << tile_rows_log2) < end;
          ++tile) {
       first[tile * stride] = {offset, static_cast<uint32_t>(value)};
     }
@@ -297,7 +300,7 @@ constexpr uint32_t walk_min_chunks = 48;
  * @tparam windowed Whether the block may work on windows; if not, one thread walks the stream
  */
 template <bool windowed>
-__device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
+__device__ void walk_hybrid_stream(hybrid_stream const& section,
                                    checkpoint_writer const& writer,
                                    uint32_t num_values)
 {
@@ -318,15 +321,15 @@ __device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
     uint32_t probe_runs  = 0;
     bool window          = false;
     // First tile that starts at or after `value`, and the value it starts at.
-    uint32_t tile       = (value + jit::tile_rows - 1) >> jit::tile_rows_log2;
-    uint32_t tile_value = tile << jit::tile_rows_log2;
+    uint32_t tile       = (value + tile_rows - 1) >> tile_rows_log2;
+    uint32_t tile_value = tile << tile_rows_log2;
     for (uint32_t run = 0; run < max_runs and offset < section.size and value < num_values; ++run) {
       auto const extent  = parse_run(section, offset);
       uint32_t const end = value + extent.count;
       while (tile_value < end and tile < writer.num_tiles) {
         writer.first[tile * writer.stride] = {offset, value};
         ++tile;
-        tile_value += jit::tile_rows;
+        tile_value += tile_rows;
       }
       value  = end;
       offset = extent.next;
@@ -346,7 +349,7 @@ __device__ void walk_hybrid_stream(jit::hybrid_stream const& section,
   };
   // Tiles past the end of the stream start where it ends.
   auto const finish = [&](walk_state const& state) {
-    for (uint64_t tile = (state.value + jit::tile_rows - 1) >> jit::tile_rows_log2;
+    for (uint64_t tile = (state.value + tile_rows - 1) >> tile_rows_log2;
          tile < writer.num_tiles;
          ++tile) {
       writer.first[tile * writer.stride] = {
@@ -453,17 +456,17 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
                             device_span<ColumnChunkDesc const> chunks,
                             flat_page_claim const* claims,
                             uint32_t const* claim_ids,
-                            jit::checkpoint* checkpoints)
+                            checkpoint* checkpoints)
 {
   flat_page_claim const claim  = claims[claim_ids[blockIdx.x]];
   PageInfo const& page         = pages[claim.page_idx];
   ColumnChunkDesc const& chunk = chunks[page.chunk_idx];
   bool const is_dict           = (claim.shape & flat_shape_dict) != 0;
   bool const nullable          = (claim.shape & flat_shape_nullable) != 0;
-  uint32_t const stride        = jit::checkpoint_stride(is_dict, nullable);
+  uint32_t const stride        = checkpoint_stride(is_dict, nullable);
   auto const num_values        = static_cast<uint32_t>(page.num_input_values);
-  uint32_t const num_tiles     = cudf::detail::div_rounding_up_safe(num_values, jit::tile_rows);
-  jit::checkpoint* const first = checkpoints + claim.first_checkpoint;
+  uint32_t const num_tiles     = cudf::detail::div_rounding_up_safe(num_values, tile_rows);
+  checkpoint* const first = checkpoints + claim.first_checkpoint;
   value_section const section  = locate_value_section(page, chunk, is_dict);
   // With two rows of blocks the level stream and the index stream of a page are walked by
   // different blocks, so that the two walks overlap.
@@ -473,17 +476,17 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   if (walks_levels and nullable and section.has_nulls) {
     // Levels: resume entries from a walk of the level stream, then the non-null rows of
     // every tile, one tile per thread, turned into ranks by one thread.
-    jit::hybrid_stream const levels{section.levels, section.levels_size, 1};
-    jit::checkpoint* const entries = first + (is_dict ? 1 : 0);
+    hybrid_stream const levels{section.levels, section.levels_size, 1};
+    checkpoint* const entries = first + (is_dict ? 1 : 0);
     walk_hybrid_stream<windowed>(levels, checkpoint_writer{entries, stride, num_tiles}, num_values);
     __syncthreads();
     for (uint32_t tile = threadIdx.x; tile < num_tiles; tile += prepare_block_size) {
-      uint32_t const tile_begin = tile * jit::tile_rows;
+      uint32_t const tile_begin = tile * tile_rows;
       entries[tile * stride + 1].first_value =
         count_valid_rows(levels,
                          entries[tile * stride],
                          tile_begin,
-                         cuda::std::min(tile_begin + jit::tile_rows, num_values));
+                         cuda::std::min(tile_begin + tile_rows, num_values));
     }
     __syncthreads();
     if (threadIdx.x == 0) {
@@ -500,7 +503,7 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   if (walks_values and is_dict) {
     __syncthreads();
     walk_hybrid_stream<windowed>(
-      jit::hybrid_stream{section.values, section.size, section.bit_width},
+      hybrid_stream{section.values, section.size, section.bit_width},
       checkpoint_writer{first, stride, num_tiles},
       num_values);
   }
@@ -519,8 +522,8 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
                           size_t min_row,
                           size_t num_rows,
                           uint32_t const* tile_offsets,
-                          jit::page_ref* page_refs,
-                          jit::tile_ref* tiles,
+                          page_ref* page_refs,
+                          tile_ref* tiles,
                           int32_t* null_counts,
                           kernel_error::pointer error_code)
 {
@@ -533,7 +536,7 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
   bool const nullable          = (claim.shape & flat_shape_nullable) != 0;
   int const in_bytes           = (claim.shape & flat_shape_wide) != 0 ? 8 : 4;
 
-  jit::page_ref ref{};
+  page_ref ref{};
   null_counts[idx] = 0;
 
   // Rows of the page inside [min_row, min_row + num_rows).
@@ -551,9 +554,9 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
 
   if (ref.num_rows != 0) {
     // The tiles are listed even if the page turns out to be malformed; they then decode nothing.
-    uint32_t const first_tile = ref.first_row / jit::tile_rows;
-    uint32_t const last_tile  = (ref.first_row + ref.num_rows - 1) / jit::tile_rows;
-    jit::tile_ref* const out  = tiles + tile_offsets[idx];
+    uint32_t const first_tile = ref.first_row / tile_rows;
+    uint32_t const last_tile  = (ref.first_row + ref.num_rows - 1) / tile_rows;
+    tile_ref* const out  = tiles + tile_offsets[idx];
     for (uint32_t tile = first_tile; tile <= last_tile; ++tile) {
       out[tile - first_tile] = {static_cast<uint32_t>(idx), tile};
     }
@@ -578,13 +581,14 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
       ref.dict_entries = static_cast<uint32_t>(chunk.dict_page->uncompressed_page_size) / in_bytes;
     }
     if (nullable) {
-      ref.levels = section.levels;
-      ref.valid  = chunk.valid_map_base[0];
-      ref.flags  = section.has_nulls ? 0 : jit::page_flag_no_nulls;
+      ref.levels      = section.levels;
+      ref.levels_size = section.levels_size;
+      ref.valid       = chunk.valid_map_base[0];
+      ref.flags       = section.has_nulls ? 0 : page_flag_no_nulls;
     }
   }
   ref.first_checkpoint = claim.first_checkpoint;
-  ref.ctx_idx          = static_cast<uint16_t>(chunk.src_col_index);
+  ref.output_idx       = static_cast<uint16_t>(chunk.src_col_index);
   page_refs[idx]       = ref;
 }
 
@@ -602,54 +606,56 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
 }
 
 /**
- * @brief Leaf that stores the physical value unchanged and keeps every row.
+ * @brief Leaf that stores the physical value unchanged.
  */
-struct store_leaf {
+struct store_value {
   template <typename Value>
-  __device__ uint32_t
-  operator()(jit::leaf_ctx const& ctx, uint32_t row, Value value, uint32_t) const
+  __device__ void operator()(void* out, uint32_t row, Value value) const
   {
-    static_cast<Value*>(ctx.out)[row] = value;
-    return 1;
+    static_cast<Value*>(out)[row] = value;
   }
 };
 
 /**
- * @brief Tile decode kernel with the store leaf compiled in.
+ * @brief Tile decode kernel of one encoding, value width and nullability.
+ *
+ * @tparam is_dict Whether the pages are dictionary encoded; PLAIN otherwise
+ * @tparam in_bytes Size of a physical value, 4 or 8
+ * @tparam nullable Whether the pages' columns have a maximum definition level of 1
+ * @tparam steps Number of 32-row groups a warp decodes per loop turn
  */
 template <bool is_dict, int in_bytes, bool nullable, uint32_t steps>
-CUDF_KERNEL void __launch_bounds__(jit::decode_flat_block_size)
-  decode_flat_tiles_kernel(jit::page_ref const* pages,
-                           jit::tile_ref const* tiles,
+CUDF_KERNEL void __launch_bounds__(decode_flat_block_size)
+  decode_flat_tiles_kernel(page_ref const* pages,
+                           tile_ref const* tiles,
                            uint32_t num_tiles,
-                           jit::checkpoint const* checkpoints,
-                           jit::leaf_ctx const* contexts,
+                           checkpoint const* checkpoints,
+                           void* const* outputs,
                            int32_t* null_counts)
 {
-  using level_source =
-    typename jit::select_stage<nullable, jit::optional_levels, jit::required_levels>::type;
-  using value_source = typename jit::select_stage<is_dict,
-                                                  jit::dictionary_values<in_bytes, 32 * steps>,
-                                                  jit::plain_values<in_bytes>>::type;
-  jit::decode_tiles<level_source, value_source, steps>(
-    pages, tiles, num_tiles, checkpoints, contexts, null_counts, store_leaf{});
+  using level_source = cuda::std::conditional_t<nullable, optional_levels, required_levels>;
+  using value_source = cuda::std::conditional_t<is_dict,
+                                                dictionary_values<in_bytes, 32 * steps>,
+                                                plain_values<in_bytes>>;
+  decode_tiles<level_source, value_source, steps>(
+    pages, tiles, num_tiles, checkpoints, outputs, null_counts, store_value{});
 }
 
 void launch_decode_flat_tiles(uint32_t shape,
-                              jit::page_ref const* pages,
-                              jit::tile_ref const* tiles,
+                              page_ref const* pages,
+                              tile_ref const* tiles,
                               uint32_t num_tiles,
-                              jit::checkpoint const* checkpoints,
-                              jit::leaf_ctx const* contexts,
+                              checkpoint const* checkpoints,
+                              void* const* outputs,
                               int32_t* null_counts,
                               cuda::stream_ref stream)
 {
-  constexpr uint32_t tiles_per_block = jit::decode_flat_block_size / cudf::detail::warp_size;
+  constexpr uint32_t tiles_per_block = decode_flat_block_size / cudf::detail::warp_size;
   auto const num_blocks = cudf::detail::div_rounding_up_safe(num_tiles, tiles_per_block);
   auto const launch     = [&]<bool is_dict, int in_bytes, bool nullable>() {
-    decode_flat_tiles_kernel<is_dict, in_bytes, nullable, jit::flat_steps_per_turn>
-      <<<num_blocks, jit::decode_flat_block_size, 0, stream.get()>>>(
-        pages, tiles, num_tiles, checkpoints, contexts, null_counts);
+    decode_flat_tiles_kernel<is_dict, in_bytes, nullable, flat_steps_per_turn>
+      <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
+        pages, tiles, num_tiles, checkpoints, outputs, null_counts);
   };
   switch (shape) {
     case 0: launch.template operator()<false, 4, false>(); break;
@@ -673,7 +679,12 @@ uint32_t shape_of(PageInfo const& page, ColumnChunkDesc const& chunk)
          (chunk.max_level[level_type::DEFINITION] > 0 ? flat_shape_nullable : 0);
 }
 
+// Pages claimed by all readers of the process.
+std::atomic<size_t> num_claimed_pages{0};
+
 }  // namespace
+
+size_t num_tile_decode_claimed_pages() { return num_claimed_pages.load(std::memory_order_relaxed); }
 
 bool is_flat_decode_eligible(PageInfo const& page,
                              ColumnChunkDesc const& chunk,
@@ -724,6 +735,8 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
+
   // Dictionary sizes, to tell how wide the indices of a page are.
   std::vector<int32_t> dict_entries(chunks.size(), 0);
   for (size_t idx = 0; idx < pages.size(); ++idx) {
@@ -744,11 +757,11 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
     auto const& chunk  = chunks[page.chunk_idx];
     auto const shape   = shape_of(page, chunk);
     auto const is_dict = (shape & flat_shape_dict) != 0;
-    auto const stride  = jit::checkpoint_stride(is_dict, (shape & flat_shape_nullable) != 0);
+    auto const stride  = checkpoint_stride(is_dict, (shape & flat_shape_nullable) != 0);
     auto const claim   = static_cast<uint32_t>(claims.size());
     claims.push_back({static_cast<uint32_t>(idx), static_cast<uint32_t>(num_checkpoints), shape});
     num_checkpoints +=
-      cudf::detail::div_rounding_up_safe<size_t>(page.num_input_values, jit::tile_rows) * stride;
+      cudf::detail::div_rounding_up_safe<size_t>(page.num_input_values, tile_rows) * stride;
     if (stride == 0) { continue; }
     // Level streams, and index streams much smaller than their bit-packed size, hold mostly
     // short runs. Walking those takes the whole block; long runs are walked by one thread.
@@ -764,15 +777,17 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
                "Too many tiles in a subpass",
                std::overflow_error);
 
+  num_claimed_pages.fetch_add(claims.size(), std::memory_order_relaxed);
+
   auto plan    = std::make_shared<flat_decode_plan>(stream, mr);
   plan->claims = cudf::detail::hostdevice_vector<flat_page_claim>(claims.size(), stream, mr);
   std::copy(claims.begin(), claims.end(), plan->claims.begin());
   plan->claims.host_to_device_async(stream);
   plan->tile_offsets = cudf::detail::hostdevice_vector<uint32_t>(claims.size(), stream, mr);
-  plan->checkpoints  = cuda::device_buffer<jit::checkpoint>(
+  plan->checkpoints  = cuda::device_buffer<checkpoint>(
     stream, mr.get_temporary_mr(), num_checkpoints, cuda::no_init);
   plan->page_refs =
-    cuda::device_buffer<jit::page_ref>(stream, mr.get_temporary_mr(), claims.size(), cuda::no_init);
+    cuda::device_buffer<page_ref>(stream, mr.get_temporary_mr(), claims.size(), cuda::no_init);
   plan->null_counts =
     cuda::device_buffer<int32_t>(stream, mr.get_temporary_mr(), claims.size(), cuda::no_init);
 
@@ -814,6 +829,8 @@ void decode_flat_pages(flat_decode_plan& plan,
                        cuda::stream_ref stream,
                        cudf::memory_resources mr)
 {
+  CUDF_FUNC_RANGE();
+
   auto const num_claims = plan.claims.size();
   if (num_claims == 0) { return; }
 
@@ -829,7 +846,7 @@ void decode_flat_pages(flat_decode_plan& plan,
     if (page_begin >= range_end or page_end <= min_row) { return 0; }
     auto const first_row = page_begin >= min_row ? 0 : min_row - page_begin;
     auto const last_row  = std::min(page_end, range_end) - page_begin - 1;
-    return static_cast<uint32_t>(last_row / jit::tile_rows - first_row / jit::tile_rows + 1);
+    return static_cast<uint32_t>(last_row / tile_rows - first_row / tile_rows + 1);
   };
   for (size_t idx = 0; idx < num_claims; ++idx) {
     plan.tile_offsets[idx] = tile_counts(idx);
@@ -849,19 +866,14 @@ void decode_flat_pages(flat_decode_plan& plan,
   plan.tile_offsets.host_to_device_async(stream);
   if (plan.tiles.size() < num_tiles) {
     plan.tiles =
-      cuda::device_buffer<jit::tile_ref>(stream, mr.get_temporary_mr(), num_tiles, cuda::no_init);
+      cuda::device_buffer<tile_ref>(stream, mr.get_temporary_mr(), num_tiles, cuda::no_init);
   }
 
-  // Every column uses the store leaf, whose context holds only the output pointer.
-  if (plan.contexts.size() != column_data.size()) {
-    plan.contexts = cudf::detail::hostdevice_vector<jit::leaf_ctx>(column_data.size(), stream, mr);
+  if (plan.outputs.size() != column_data.size()) {
+    plan.outputs = cudf::detail::hostdevice_vector<void*>(column_data.size(), stream, mr);
   }
-  std::transform(column_data.begin(), column_data.end(), plan.contexts.begin(), [](void* out) {
-    jit::leaf_ctx ctx{};
-    ctx.out = out;
-    return ctx;
-  });
-  plan.contexts.host_to_device_async(stream);
+  std::copy(column_data.begin(), column_data.end(), plan.outputs.begin());
+  plan.outputs.host_to_device_async(stream);
 
   auto const num_page_blocks =
     cudf::detail::div_rounding_up_safe<size_t>(num_claims, page_block_size);
@@ -885,7 +897,7 @@ void decode_flat_pages(flat_decode_plan& plan,
                              plan.tiles.data() + shape_begin[shape],
                              shape_tiles[shape],
                              plan.checkpoints.data(),
-                             plan.contexts.device_ptr(),
+                             plan.outputs.device_ptr(),
                              plan.null_counts.data(),
                              stream);
   }

@@ -32,6 +32,18 @@
 namespace cudf::io::parquet::detail {
 
 /**
+ * @brief Returns whether a reader with the given options uses the tile decode kernels.
+ *
+ * True if the `use_tile_decode` option is set, or if the environment variable
+ * `LIBCUDF_PARQUET_TILE_DECODE` turns tile decode on for every reader of the process. The
+ * variable is read once, on the first call.
+ *
+ * @param options Reader options
+ * @return Whether eligible pages are claimed for tile decode
+ */
+[[nodiscard]] bool is_tile_decode_enabled(parquet_reader_options const& options);
+
+/**
  * @brief Implementation for Parquet reader
  */
 class reader_impl {
@@ -638,8 +650,7 @@ class reader_impl {
   // `hybrid_scan_reader_impl` reaches this class through the default constructor.
   bool _nz_map_enabled{cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_NZ_MAP", false)};
 
-  // Whether flat fixed-width pages are decoded by the tile decode kernels. Set from the
-  // `use_tile_decode` reader option; LIBCUDF_PARQUET_TILE_DECODE turns it on for every reader.
+  // Whether flat fixed-width pages are decoded by the tile decode kernels.
   bool _tile_decode_enabled{false};
 };
 

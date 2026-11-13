@@ -10,6 +10,7 @@
 #include "parquet_gpu.hpp"
 
 #include <cudf/types.hpp>
+#include <cudf/utilities/export.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
@@ -24,6 +25,16 @@ namespace cudf::io::parquet::detail {
  * @brief State the tile decode kernels keep for the claimed pages of one subpass.
  */
 struct flat_decode_plan;
+
+/**
+ * @brief Returns the number of pages claimed for tile decode in this process so far.
+ *
+ * Lets a test tell that pages went through the tile decode kernels, which the output of a
+ * read does not show.
+ *
+ * @return Number of pages claimed, summed over the subpasses of all readers
+ */
+[[nodiscard]] CUDF_EXPORT size_t num_tile_decode_claimed_pages();
 
 /**
  * @brief Returns whether the tile decode kernels can decode a page.

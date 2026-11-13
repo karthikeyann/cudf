@@ -119,7 +119,7 @@ class parquet_reader_options {
   bool _prepend_source_index_column = false;
   // Whether to prepend a file-local row index column to the output
   bool _prepend_row_index_column = false;
-  // Whether to decode flat fixed-width pages with the tile decode kernels
+  // Whether to decode eligible flat fixed-width pages on the tile decode path
   bool _use_tile_decode = false;
 
   std::optional<std::vector<reader_column_schema>> _reader_column_schema;
@@ -345,9 +345,9 @@ class parquet_reader_options {
   }
 
   /**
-   * @brief Returns whether flat fixed-width pages are decoded with the tile decode kernels.
+   * @brief Returns whether eligible flat fixed-width pages are decoded on the tile decode path.
    *
-   * @return `true` if the tile decode kernels are used
+   * @return `true` if the tile decode path is requested by these options
    */
   [[nodiscard]] bool is_enabled_use_tile_decode() const { return _use_tile_decode; }
 
@@ -672,13 +672,18 @@ class parquet_reader_options {
   void enable_prepend_row_index_column(bool val) { _prepend_row_index_column = val; }
 
   /**
-   * @brief Sets whether to decode flat fixed-width pages with the tile decode kernels.
+   * @brief Sets whether to decode eligible flat fixed-width pages on the tile decode path.
    *
-   * The kernels decode PLAIN and dictionary encoded pages of non-nested INT32, INT64, FLOAT and
-   * DOUBLE columns. All other pages are decoded as usual. The output does not depend on this
-   * option.
+   * Experimental. The tile decode path is a faster decoder for PLAIN and dictionary encoded
+   * data pages of non-nested INT32, INT64, FLOAT and DOUBLE columns that have at most one
+   * definition level and whose output type has the width of the physical type (no narrowing
+   * or widening, no timestamp rescaling). All other pages are decoded as usual, page by page.
+   * The output does not depend on this option.
    *
-   * @param val Boolean indicating whether to use the tile decode kernels.
+   * Setting the environment variable `LIBCUDF_PARQUET_TILE_DECODE` to `1` turns the path on
+   * for every reader of the process, whatever the value of this option.
+   *
+   * @param val Boolean indicating whether to use the tile decode path
    */
   void enable_use_tile_decode(bool val) { _use_tile_decode = val; }
 
@@ -994,9 +999,10 @@ class parquet_reader_options_builder {
   }
 
   /**
-   * @brief Sets whether to decode flat fixed-width pages with the tile decode kernels.
+   * @brief Sets whether to decode eligible flat fixed-width pages on the tile decode path.
    *
-   * @param val Boolean indicating whether to use the tile decode kernels
+   * @copydetails parquet_reader_options::enable_use_tile_decode
+   *
    * @return this for chaining
    */
   parquet_reader_options_builder& use_tile_decode(bool val)

@@ -72,11 +72,11 @@ struct row_range {
   size_t num_rows;
 };
 
+struct flat_decode_plan;
+
 /**
  * @brief Passes are broken down into subpasses based on temporary memory constraints.
  */
-struct flat_decode_plan;
-
 struct subpass_intermediate_data {
   subpass_intermediate_data()                                            = delete;
   subpass_intermediate_data(subpass_intermediate_data const&)            = delete;

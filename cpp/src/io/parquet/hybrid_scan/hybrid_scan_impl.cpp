@@ -994,8 +994,7 @@ void hybrid_scan_reader_impl::initialize_reader_config(parquet_reader_options co
   _options.case_sensitive_names        = options.is_enabled_case_sensitive_names();
   _options.prepend_source_index_column = options.is_enabled_prepend_source_index_column();
   _options.prepend_row_index_column    = options.is_enabled_prepend_row_index_column();
-  _tile_decode_enabled                 = options.is_enabled_use_tile_decode() or
-                         cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_TILE_DECODE", false);
+  _tile_decode_enabled                 = is_tile_decode_enabled(options);
 }
 
 void hybrid_scan_reader_impl::initialize_options(parquet_reader_options const& options,

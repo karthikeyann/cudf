@@ -5,20 +5,16 @@
 
 #pragma once
 
-#include "abi/leaf_abi.cuh"
-#include "kernel_abi.hpp"
+#include "decode_flat_types.hpp"
 
 #include <cuda/std/cstdint>
 
 /**
  * @file decode_flat.cuh
- * @brief Tile decode of flat fixed-width Parquet pages.
- *
- * Depends only on the leaf ABI and the kernel ABI, so that the same body can be compiled into
- * libcudf with a leaf known at compile time and into a fragment whose leaf is linked at run time.
+ * @brief Tile decode of flat fixed-width Parquet pages: the stages and the loop that runs them.
  */
 
-namespace cudf::io::parquet::jit {
+namespace cudf::io::parquet::detail {
 
 /**
  * @brief Runs of a hybrid stream that cover the values a warp is decoding.
@@ -207,9 +203,8 @@ struct tile_range {
 /**
  * @name Stages of tile decode
  *
- * `decode_tiles` is written once against three stages. A kernel for a column is a composition
- * of one type per stage, chosen at compile time; today's kernels are the compositions listed
- * under `decode_flat_tiles`.
+ * `decode_tiles` is written once against three stages. A kernel is a composition of one type
+ * per stage, chosen at compile time.
  *
  * **Level source**: turns rows into validity and value stream positions.
  * - `static constexpr uint32_t checkpoints_per_tile`: checkpoint entries it needs per tile.
@@ -225,9 +220,7 @@ struct tile_range {
  *   source that keeps state shared by the warp rewrites it in one lane, with a warp barrier
  *   before and after the rewrite.
  * - `void finish(null_count, lane)`: adds the nulls of the tile to `*null_count`.
- * `required_levels` and `optional_levels` cover flat columns. A source for nested columns
- * would read repetition levels as well, map rows to positions through the offsets it writes,
- * and hand out more than one value per row.
+ * `required_levels` and `optional_levels` cover flat columns.
  *
  * **Value source**: returns the value at a position of the value stream. One per encoding.
  * - `using value_type`: `uint32_t` or `uint64_t`, the physical value zero extended.
@@ -242,22 +235,16 @@ struct tile_range {
  *   Called by all lanes: a source that keeps state shared by the warp rewrites it in one
  *   lane, and `prepare` synchronizes the warp before and after the rewrite, so no lane reads
  *   the state of an earlier call while it changes or the new state before it is complete.
- * - `value_type get(position, dict_idx) const`: the value at a prepared position. Sets
- *   `dict_idx` on dictionary pages and leaves it alone otherwise. Reads must stay inside the
+ * - `value_type get(position)`: the value at a prepared position. Reads must stay inside the
  *   page; a position the page does not hold yields 0.
- * `plain_values` and `dictionary_values` exist. DELTA_BINARY_PACKED fits as a source whose
- * checkpoint is the value before a mini-block and whose `prepare` unpacks and prefix-sums the
- * mini-blocks of the turn; BYTE_STREAM_SPLIT and BOOLEAN need no checkpoint.
+ * `plain_values` and `dictionary_values` exist.
  *
- * **Leaf**: transform, predicate and sink, called as `leaf(ctx, out_row, value, dict_idx)`
- * once per non-null row, with the ABI of `abi/leaf_abi.cuh`. A value wider than 64 bits
- * (DECIMAL128, FIXED_LEN_BYTE_ARRAY, INT96) needs a `value_type` of that width and a third
- * leaf symbol for it. A variable-width sink (strings) is two compositions over the same
- * sources: a leaf that only adds up sizes per row, then, once offsets are known, a leaf that
- * copies bytes; the value source then returns a pointer and a length instead of the bits.
+ * **Leaf**: stores the value of a non-null row, called as `leaf(out, out_row, value)` with the
+ * output data pointer of the page's column.
  *
  * Encoding, value width and nullability are compile-time properties of the stage types, so a
- * composition contains only the code of its stages.
+ * composition contains only the code of its stages. Other encodings and column shapes would
+ * be further types for the same stages.
  * @{
  */
 
@@ -319,7 +306,7 @@ struct optional_levels {
                              uint32_t stride,
                              uint32_t slot,
                              uint32_t lane)
-    : _stream{page.levels, static_cast<uint32_t>(page.values - page.levels), 1},
+    : _stream{page.levels, page.levels_size, 1},
       _valid{page.valid},
       _table{nullptr},
       _row_base{page.row_base},
@@ -456,7 +443,7 @@ struct plain_values {
 
   __device__ void prepare(uint32_t, uint32_t, uint32_t, uint32_t) const {}
 
-  [[nodiscard]] __device__ value_type get(uint32_t position, uint32_t&) const
+  [[nodiscard]] __device__ value_type get(uint32_t position) const
   {
     return position < _num_values ? load_value<in_bytes>(_values + size_t{position} * in_bytes)
                                   : value_type{0};
@@ -513,7 +500,7 @@ struct dictionary_values {
     }
   }
 
-  [[nodiscard]] __device__ value_type get(uint32_t position, uint32_t& dict_idx)
+  [[nodiscard]] __device__ value_type get(uint32_t position)
   {
     while (_table->start[_run + 1] <= position) {
       ++_run;
@@ -527,12 +514,9 @@ struct dictionary_values {
                          static_cast<uint64_t>(position - _table->start[_run]) * _page->bit_width,
                          _page->bit_width);
     }
-    if (index < _page->dict_entries) {
-      dict_idx = index + _page->dict_first;
-      return load_value<in_bytes>(_page->dict + size_t{index} * in_bytes);
-    }
-    dict_idx = _page->dict_entries + _page->dict_first;
-    return value_type{0};
+    return index < _page->dict_entries
+             ? load_value<in_bytes>(_page->dict + size_t{index} * in_bytes)
+             : value_type{0};
   }
 
  private:
@@ -559,14 +543,14 @@ struct dictionary_values {
  * @tparam ValueSource Value source of the pages
  * @tparam steps Number of 32-row groups a warp decodes per loop turn. The loads of one turn are
  * issued before its stores, so this sets how many independent loads each lane has in flight
- * @tparam Leaf Callable with the signature of the leaf ABI for `ValueSource::value_type`
+ * @tparam Leaf Callable as `leaf(void* out, uint32_t out_row, ValueSource::value_type value)`
  * @param pages Page descriptors of this decode call
  * @param tiles Tiles to decode, all of pages this composition can decode
  * @param num_tiles Number of entries in `tiles`
  * @param checkpoints Checkpoints of all pages. A page has
  * `ValueSource::checkpoints_per_tile + LevelSource::checkpoints_per_tile` entries per tile,
  * the value source's first
- * @param contexts Leaf contexts, indexed by `page_ref::ctx_idx`
+ * @param outputs Output data pointer of each column, indexed by `page_ref::output_idx`
  * @param null_counts One counter per entry of `pages`; the nulls found are added to it
  * @param leaf The leaf
  */
@@ -575,7 +559,7 @@ __device__ inline void decode_tiles(page_ref const* pages,
                                     tile_ref const* tiles,
                                     uint32_t num_tiles,
                                     checkpoint const* checkpoints,
-                                    leaf_ctx const* contexts,
+                                    void* const* outputs,
                                     int32_t* null_counts,
                                     Leaf leaf)
 {
@@ -590,7 +574,7 @@ __device__ inline void decode_tiles(page_ref const* pages,
 
   tile_ref const tile = tiles[tile_index];
   page_ref const page = pages[tile.page];
-  leaf_ctx const ctx  = contexts[page.ctx_idx];
+  void* const out     = outputs[page.output_idx];
 
   tile_range range;
   range.tile_begin         = tile.tile * tile_rows;
@@ -624,70 +608,19 @@ __device__ inline void decode_tiles(page_ref const* pages,
 
     // Load every value of the turn before any is stored, so that the loads overlap.
     typename ValueSource::value_type value[steps];
-    uint32_t dict_idx[steps];
     for (uint32_t step = 0; step < steps; ++step) {
-      value[step]    = 0;
-      dict_idx[step] = 0;
-      if (valid[step]) { value[step] = values.get(value_index[step], dict_idx[step]); }
+      value[step] = 0;
+      if (valid[step]) { value[step] = values.get(value_index[step]); }
     }
     for (uint32_t step = 0; step < steps; ++step) {
-      if (valid[step]) {
-        leaf(ctx, static_cast<uint32_t>(out_row[step]), value[step], dict_idx[step]);
-      }
+      if (valid[step]) { leaf(out, static_cast<uint32_t>(out_row[step]), value[step]); }
     }
   }
   levels.finish(null_counts + tile.page, lane);
 }
 
-/// Steps per loop turn of the compositions named by `decode_flat_tiles`. More steps keep more
-/// loads in flight per lane and cost registers and a larger run table.
+/// Steps per loop turn of the tile decode kernels. More steps keep more loads in flight per
+/// lane and cost registers and a larger run table.
 inline constexpr uint32_t flat_steps_per_turn = 1;
 
-/**
- * @brief Selects one of two types at compile time.
- */
-template <bool condition, typename True, typename False>
-struct select_stage {
-  using type = True;  ///< The selected type
-};
-
-/// @copydoc select_stage
-template <typename True, typename False>
-struct select_stage<false, True, False> {
-  using type = False;  ///< The selected type
-};
-
-/**
- * @brief Decodes tiles of flat fixed-width pages: the compositions for PLAIN or dictionary
- * encoding, 4- or 8-byte values, and REQUIRED or OPTIONAL columns.
- *
- * @tparam is_dict Whether the pages are dictionary encoded; PLAIN otherwise
- * @tparam in_bytes Size of a physical value, 4 or 8
- * @tparam nullable Whether the pages' columns have a maximum definition level of 1
- * @tparam Leaf Callable with the signature of the leaf ABI for `in_bytes`
- * @param pages Page descriptors of this decode call
- * @param tiles Tiles to decode, all of pages with this encoding, width and nullability
- * @param num_tiles Number of entries in `tiles`
- * @param checkpoints Checkpoints of all pages
- * @param contexts Leaf contexts, indexed by `page_ref::ctx_idx`
- * @param null_counts One counter per entry of `pages`; the nulls found are added to it
- * @param leaf The leaf
- */
-template <bool is_dict, int in_bytes, bool nullable, typename Leaf>
-__device__ inline void decode_flat_tiles(page_ref const* pages,
-                                         tile_ref const* tiles,
-                                         uint32_t num_tiles,
-                                         checkpoint const* checkpoints,
-                                         leaf_ctx const* contexts,
-                                         int32_t* null_counts,
-                                         Leaf leaf)
-{
-  using level_source = typename select_stage<nullable, optional_levels, required_levels>::type;
-  using value_source = typename select_stage<is_dict,
-                                             dictionary_values<in_bytes, 32 * flat_steps_per_turn>,
-                                             plain_values<in_bytes>>::type;
-  decode_tiles<level_source, value_source, flat_steps_per_turn>(
-    pages, tiles, num_tiles, checkpoints, contexts, null_counts, leaf);
-}
-
-}  // namespace cudf::io::parquet::jit
+}  // namespace cudf::io::parquet::detail
