@@ -11,19 +11,27 @@
 #include <cudf/detail/nvtx/ranges.hpp>
 #include <cudf/detail/utilities/cuda.cuh>
 #include <cudf/detail/utilities/integer_utils.hpp>
+#include <cudf/null_mask.hpp>
 #include <cudf/utilities/error.hpp>
 #include <cudf/utilities/traits.hpp>
 
+#include <rmm/exec_policy.hpp>
+
 #include <cuda/atomic>
 #include <cuda/buffer>
+#include <cuda/iterator>
 #include <cuda/std/algorithm>
+#include <cuda/std/bit>
+#include <cuda/std/functional>
 #include <cuda/std/limits>
 #include <cuda/std/type_traits>
+#include <thrust/transform_scan.h>
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <bit>
+#include <functional>
 #include <limits>
 #include <numeric>
 #include <vector>
@@ -47,6 +55,10 @@ inline constexpr uint32_t flat_shape_wide = 2;
 inline constexpr uint32_t flat_shape_nullable = 4;
 /// Number of distinct `flat_page_claim::shape` values.
 inline constexpr uint32_t num_flat_shapes = 8;
+/// Added to a claim's shape for a decode call that stores only selected rows of its column.
+inline constexpr uint32_t flat_shape_selected = 8;
+/// Number of distinct kernel shapes of a decode call.
+inline constexpr uint32_t num_call_shapes = 16;
 
 /**
  * @brief State the tile decode kernels keep for the claimed pages of one subpass.
@@ -620,22 +632,25 @@ struct store_value {
  * @tparam is_dict Whether the pages are dictionary encoded; PLAIN otherwise
  * @tparam in_bytes Size of a physical value, 4 or 8
  * @tparam nullable Whether the pages' columns have a maximum definition level of 1
+ * @tparam selected Whether only the rows of a row selection are stored, next to each other
  * @tparam steps Number of 32-row groups a warp decodes per loop turn
  */
-template <bool is_dict, int in_bytes, bool nullable, uint32_t steps>
+template <bool is_dict, int in_bytes, bool nullable, bool selected, uint32_t steps>
 CUDF_KERNEL void __launch_bounds__(decode_flat_block_size)
   decode_flat_tiles_kernel(page_ref const* pages,
                            tile_ref const* tiles,
                            uint32_t num_tiles,
                            checkpoint const* checkpoints,
                            void* const* outputs,
-                           int32_t* null_counts)
+                           int32_t* null_counts,
+                           row_selection selection)
 {
+  using rows         = cuda::std::conditional_t<selected, selected_rows, all_rows>;
   using level_source = cuda::std::conditional_t<nullable, optional_levels, required_levels>;
   using value_source = cuda::std::
     conditional_t<is_dict, dictionary_values<in_bytes, 32 * steps>, plain_values<in_bytes>>;
-  decode_tiles<level_source, value_source, steps>(
-    pages, tiles, num_tiles, checkpoints, outputs, null_counts, store_value{});
+  decode_tiles<rows, level_source, value_source, steps>(
+    pages, tiles, num_tiles, checkpoints, outputs, null_counts, selection, store_value{});
 }
 
 void launch_decode_flat_tiles(uint32_t shape,
@@ -645,16 +660,23 @@ void launch_decode_flat_tiles(uint32_t shape,
                               checkpoint const* checkpoints,
                               void* const* outputs,
                               int32_t* null_counts,
+                              row_selection selection,
                               cuda::stream_ref stream)
 {
   constexpr uint32_t tiles_per_block = decode_flat_block_size / cudf::detail::warp_size;
   auto const num_blocks = cudf::detail::div_rounding_up_safe(num_tiles, tiles_per_block);
   auto const launch     = [&]<bool is_dict, int in_bytes, bool nullable>() {
-    decode_flat_tiles_kernel<is_dict, in_bytes, nullable, flat_steps_per_turn>
-      <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
-        pages, tiles, num_tiles, checkpoints, outputs, null_counts);
+    if ((shape & flat_shape_selected) != 0) {
+      decode_flat_tiles_kernel<is_dict, in_bytes, nullable, true, flat_steps_per_turn>
+        <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
+          pages, tiles, num_tiles, checkpoints, outputs, null_counts, selection);
+    } else {
+      decode_flat_tiles_kernel<is_dict, in_bytes, nullable, false, flat_steps_per_turn>
+        <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
+          pages, tiles, num_tiles, checkpoints, outputs, null_counts, selection);
+    }
   };
-  switch (shape) {
+  switch (shape % num_flat_shapes) {
     case 0: launch.template operator()<false, 4, false>(); break;
     case 1: launch.template operator()<true, 4, false>(); break;
     case 2: launch.template operator()<false, 8, false>(); break;
@@ -679,9 +701,17 @@ uint32_t shape_of(PageInfo const& page, ColumnChunkDesc const& chunk)
 // Pages claimed by all readers of the process.
 std::atomic<size_t> num_claimed_pages{0};
 
+// Column outputs that received selected rows only, summed over the decode calls of the process.
+std::atomic<size_t> num_compacted_columns{0};
+
 }  // namespace
 
 size_t num_tile_decode_claimed_pages() { return num_claimed_pages.load(std::memory_order_relaxed); }
+
+size_t num_tile_decode_compacted_columns()
+{
+  return num_compacted_columns.load(std::memory_order_relaxed);
+}
 
 bool is_flat_decode_eligible(PageInfo const& page,
                              ColumnChunkDesc const& chunk,
@@ -816,10 +846,36 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   return plan;
 }
 
+cuda::device_buffer<uint32_t> compute_selection_rank(cudf::device_span<bitmask_type const> mask,
+                                                     size_type num_rows,
+                                                     cuda::stream_ref stream,
+                                                     rmm::device_async_resource_ref mr)
+{
+  auto const num_words = cudf::num_bitmask_words(num_rows);
+  cuda::device_buffer<uint32_t> rank(stream, mr, num_words + 1, cuda::no_init);
+  // Bits past the last row of the last word are not rows.
+  auto const last_word_mask =
+    num_rows % 32 == 0 ? ~bitmask_type{0} : (bitmask_type{1} << (num_rows % 32)) - 1;
+  thrust::transform_exclusive_scan(
+    rmm::exec_policy_nosync(stream, mr),
+    cuda::counting_iterator<size_type>{0},
+    cuda::counting_iterator<size_type>{num_words + 1},
+    rank.begin(),
+    [mask = mask.data(), num_words, last_word_mask] __device__(size_type word) -> uint32_t {
+      if (word >= num_words) { return 0; }
+      return cuda::std::popcount(word == num_words - 1 ? mask[word] & last_word_mask : mask[word]);
+    },
+    uint32_t{0},
+    cuda::std::plus<uint32_t>{});
+  return rank;
+}
+
 void decode_flat_pages(flat_decode_plan& plan,
                        cudf::detail::hostdevice_span<PageInfo> pages,
                        cudf::detail::hostdevice_span<ColumnChunkDesc const> chunks,
                        cudf::host_span<void* const> column_data,
+                       cudf::host_span<uint8_t const> selected_columns,
+                       row_selection selection,
                        size_t min_row,
                        size_t num_rows,
                        kernel_error::pointer error_code,
@@ -830,10 +886,21 @@ void decode_flat_pages(flat_decode_plan& plan,
 
   auto const num_claims = plan.claims.size();
   if (num_claims == 0) { return; }
+  num_compacted_columns.fetch_add(std::ranges::count_if(selected_columns, std::identity{}),
+                                  std::memory_order_relaxed);
+
+  // Kernel shape of a claim in this decode call.
+  auto const call_shape = [&](size_t idx) {
+    auto const& claim = plan.claims[idx];
+    auto const column = chunks[pages[claim.page_idx].chunk_idx].src_col_index;
+    return claim.shape |
+           (not selected_columns.empty() and selected_columns[column] != 0 ? flat_shape_selected
+                                                                           : 0);
+  };
 
   // Tiles that overlap the row range, grouped by kernel shape. The host only counts them; the
   // setup kernel writes the list.
-  std::array<uint32_t, num_flat_shapes> shape_tiles{};
+  std::array<uint32_t, num_call_shapes> shape_tiles{};
   auto const range_end   = min_row + num_rows;
   auto const tile_counts = [&](size_t idx) -> uint32_t {
     auto const& page        = pages[plan.claims[idx].page_idx];
@@ -847,17 +914,17 @@ void decode_flat_pages(flat_decode_plan& plan,
   };
   for (size_t idx = 0; idx < num_claims; ++idx) {
     plan.tile_offsets[idx] = tile_counts(idx);
-    shape_tiles[plan.claims[idx].shape] += plan.tile_offsets[idx];
+    shape_tiles[call_shape(idx)] += plan.tile_offsets[idx];
   }
-  std::array<uint32_t, num_flat_shapes> shape_begin{};
+  std::array<uint32_t, num_call_shapes> shape_begin{};
   std::exclusive_scan(shape_tiles.begin(), shape_tiles.end(), shape_begin.begin(), uint32_t{0});
   auto const num_tiles = shape_begin.back() + shape_tiles.back();
   {
     auto next = shape_begin;
     for (size_t idx = 0; idx < num_claims; ++idx) {
       auto const count       = plan.tile_offsets[idx];
-      plan.tile_offsets[idx] = next[plan.claims[idx].shape];
-      next[plan.claims[idx].shape] += count;
+      plan.tile_offsets[idx] = next[call_shape(idx)];
+      next[call_shape(idx)] += count;
     }
   }
   plan.tile_offsets.host_to_device_async(stream);
@@ -887,7 +954,7 @@ void decode_flat_pages(flat_decode_plan& plan,
     error_code);
   CUDF_CUDA_TRY(cudaGetLastError());
 
-  for (uint32_t shape = 0; shape < num_flat_shapes; ++shape) {
+  for (uint32_t shape = 0; shape < num_call_shapes; ++shape) {
     if (shape_tiles[shape] == 0) { continue; }
     launch_decode_flat_tiles(shape,
                              plan.page_refs.data(),
@@ -896,6 +963,7 @@ void decode_flat_pages(flat_decode_plan& plan,
                              plan.checkpoints.data(),
                              plan.outputs.device_ptr(),
                              plan.null_counts.data(),
+                             selection,
                              stream);
   }
 

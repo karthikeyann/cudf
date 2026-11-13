@@ -22,11 +22,13 @@ std::tuple<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>> hybrid_sc
   std::optional<std::vector<std::string>> const& payload_column_names,
   bool case_sensitive_names,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  bool use_tile_decode)
 {
   auto options = cudf::io::parquet_reader_options::builder()
                    .filter(filter_expression)
                    .case_sensitive_names(case_sensitive_names)
+                   .use_tile_decode(use_tile_decode)
                    .build();
   if (payload_column_names.has_value()) { options.set_column_names(payload_column_names.value()); }
 
@@ -98,11 +100,13 @@ chunked_hybrid_scan_multifile(cudf::io::source_info const& source_info,
                               std::optional<std::vector<std::string>> const& payload_column_names,
                               bool case_sensitive_names,
                               cuda::stream_ref stream,
-                              rmm::device_async_resource_ref mr)
+                              rmm::device_async_resource_ref mr,
+                              bool use_tile_decode)
 {
   auto options = cudf::io::parquet_reader_options::builder()
                    .filter(filter_expression)
                    .case_sensitive_names(case_sensitive_names)
+                   .use_tile_decode(use_tile_decode)
                    .build();
   if (payload_column_names.has_value()) { options.set_column_names(payload_column_names.value()); }
 
@@ -165,11 +169,13 @@ chunked_sparse_hybrid_scan_multifile(
   std::optional<std::vector<std::string>> const& payload_column_names,
   bool case_sensitive_names,
   cuda::stream_ref stream,
-  rmm::device_async_resource_ref mr)
+  rmm::device_async_resource_ref mr,
+  bool use_tile_decode)
 {
   auto options = cudf::io::parquet_reader_options::builder()
                    .filter(filter_expression)
                    .case_sensitive_names(case_sensitive_names)
+                   .use_tile_decode(use_tile_decode)
                    .build();
   if (payload_column_names.has_value()) { options.set_column_names(payload_column_names.value()); }
 

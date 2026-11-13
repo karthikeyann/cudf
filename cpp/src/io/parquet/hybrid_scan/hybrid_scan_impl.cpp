@@ -7,12 +7,14 @@
 
 #include "cudf/io/text/byte_range_info.hpp"
 #include "hybrid_scan_helpers.hpp"
+#include "io/parquet/decode_flat.hpp"
 #include "io/parquet/reader_impl_chunking_utils.cuh"
 #include "io/parquet/synthetic_column_helpers.hpp"
 #include "page_index_filter_utils.hpp"
 #include "runtime/context.hpp"
 
 #include <cudf/copying.hpp>
+#include <cudf/detail/null_mask.hpp>
 #include <cudf/detail/stream_compaction.hpp>
 #include <cudf/detail/structs/utilities.hpp>
 #include <cudf/detail/transform.hpp>
@@ -978,6 +980,7 @@ void hybrid_scan_reader_impl::reset_internal_state()
   _reader_column_schema.reset();
 
   _row_mask_offset = 0;
+  _selected_rows.reset();
 
   _expr_conv = parquet_filter_normalizer{};
   _mr        = cudf::get_current_device_resource_ref();
@@ -1065,6 +1068,14 @@ table_with_metadata hybrid_scan_reader_impl::read_chunk_internal(read_mode mode,
                                                                  read_columns_mode columns_mode,
                                                                  RowMaskView row_mask)
 {
+  // A row selection belongs to the chunk read that prepared it. Drop it on every way out of
+  // this function, including an exception, and whatever an earlier read left behind.
+  _selected_rows.reset();
+  struct selection_scope {
+    std::optional<selected_rows_info>& selection;
+    ~selection_scope() { selection.reset(); }
+  } const selection_scope{_selected_rows};
+
   // Use the main reader's function for reading all columns
   if (columns_mode == read_columns_mode::ALL_COLUMNS) {
     auto result = reader_impl::read_chunk_internal(mode);
@@ -1128,6 +1139,13 @@ table_with_metadata hybrid_scan_reader_impl::read_chunk_internal(read_mode mode,
 
   // preprocess strings
   preprocess_chunk_strings(mode, read_info);
+
+  // The row mask of payload columns is known before they are decoded
+  if constexpr (std::is_same_v<RowMaskView, cudf::column_view>) {
+    if (columns_mode == read_columns_mode::PAYLOAD_COLUMNS and not row_mask.is_empty()) {
+      prepare_row_selection(row_mask, read_info);
+    }
+  }
 
   // Allocate memory buffers for the output columns.
   allocate_columns(mode, read_info.skip_rows, read_info.num_rows, mr);
@@ -1230,6 +1248,12 @@ table_with_metadata hybrid_scan_reader_impl::finalize_output(
     }
   }
 
+  if constexpr (std::is_same_v<RowMaskView, cudf::column_view>) {
+    if (_selected_rows) {
+      return finalize_selected_output(out_metadata, out_columns, row_mask, read_info.num_rows);
+    }
+  }
+
   // Create a table from the output columns.
   auto read_table = std::make_unique<table>(std::move(out_columns));
 
@@ -1294,6 +1318,131 @@ table_with_metadata hybrid_scan_reader_impl::finalize_output(
       read_table->view(), effective_row_mask, cudf::detail::mask_type::RETENTION, _stream, _mr);
     return {std::move(output_table), std::move(out_metadata)};
   }
+}
+
+void hybrid_scan_reader_impl::prepare_row_selection(
+  cudf::column_view const& row_mask, cudf::io::parquet::detail::row_range const& read_info)
+{
+  _selected_rows.reset();
+  // A decimal width cast replaces columns after decode, from the resources of the full-size ones
+  if (not _tile_decode_enabled or read_info.num_rows == 0 or
+      _options.decimal_width != type_id::EMPTY) {
+    return;
+  }
+
+  auto const& pass     = *_pass_itm_data;
+  auto const& subpass  = *pass.subpass;
+  auto const page_mask = subpass_page_mask_span();
+
+  // A column can store the surviving rows only if the tile decode kernels decode every page of
+  // it that is decoded at all.
+  auto columns        = std::vector<uint8_t>(_input_columns.size(), 0);
+  auto has_page       = std::vector<bool>(_input_columns.size(), false);
+  auto has_other_page = std::vector<bool>(_input_columns.size(), false);
+  // Rows of the chunk that belong to pruned pages, as pairs of first row and one past the last
+  auto pruned_rows       = std::vector<size_type>{};
+  auto const chunk_begin = read_info.skip_rows;
+  auto const chunk_end   = read_info.skip_rows + read_info.num_rows;
+  for (std::size_t idx = 0; idx < subpass.pages.size(); ++idx) {
+    auto const& page = subpass.pages[idx];
+    if ((page.flags & parquet::detail::PAGEINFO_FLAGS_DICTIONARY) != 0) { continue; }
+    if (not page_mask.is_empty() and not page_mask[idx]) {
+      auto const page_begin = pass.chunks[page.chunk_idx].start_row + page.chunk_row;
+      auto const begin      = std::max(page_begin, chunk_begin);
+      auto const end        = std::min(page_begin + page.num_rows, chunk_end);
+      if (begin < end) {
+        pruned_rows.push_back(static_cast<size_type>(begin - chunk_begin));
+        pruned_rows.push_back(static_cast<size_type>(end - chunk_begin));
+      }
+      continue;
+    }
+    auto const column = pass.chunks[page.chunk_idx].src_col_index;
+    if (page.kernel_mask == parquet::detail::decode_kernel_mask::FLAT_TILES) {
+      has_page[column] = true;
+    } else {
+      has_other_page[column] = true;
+    }
+  }
+  for (std::size_t column = 0; column < columns.size(); ++column) {
+    columns[column] = has_page[column] and not has_other_page[column] and
+                      _input_columns[column].nesting_depth() == 1;
+  }
+  if (std::ranges::none_of(columns, [](auto selected) { return selected != 0; })) { return; }
+
+  auto const num_rows = static_cast<size_type>(read_info.num_rows);
+  CUDF_EXPECTS(_row_mask_offset + num_rows <= row_mask.size(),
+               "Encountered invalid sized row mask to apply");
+  auto const chunk_mask =
+    (num_rows == row_mask.size())
+      ? row_mask
+      : cudf::split(row_mask, {_row_mask_offset, _row_mask_offset + num_rows}, _stream)[1];
+  auto [mask, num_dropped] = cudf::detail::bools_to_mask(chunk_mask, _stream, _mr.as_temporary());
+  // Without a surviving row there is nothing to store at a new position
+  if (num_dropped == num_rows) { return; }
+  // A pruned page is not decoded; the rows of it that the mask keeps are returned as nulls at
+  // their place in a full-size column. That only happens when this mask keeps rows that the
+  // mask the pages were pruned with did not.
+  if (not pruned_rows.empty()) {
+    auto const kept_pruned_rows = cudf::detail::segmented_count_set_bits(
+      static_cast<bitmask_type const*>(mask->data()), pruned_rows, _stream, _mr.as_temporary());
+    if (std::ranges::any_of(kept_pruned_rows, [](auto count) { return count != 0; })) { return; }
+  }
+  // TODO: A mask that keeps every row needs no ranks: decode as usual into output memory.
+  auto rank = parquet::detail::compute_selection_rank(
+    {mask->data(), mask->size()}, num_rows, _stream, _mr.get_temporary_mr());
+  _selected_rows.emplace(selected_rows_info{
+    std::move(columns), std::move(mask), std::move(rank), num_rows - num_dropped});
+}
+
+table_with_metadata hybrid_scan_reader_impl::finalize_selected_output(
+  table_metadata& out_metadata,
+  std::vector<std::unique_ptr<column>>& out_columns,
+  cudf::column_view const& row_mask,
+  std::size_t num_rows)
+{
+  // The selection outlives the kernels that read it: the decode has been joined
+  auto const selection = std::exchange(_selected_rows, std::nullopt);
+
+  auto const mask_offset = _row_mask_offset;
+  _row_mask_offset += static_cast<size_type>(num_rows);
+  _output_chunk_produced = true;
+
+  // Clear the number of rows per source as it is not valid after filtering
+  out_metadata.num_rows_per_source.clear();
+
+  // Top-level output columns that hold the surviving rows already
+  auto is_selected = std::vector<bool>(out_columns.size(), false);
+  for (std::size_t column = 0; column < _input_columns.size(); ++column) {
+    if (selection->compacted_columns[column] != 0) {
+      is_selected[_input_columns[column].nesting[0]] = true;
+    }
+  }
+
+  // Copy the surviving rows of the other columns
+  auto full_columns = std::vector<cudf::column_view>{};
+  for (std::size_t i = 0; i < out_columns.size(); ++i) {
+    if (not is_selected[i]) { full_columns.emplace_back(out_columns[i]->view()); }
+  }
+  if (not full_columns.empty()) {
+    CUDF_EXPECTS(mask_offset + num_rows <= static_cast<std::size_t>(row_mask.size()),
+                 "Encountered invalid sized row mask to apply");
+    auto const effective_row_mask =
+      std::cmp_equal(num_rows, row_mask.size())
+        ? row_mask
+        : cudf::split(
+            row_mask, {mask_offset, mask_offset + static_cast<size_type>(num_rows)}, _stream)[1];
+    auto filtered = cudf::detail::apply_mask(cudf::table_view{full_columns},
+                                             effective_row_mask,
+                                             cudf::detail::mask_type::RETENTION,
+                                             _stream,
+                                             _mr)
+                      ->release();
+    auto next = filtered.begin();
+    for (std::size_t i = 0; i < out_columns.size(); ++i) {
+      if (not is_selected[i]) { out_columns[i] = std::move(*next++); }
+    }
+  }
+  return {std::make_unique<table>(std::move(out_columns)), std::move(out_metadata)};
 }
 
 void hybrid_scan_reader_impl::set_pass_page_mask(std::span<bool const> data_page_mask)

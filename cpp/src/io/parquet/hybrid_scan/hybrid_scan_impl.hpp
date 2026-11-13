@@ -548,6 +548,35 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
   void reset_internal_state();
 
   /**
+   * @brief Prepares the row selection of the current output chunk, with which the columns
+   * that the tile decode kernels decode in full store only the rows that a row mask keeps
+   *
+   * Prepares nothing unless tile decode is enabled, some column qualifies, the mask keeps a row
+   * of the chunk, and it keeps no row of a page that was pruned.
+   *
+   * @param row_mask Boolean column indicating which rows of the row groups survive
+   * @param read_info Row range of the current output chunk
+   */
+  void prepare_row_selection(cudf::column_view const& row_mask,
+                             cudf::io::parquet::detail::row_range const& read_info);
+
+  /**
+   * @brief Finalizes a table chunk in which some columns already hold the surviving rows only
+   *
+   * Copies the surviving rows of the other columns and returns all columns in their order.
+   *
+   * @param out_metadata The output table metadata
+   * @param out_columns The columns of the chunk
+   * @param row_mask Boolean column indicating which rows of the row groups survive
+   * @param num_rows Number of rows of the chunk before the row mask is applied
+   * @return The output table along with columns' metadata
+   */
+  table_with_metadata finalize_selected_output(table_metadata& out_metadata,
+                                               std::vector<std::unique_ptr<column>>& out_columns,
+                                               cudf::column_view const& row_mask,
+                                               std::size_t num_rows);
+
+  /**
    * @brief Finalize the output table by adding empty columns for the non-selected columns in
    * schema.
    *
