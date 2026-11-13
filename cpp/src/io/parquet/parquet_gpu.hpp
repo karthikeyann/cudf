@@ -261,6 +261,7 @@ enum class decode_kernel_mask {
     (1 << 24),  // Run decode kernel for nested BYTE_STREAM_SPLIT string data
   STRING_STREAM_SPLIT_LIST = (1 << 25),  // Run decode kernel for list BYTE_STREAM_SPLIT string data
   DICT_INT32               = (1 << 26),  // Run decode kernel for dict string → INT32 indices
+  FLAT_TILES               = (1 << 27),  // Run the tile decode kernels for flat fixed width pages
 };
 
 constexpr uint32_t STRINGS_MASK_NON_DELTA = BitOr(decode_kernel_mask::STRING,
