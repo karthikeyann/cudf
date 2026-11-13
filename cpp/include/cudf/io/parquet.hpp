@@ -119,6 +119,8 @@ class parquet_reader_options {
   bool _prepend_source_index_column = false;
   // Whether to prepend a file-local row index column to the output
   bool _prepend_row_index_column = false;
+  // Whether to decode flat fixed-width pages with the tile decode kernels
+  bool _use_tile_decode = false;
 
   std::optional<std::vector<reader_column_schema>> _reader_column_schema;
 
@@ -341,6 +343,13 @@ class parquet_reader_options {
   {
     return _prepend_row_index_column;
   }
+
+  /**
+   * @brief Returns whether flat fixed-width pages are decoded with the tile decode kernels.
+   *
+   * @return `true` if the tile decode kernels are used
+   */
+  [[nodiscard]] bool is_enabled_use_tile_decode() const { return _use_tile_decode; }
 
   /**
    * @brief Returns whether the reader returns flat string columns as DICTIONARY32 encoded columns
@@ -663,6 +672,17 @@ class parquet_reader_options {
   void enable_prepend_row_index_column(bool val) { _prepend_row_index_column = val; }
 
   /**
+   * @brief Sets whether to decode flat fixed-width pages with the tile decode kernels.
+   *
+   * The kernels decode PLAIN and dictionary encoded pages of non-nested INT32, INT64, FLOAT and
+   * DOUBLE columns. All other pages are decoded as usual. The output does not depend on this
+   * option.
+   *
+   * @param val Boolean indicating whether to use the tile decode kernels.
+   */
+  void enable_use_tile_decode(bool val) { _use_tile_decode = val; }
+
+  /**
    * @brief Sets to enable/disable trying to output DICTIONARY32 columns for flat string columns.
    *
    * @param val Boolean indicating whether to output DICTIONARY32 columns for flat string columns
@@ -970,6 +990,18 @@ class parquet_reader_options_builder {
   parquet_reader_options_builder& prepend_row_index_column(bool val)
   {
     options.enable_prepend_row_index_column(val);
+    return *this;
+  }
+
+  /**
+   * @brief Sets whether to decode flat fixed-width pages with the tile decode kernels.
+   *
+   * @param val Boolean indicating whether to use the tile decode kernels
+   * @return this for chaining
+   */
+  parquet_reader_options_builder& use_tile_decode(bool val)
+  {
+    options.enable_use_tile_decode(val);
     return *this;
   }
 
