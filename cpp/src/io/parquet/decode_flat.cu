@@ -34,6 +34,7 @@
 #include <functional>
 #include <limits>
 #include <numeric>
+#include <utility>
 #include <vector>
 
 namespace cudf::io::parquet::detail {
@@ -672,28 +673,21 @@ void launch_decode_flat_tiles(uint32_t shape,
 {
   constexpr uint32_t tiles_per_block = decode_flat_block_size / cudf::detail::warp_size;
   auto const num_blocks = cudf::detail::div_rounding_up_safe(num_tiles, tiles_per_block);
-  auto const launch     = [&]<bool is_dict, int in_bytes, bool nullable>() {
-    if ((shape & flat_shape_selected) != 0) {
-      decode_flat_tiles_kernel<is_dict, in_bytes, nullable, true, flat_steps_per_turn>
-        <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
-          pages, tiles, num_tiles, checkpoints, outputs, null_counts, selection);
-    } else {
-      decode_flat_tiles_kernel<is_dict, in_bytes, nullable, false, flat_steps_per_turn>
-        <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
-          pages, tiles, num_tiles, checkpoints, outputs, null_counts, selection);
-    }
+  // The template arguments of a kernel are the bits of its shape.
+  auto const launch = [&]<uint32_t kernel_shape>() {
+    if (shape != kernel_shape) { return; }
+    decode_flat_tiles_kernel<(kernel_shape & flat_shape_dict) != 0,
+                             (kernel_shape & flat_shape_wide) != 0 ? 8 : 4,
+                             (kernel_shape & flat_shape_nullable) != 0,
+                             (kernel_shape & flat_shape_selected) != 0,
+                             flat_steps_per_turn>
+      <<<num_blocks, decode_flat_block_size, 0, stream.get()>>>(
+        pages, tiles, num_tiles, checkpoints, outputs, null_counts, selection);
   };
-  switch (shape % num_flat_shapes) {
-    case 0: launch.template operator()<false, 4, false>(); break;
-    case 1: launch.template operator()<true, 4, false>(); break;
-    case 2: launch.template operator()<false, 8, false>(); break;
-    case 3: launch.template operator()<true, 8, false>(); break;
-    case 4: launch.template operator()<false, 4, true>(); break;
-    case 5: launch.template operator()<true, 4, true>(); break;
-    case 6: launch.template operator()<false, 8, true>(); break;
-    case 7: launch.template operator()<true, 8, true>(); break;
-    default: CUDF_FAIL("Invalid flat decode shape");
-  }
+  CUDF_EXPECTS(shape < 2 * num_flat_shapes, "Invalid flat decode shape");
+  [&]<std::size_t... kernel_shapes>(std::index_sequence<kernel_shapes...>) {
+    (launch.template operator()<kernel_shapes>(), ...);
+  }(std::make_index_sequence<2 * num_flat_shapes>{});
   CUDF_CUDA_TRY(cudaGetLastError());
 }
 
