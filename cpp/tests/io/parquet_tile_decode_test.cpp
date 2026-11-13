@@ -20,9 +20,12 @@
 #include <cudf/utilities/span.hpp>
 #include <cudf/wrappers/timestamps.hpp>
 
+#include <src/io/parquet/decode_flat.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cstddef>
+#include <cstdlib>
 #include <memory>
 #include <random>
 #include <string>
@@ -155,7 +158,17 @@ void expect_identical(cudf::table_view const& generic, cudf::table_view const& t
   }
 }
 
+// Returns the number of pages the tile decode kernels claimed while `read` ran.
+template <typename Read>
+std::size_t count_claimed_pages(Read read)
+{
+  auto const before = cudf::io::parquet::detail::num_tile_decode_claimed_pages();
+  read();
+  return cudf::io::parquet::detail::num_tile_decode_claimed_pages() - before;
+}
+
 // Reads `buffer` with the generic and with the tile decode kernels and compares the results.
+// `buffer` must hold at least one column the tile decode kernels handle.
 std::unique_ptr<cudf::table> read_both(std::vector<char> const& buffer,
                                        cudf::size_type skip_rows,
                                        cudf::size_type num_rows)
@@ -167,8 +180,11 @@ std::unique_ptr<cudf::table> read_both(std::vector<char> const& buffer,
     if (num_rows >= 0) { builder.num_rows(num_rows); }
     return cudf::io::read_parquet(builder.build()).tbl;
   };
-  auto generic     = read(false);
-  auto const tiles = read(true);
+  auto generic = read(false);
+  std::unique_ptr<cudf::table> tiles;
+  auto const num_claimed = count_claimed_pages([&] { tiles = read(true); });
+  // An equal result alone would also pass if no page reached the tile decode kernels.
+  if (generic->num_rows() > 0) { EXPECT_GT(num_claimed, 0); }
   expect_identical(generic->view(), tiles->view());
   return generic;
 }
@@ -485,4 +501,117 @@ TEST_F(ParquetTileDecodeTest, MixedWithOtherColumns)
   auto const result = read_both(buffer, 0, -1);
   CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected, result->view());
   read_both(buffer, 4'001, 20'000);
+}
+
+TEST_F(ParquetTileDecodeTest, ClaimsEligiblePagesOnly)
+{
+  constexpr cudf::size_type num_rows = 10'000;
+  write_config config;
+  config.dictionary = cudf::io::dictionary_policy::NEVER;
+  config.page_rows  = 1'000;
+  auto const read   = [](std::vector<char> const& buffer, bool use_tile_decode) {
+    return count_claimed_pages([&] {
+      cudf::io::read_parquet(cudf::io::parquet_reader_options::builder(source_of(buffer))
+                               .use_tile_decode(use_tile_decode)
+                               .build());
+    });
+  };
+  // The environment variable claims pages for readers that do not ask for it.
+  auto const forced = std::getenv("LIBCUDF_PARQUET_TILE_DECODE") != nullptr;
+
+  {
+    // Four columns of ten PLAIN pages each.
+    auto const eligible =
+      make_table(num_rows, value_pattern::RANDOM, null_pattern::SPARSE);
+    auto const buffer = write_buffer(eligible->view(), config);
+    EXPECT_EQ(read(buffer, true), 40);
+    if (not forced) { EXPECT_EQ(read(buffer, false), 0); }
+  }
+  {
+    // Narrowed integers, booleans and strings stay with the generic decoders.
+    auto narrow = make_column<int8_t>(num_rows, value_pattern::RANDOM, null_pattern::SPARSE, 1);
+    auto bools  = make_column<bool>(num_rows, value_pattern::RANDOM, null_pattern::HALF, 2);
+    std::vector<std::string> strings(num_rows);
+    for (cudf::size_type i = 0; i < num_rows; ++i) {
+      strings[i] = "s" + std::to_string(i % 91);
+    }
+    cudf::test::strings_column_wrapper string_column(strings.begin(), strings.end());
+    auto const buffer =
+      write_buffer(cudf::table_view{{*narrow, *bools, string_column}}, config);
+    EXPECT_EQ(read(buffer, true), 0);
+  }
+}
+
+TEST_F(ParquetTileDecodeTest, ColumnWithClaimedAndGenericPages)
+{
+  // Two sources hold the same columns: PLAIN pages, which the tile decode kernels claim, and
+  // DELTA_BINARY_PACKED and BYTE_STREAM_SPLIT pages, which they do not. The sources meet
+  // inside a word of the validity mask, which both sets of kernels then write.
+  constexpr cudf::size_type plain_rows = 3'001;
+  constexpr cudf::size_type other_rows = 2'003;
+  auto const write = [](cudf::table_view const& table, bool plain) {
+    cudf::io::table_input_metadata metadata(table);
+    metadata.column_metadata[0].set_name("ints").set_encoding(
+      plain ? cudf::io::column_encoding::PLAIN : cudf::io::column_encoding::DELTA_BINARY_PACKED);
+    metadata.column_metadata[1].set_name("doubles").set_encoding(
+      plain ? cudf::io::column_encoding::PLAIN : cudf::io::column_encoding::BYTE_STREAM_SPLIT);
+    std::vector<char> buffer;
+    auto const options =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info(&buffer), table)
+        .metadata(std::move(metadata))
+        .dictionary_policy(cudf::io::dictionary_policy::NEVER)
+        .max_page_size_rows(500)
+        .max_page_fragment_size(500)
+        .write_v2_headers(not plain)
+        .stats_level(cudf::io::statistics_freq::STATISTICS_NONE)
+        .build();
+    cudf::io::write_parquet(options);
+    return buffer;
+  };
+  auto const make = [](cudf::size_type num_rows, uint32_t seed) {
+    std::vector<std::unique_ptr<cudf::column>> columns;
+    columns.push_back(
+      make_column<int64_t>(num_rows, value_pattern::RANDOM, null_pattern::SPARSE, seed));
+    columns.push_back(
+      make_column<double>(num_rows, value_pattern::RANDOM, null_pattern::HALF, seed + 1));
+    return std::make_unique<cudf::table>(std::move(columns));
+  };
+  auto const plain_table  = make(plain_rows, 1);
+  auto const other_table  = make(other_rows, 3);
+  auto const plain_buffer = write(plain_table->view(), true);
+  auto const other_buffer = write(other_table->view(), false);
+
+  auto const span_of = [](std::vector<char> const& buffer) {
+    return cudf::host_span<std::byte const>{reinterpret_cast<std::byte const*>(buffer.data()),
+                                            buffer.size()};
+  };
+  auto const read = [&](std::vector<cudf::host_span<std::byte const>> sources,
+                        bool use_tile_decode) {
+    return cudf::io::read_parquet(
+             cudf::io::parquet_reader_options::builder(
+               cudf::io::source_info{cudf::host_span<cudf::host_span<std::byte const>>{sources}})
+               .use_tile_decode(use_tile_decode)
+               .build())
+      .tbl;
+  };
+
+  // The pages of the second source are not claimed; those of the first are.
+  EXPECT_EQ(count_claimed_pages([&] { read({span_of(other_buffer)}, true); }), 0);
+  auto const num_plain_pages = count_claimed_pages([&] { read({span_of(plain_buffer)}, true); });
+  EXPECT_GT(num_plain_pages, 0);
+
+  for (auto const plain_first : {true, false}) {
+    SCOPED_TRACE("plain_first=" + std::to_string(plain_first));
+    std::vector<cudf::host_span<std::byte const>> const sources{
+      span_of(plain_first ? plain_buffer : other_buffer),
+      span_of(plain_first ? other_buffer : plain_buffer)};
+    auto const expected = cudf::concatenate(std::vector<cudf::table_view>{
+      plain_first ? plain_table->view() : other_table->view(),
+      plain_first ? other_table->view() : plain_table->view()});
+    auto const generic = read(sources, false);
+    std::unique_ptr<cudf::table> tiles;
+    EXPECT_EQ(count_claimed_pages([&] { tiles = read(sources, true); }), num_plain_pages);
+    expect_identical(generic->view(), tiles->view());
+    CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected->view(), tiles->view());
+  }
 }

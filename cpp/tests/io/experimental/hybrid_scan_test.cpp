@@ -33,6 +33,8 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
+#include <src/io/parquet/decode_flat.hpp>
+
 #include <rmm/aligned.hpp>
 #include <rmm/mr/aligned_resource_adaptor.hpp>
 
@@ -905,11 +907,11 @@ TEST_F(HybridScanTest, TileDecodeMatchesGenericWithPrunedPages)
     reinterpret_cast<std::byte const*>(parquet_buffer.data()), parquet_buffer.size()));
   auto datasource_ref = std::ref(*datasource);
 
-  auto const read = [&]() {
-    auto [filter_table, payload_table] =
-      hybrid_scan(datasource_ref, filter_expression, {}, true, false, stream, mr, aligned_mr);
-    auto [filter_table_chunked, payload_table_chunked] =
-      chunked_hybrid_scan(datasource_ref, filter_expression, {}, true, stream, mr, aligned_mr);
+  auto const read = [&](bool use_tile_decode) {
+    auto [filter_table, payload_table] = hybrid_scan(
+      datasource_ref, filter_expression, {}, true, false, stream, mr, aligned_mr, use_tile_decode);
+    auto [filter_table_chunked, payload_table_chunked] = chunked_hybrid_scan(
+      datasource_ref, filter_expression, {}, true, stream, mr, aligned_mr, use_tile_decode);
     std::vector<std::unique_ptr<cudf::table>> tables;
     tables.push_back(std::move(filter_table));
     tables.push_back(std::move(payload_table));
@@ -918,10 +920,11 @@ TEST_F(HybridScanTest, TileDecodeMatchesGenericWithPrunedPages)
     return tables;
   };
 
-  auto const generic = read();
-  setenv("LIBCUDF_PARQUET_TILE_DECODE", "1", 1);
-  auto const tiles = read();
-  unsetenv("LIBCUDF_PARQUET_TILE_DECODE");
+  auto const generic = read(false);
+  // An equal result alone would also pass if no page reached the tile decode kernels.
+  auto const num_claimed_before = cudf::io::parquet::detail::num_tile_decode_claimed_pages();
+  auto const tiles              = read(true);
+  EXPECT_GT(cudf::io::parquet::detail::num_tile_decode_claimed_pages(), num_claimed_before);
 
   for (std::size_t i = 0; i < generic.size(); ++i) {
     CUDF_TEST_EXPECT_TABLES_EQUAL(generic[i]->view(), tiles[i]->view());

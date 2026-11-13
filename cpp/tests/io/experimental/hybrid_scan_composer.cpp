@@ -148,13 +148,15 @@ std::tuple<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>> hybrid_sc
   bool use_jit_filter,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  rmm::mr::aligned_resource_adaptor& aligned_mr)
+  rmm::mr::aligned_resource_adaptor& aligned_mr,
+  bool use_tile_decode)
 {
   // Create reader options with empty source info
   cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder()
                                                .filter(filter_expression)
                                                .case_sensitive_names(case_sensitive_names)
-                                               .use_jit_filter(use_jit_filter);
+                                               .use_jit_filter(use_jit_filter)
+                                               .use_tile_decode(use_tile_decode);
 
   // Set payload column names if provided
   if (payload_column_names.has_value()) { options.set_column_names(payload_column_names.value()); }
@@ -233,12 +235,14 @@ std::tuple<std::unique_ptr<cudf::table>, std::unique_ptr<cudf::table>> chunked_h
   bool case_sensitive_names,
   cuda::stream_ref stream,
   rmm::device_async_resource_ref mr,
-  rmm::mr::aligned_resource_adaptor& aligned_mr)
+  rmm::mr::aligned_resource_adaptor& aligned_mr,
+  bool use_tile_decode)
 {
   // Create reader options with empty source info
   cudf::io::parquet_reader_options options = cudf::io::parquet_reader_options::builder()
                                                .filter(filter_expression)
-                                               .case_sensitive_names(case_sensitive_names);
+                                               .case_sensitive_names(case_sensitive_names)
+                                               .use_tile_decode(use_tile_decode);
 
   // Set payload column names if provided
   if (payload_column_names.has_value()) { options.set_column_names(payload_column_names.value()); }
