@@ -361,6 +361,7 @@ ConfigureTest(
   io/parquet_reader_dict_test.cpp
   io/parquet_reader_test.cpp
   io/parquet_test.cpp
+  io/parquet_tile_decode_test.cpp
   io/parquet_v2_test.cpp
   io/parquet_writer_test.cpp
   GPUS 1

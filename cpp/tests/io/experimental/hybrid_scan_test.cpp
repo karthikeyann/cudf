@@ -38,12 +38,16 @@
 
 #include <cuda/iterator>
 
+#include <src/io/parquet/decode_flat.hpp>
+
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <format>
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -842,6 +846,94 @@ TEST_F(HybridScanTest, MaterializeUsesMemoryResources)
                                        payload_table->view());
   }
   harness.expect_no_live_allocations(stream);
+}
+
+TEST_F(HybridScanTest, TileDecodeMatchesGenericWithPrunedPages)
+{
+  // An ascending filter column lets the page index prune pages at both ends of each row group.
+  // The filter column and the fixed-width payload columns are read once by the generic decoders
+  // and once by the tile decode kernels.
+  auto constexpr num_rows  = cudf::size_type{40'000};
+  auto constexpr page_rows = cudf::size_type{1'000};
+
+  std::vector<uint32_t> keys(num_rows);
+  std::vector<int64_t> ints(num_rows);
+  std::vector<bool> ints_valid(num_rows);
+  std::vector<double> doubles(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    keys[i]       = i;
+    ints[i]       = (i * 7) % 300;
+    ints_valid[i] = i % 11 != 0;
+    doubles[i]    = (i % 97) * 0.5;
+  }
+  cudf::test::fixed_width_column_wrapper<uint32_t> col0(keys.begin(), keys.end());
+  cudf::test::fixed_width_column_wrapper<int64_t> col1(
+    ints.begin(), ints.end(), ints_valid.begin());
+  cudf::test::fixed_width_column_wrapper<double> col2(doubles.begin(), doubles.end());
+  auto const input = cudf::table_view{{col0, col1, col2}};
+
+  std::vector<char> parquet_buffer;
+  {
+    auto metadata = cudf::io::table_input_metadata(input);
+    metadata.column_metadata[0].set_name("col0");
+    metadata.column_metadata[1].set_name("col1");
+    metadata.column_metadata[2].set_name("col2");
+    auto const write_options =
+      cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&parquet_buffer}, input)
+        .metadata(std::move(metadata))
+        .row_group_size_rows(num_rows / 2)
+        .max_page_size_rows(page_rows)
+        .dictionary_policy(cudf::io::dictionary_policy::ALWAYS)
+        .stats_level(cudf::io::statistics_freq::STATISTICS_COLUMN)
+        .build();
+    cudf::io::write_parquet(write_options);
+  }
+
+  // Filtering AST - 3'456 <= table[0] < 34'567
+  auto lower_value = cudf::numeric_scalar<uint32_t>(3'456);
+  auto upper_value = cudf::numeric_scalar<uint32_t>(34'567);
+  auto lower       = cudf::ast::literal(lower_value);
+  auto upper       = cudf::ast::literal(upper_value);
+  auto col_ref_0   = cudf::ast::column_name_reference("col0");
+  auto above       = cudf::ast::operation(cudf::ast::ast_operator::GREATER_EQUAL, col_ref_0, lower);
+  auto below       = cudf::ast::operation(cudf::ast::ast_operator::LESS, col_ref_0, upper);
+  auto filter_expression = cudf::ast::operation(cudf::ast::ast_operator::LOGICAL_AND, above, below);
+
+  auto const stream = cudf::get_default_stream();
+  auto const mr     = cudf::get_current_device_resource_ref();
+  auto aligned_mr   = rmm::mr::aligned_resource_adaptor(mr, bloom_filter_alignment);
+
+  auto datasource     = cudf::io::datasource::create(cudf::host_span<std::byte const>(
+    reinterpret_cast<std::byte const*>(parquet_buffer.data()), parquet_buffer.size()));
+  auto datasource_ref = std::ref(*datasource);
+
+  auto const read = [&](bool use_tile_decode) {
+    auto [filter_table, payload_table] = hybrid_scan(
+      datasource_ref, filter_expression, {}, true, false, stream, mr, aligned_mr, use_tile_decode);
+    auto [filter_table_chunked, payload_table_chunked] = chunked_hybrid_scan(
+      datasource_ref, filter_expression, {}, true, stream, mr, aligned_mr, use_tile_decode);
+    std::vector<std::unique_ptr<cudf::table>> tables;
+    tables.push_back(std::move(filter_table));
+    tables.push_back(std::move(payload_table));
+    tables.push_back(std::move(filter_table_chunked));
+    tables.push_back(std::move(payload_table_chunked));
+    return tables;
+  };
+
+  auto const generic = read(false);
+  // An equal result alone would also pass if no page reached the tile decode kernels.
+  auto const num_claimed_before = cudf::io::parquet::detail::num_tile_decode_claimed_pages();
+  auto const tiles              = read(true);
+  EXPECT_GT(cudf::io::parquet::detail::num_tile_decode_claimed_pages(), num_claimed_before);
+
+  for (std::size_t i = 0; i < generic.size(); ++i) {
+    CUDF_TEST_EXPECT_TABLES_EQUAL(generic[i]->view(), tiles[i]->view());
+    for (cudf::size_type c = 0; c < generic[i]->num_columns(); ++c) {
+      EXPECT_EQ(generic[i]->get_column(c).null_count(), tiles[i]->get_column(c).null_count());
+    }
+  }
+  EXPECT_EQ(generic[0]->num_rows(), 34'567 - 3'456);
+  EXPECT_EQ(generic[1]->num_rows(), 34'567 - 3'456);
 }
 
 TEST_F(HybridScanTest, MaterializeStructs)
