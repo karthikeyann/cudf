@@ -1161,11 +1161,17 @@ struct payload_read {
 };
 
 // Reads the payload columns of all row groups with the chunked calls: pages are pruned with
-// `setup_mask`, and `chunk_mask` says which rows each chunk returns.
-payload_read read_payload_with_masks(std::vector<char> const& buffer,
-                                     std::vector<bool> const& setup_mask,
-                                     std::vector<bool> const& chunk_mask,
-                                     bool use_tile_decode)
+// `setup_mask`, and `chunk_mask` says which rows each chunk returns. Without the page index the
+// reader finds the pages to prune from the page headers.
+payload_read read_payload_with_masks(
+  std::vector<char> const& buffer,
+  std::vector<bool> const& setup_mask,
+  std::vector<bool> const& chunk_mask,
+  bool use_tile_decode,
+  bool use_page_index = true,
+  cudf::io::parquet::experimental::use_data_page_mask mask_data_pages =
+    cudf::io::parquet::experimental::use_data_page_mask::YES,
+  cudf::type_id decimal_width = cudf::type_id::EMPTY)
 {
   namespace hybrid  = cudf::io::parquet::experimental;
   auto const stream = cudf::get_default_stream();
@@ -1181,12 +1187,13 @@ payload_read read_payload_with_masks(std::vector<char> const& buffer,
   auto const options = cudf::io::parquet_reader_options::builder()
                          .filter(filter)
                          .use_tile_decode(use_tile_decode)
+                         .decimal_width(decimal_width)
                          .build();
 
   auto const footer           = cudf::io::parquet::fetch_footer_to_host(*datasource);
   auto const reader           = std::make_unique<hybrid::hybrid_scan_reader>(*footer, options);
   auto const page_index_range = reader->page_index_byte_range();
-  if (not page_index_range.is_empty()) {
+  if (use_page_index and not page_index_range.is_empty()) {
     auto const page_index =
       cudf::io::parquet::fetch_page_index_to_host(*datasource, page_index_range);
     reader->setup_page_index(*page_index);
@@ -1203,7 +1210,7 @@ payload_read read_payload_with_masks(std::vector<char> const& buffer,
 
   auto const num_compacted_before = cudf::io::parquet::detail::num_tile_decode_compacted_columns();
   reader->setup_chunking_for_payload_columns(
-    0, 0, indices, setup_column, hybrid::use_data_page_mask::YES, data, options, stream, mr);
+    0, 0, indices, setup_column, mask_data_pages, data, options, stream, mr);
   std::vector<std::unique_ptr<cudf::table>> tables;
   std::vector<cudf::table_view> views;
   while (reader->has_next_table_chunk()) {
@@ -1276,6 +1283,52 @@ TEST_F(HybridScanTest, TileDecodeRowSelectionShapesAndBoundaries)
     }
     // The eight flat columns, and only they, are stored compacted
     EXPECT_EQ(tiles.num_compacted, selection_file::num_flat);
+  }
+}
+
+TEST_F(HybridScanTest, TileDecodeRowSelectionPageMaskVariants)
+{
+  // The row selection does not depend on how pages were pruned: from the page index, from the
+  // page headers of a file read without it, or not at all. A decimal width cast replaces
+  // columns after decode, so nothing is stored compacted then.
+  namespace hybrid = cudf::io::parquet::experimental;
+  selection_file const file;
+  auto mask = std::vector<bool>(selection_file::num_rows, false);
+  for (auto const row : {0, 31, 32, 999, 1'000, 1'023, 1'024, 3'999, 4'000, 6'431, 9'999}) {
+    mask[row] = true;
+  }
+  auto const expected = file.expected(mask);
+  auto const generic  = read_payload_with_masks(file.buffer, mask, mask, false);
+  CUDF_TEST_EXPECT_TABLES_EQUIVALENT(expected->view(), generic.table->view());
+
+  struct variant {
+    std::string name;
+    bool use_page_index;
+    hybrid::use_data_page_mask mask_data_pages;
+    cudf::type_id decimal_width;
+    std::size_t num_compacted;
+  };
+  for (auto const& [name, use_page_index, mask_data_pages, decimal_width, num_compacted] :
+       {variant{"page headers",
+                false,
+                hybrid::use_data_page_mask::YES,
+                cudf::type_id::EMPTY,
+                selection_file::num_flat},
+        variant{"no page mask",
+                true,
+                hybrid::use_data_page_mask::NO,
+                cudf::type_id::EMPTY,
+                selection_file::num_flat},
+        variant{
+          "decimal width", true, hybrid::use_data_page_mask::YES, cudf::type_id::DECIMAL128, 0}}) {
+    SCOPED_TRACE(name);
+    auto const tiles = read_payload_with_masks(
+      file.buffer, mask, mask, true, use_page_index, mask_data_pages, decimal_width);
+    CUDF_TEST_EXPECT_TABLES_EQUAL(generic.table->view(), tiles.table->view());
+    for (cudf::size_type c = 0; c < generic.table->num_columns(); ++c) {
+      EXPECT_EQ(generic.table->get_column(c).null_count(), tiles.table->get_column(c).null_count());
+    }
+    EXPECT_EQ(tiles.num_compacted, num_compacted);
   }
 }
 
