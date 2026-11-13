@@ -87,7 +87,10 @@ std::unique_ptr<column> cast_decimals_to_width(std::unique_ptr<column>&& col,
 
 }  // namespace
 
-void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_rows)
+void reader_impl::decode_page_data(read_mode mode,
+                                   size_t skip_rows,
+                                   size_t num_rows,
+                                   selected_rows_info const* selection)
 {
   CUDF_FUNC_RANGE();
 
@@ -495,10 +498,10 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
       subpass.pages,
       pass.chunks,
       column_data,
-      _selected_rows ? cudf::host_span<uint8_t const>{_selected_rows->compacted_columns}
-                     : cudf::host_span<uint8_t const>{},
-      _selected_rows ? row_selection{_selected_rows->mask->data(), _selected_rows->rank.data()}
-                     : row_selection{},
+      selection != nullptr ? cudf::host_span<uint8_t const>{selection->compacted_columns}
+                           : cudf::host_span<uint8_t const>{},
+      selection != nullptr ? row_selection{selection->mask->data(), selection->rank.data()}
+                           : row_selection{},
       skip_rows,
       num_rows,
       error_code.data(),
@@ -531,7 +534,8 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
   page_nesting_decode.device_to_host_async(_stream);
 
   // Invalidate output buffer nullmasks at row indices spanned by pruned pages
-  update_output_nullmasks_for_pruned_pages(subpass_page_mask_span(), skip_rows, num_rows);
+  update_output_nullmasks_for_pruned_pages(
+    subpass_page_mask_span(), skip_rows, num_rows, selection);
 
   // Fill output offsets for pruned pages before retrieving large string initial offsets.
   fill_pruned_offsets(skip_rows, num_rows, initial_str_offsets);
@@ -1300,7 +1304,8 @@ bool reader_impl::has_next()
 
 void reader_impl::update_output_nullmasks_for_pruned_pages(cudf::host_span<bool const> page_mask,
                                                            size_t skip_rows,
-                                                           size_t num_rows)
+                                                           size_t num_rows,
+                                                           selected_rows_info const* selection)
 {
   auto const& subpass    = _pass_itm_data->subpass;
   auto const& pages      = subpass->pages;
@@ -1362,7 +1367,7 @@ void reader_impl::update_output_nullmasks_for_pruned_pages(cudf::host_span<bool 
                    "Invalid row bounds");
 
       // A column that stores selected rows only has no rows of a pruned page
-      if (_selected_rows and _selected_rows->compacted_columns[chunk_idx % num_columns] != 0) {
+      if (selection != nullptr and selection->compacted_columns[chunk_idx % num_columns] != 0) {
         return;
       }
 

@@ -556,9 +556,10 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
    *
    * @param row_mask Boolean column indicating which rows of the row groups survive
    * @param read_info Row range of the current output chunk
+   * @return The row selection, or nothing if every column is to hold all rows of the chunk
    */
-  void prepare_row_selection(cudf::column_view const& row_mask,
-                             cudf::io::parquet::detail::row_range const& read_info);
+  [[nodiscard]] std::optional<selected_rows_info> prepare_row_selection(
+    cudf::column_view const& row_mask, cudf::io::parquet::detail::row_range const& read_info);
 
   /**
    * @brief Finalizes a table chunk in which some columns already hold the surviving rows only
@@ -569,12 +570,14 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
    * @param out_columns The columns of the chunk
    * @param row_mask Boolean column indicating which rows of the row groups survive
    * @param num_rows Number of rows of the chunk before the row mask is applied
+   * @param selection Row selection the chunk was decoded with
    * @return The output table along with columns' metadata
    */
   table_with_metadata finalize_selected_output(table_metadata& out_metadata,
                                                std::vector<std::unique_ptr<column>>& out_columns,
                                                cudf::column_view const& row_mask,
-                                               std::size_t num_rows);
+                                               std::size_t num_rows,
+                                               selected_rows_info const& selection);
 
   /**
    * @brief Finalize the output table by adding empty columns for the non-selected columns in
@@ -588,6 +591,7 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
    * @param[in,out] row_mask Boolean column indicating which rows need to be read after page-pruning
    *                         for filter columns, or after materialize step for payload columns
    * @param[in] mr Memory resources for the columns before the row mask is applied
+   * @param[in] selection Row selection the columns were decoded with, or nullptr
    * @return The output table along with columns' metadata
    */
   template <typename RowMaskView>
@@ -595,7 +599,8 @@ class hybrid_scan_reader_impl : public parquet::detail::reader_impl {
                                       table_metadata& out_metadata,
                                       std::vector<std::unique_ptr<column>>& out_columns,
                                       RowMaskView row_mask,
-                                      cudf::memory_resources mr);
+                                      cudf::memory_resources mr,
+                                      selected_rows_info const* selection);
 
   /**
    * @brief Read a chunk of data and return an output table.

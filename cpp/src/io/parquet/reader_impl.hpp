@@ -351,17 +351,37 @@ class reader_impl {
                                       cudf::memory_resources mr);
 
   /**
+   * @brief Rows of an output chunk that a row mask keeps, and the columns that store only those
+   * rows.
+   *
+   * Prepared by a reader that knows the row mask of an output chunk before it decodes the chunk.
+   */
+  struct selected_rows_info {
+    // Per input column, whether its output holds the selected rows only, next to each other
+    std::vector<uint8_t> compacted_columns;
+    // One bit per row of the output chunk, set for the selected rows
+    std::unique_ptr<cuda::device_buffer<bitmask_type>> mask;
+    // Per word of `mask`, the number of selected rows before it, and the total at the end
+    cuda::device_buffer<uint32_t> rank;
+    // Number of selected rows
+    size_type num_selected;
+  };
+
+  /**
    * @brief Allocate data buffers for the output columns.
    *
    * @param mode Value indicating if the data sources are read all at once or chunk by chunk
    * @param skip_rows Crop all rows below skip_rows
    * @param num_rows Number of rows to read
    * @param mr Memory resources for the decoded columns
+   * @param selection Row selection of the output chunk, or nullptr if every column holds all
+   * of its rows. A compacted column is sized for the selected rows and allocated as an output
    */
   void allocate_columns(read_mode mode,
                         size_t skip_rows,
                         size_t num_rows,
-                        cudf::memory_resources mr);
+                        cudf::memory_resources mr,
+                        selected_rows_info const* selection = nullptr);
 
   /**
    * @brief Checks if a decoded column buffer is copied again, by the decimal cast or by the
@@ -395,8 +415,12 @@ class reader_impl {
    * @param mode Value indicating if the data sources are read all at once or chunk by chunk
    * @param skip_rows Number of rows to skip from the start
    * @param num_rows Number of rows to decode
+   * @param selection Row selection the columns were allocated with, or nullptr
    */
-  void decode_page_data(read_mode mode, size_t skip_rows, size_t num_rows);
+  void decode_page_data(read_mode mode,
+                        size_t skip_rows,
+                        size_t num_rows,
+                        selected_rows_info const* selection = nullptr);
 
   /**
    * @brief Invalidate output buffer nullmask for rows spanned by the pruned pages
@@ -404,10 +428,13 @@ class reader_impl {
    * @param page_mask Boolean vector indicating if a page needs to be decoded or is pruned
    * @param skip_rows Offset of the first row in the table chunk
    * @param num_rows Number of rows in the table chunk
+   * @param selection Row selection of the table chunk, or nullptr. A compacted column holds no
+   * row of a pruned page
    */
   void update_output_nullmasks_for_pruned_pages(cudf::host_span<bool const> page_mask,
                                                 size_t skip_rows,
-                                                size_t num_rows);
+                                                size_t num_rows,
+                                                selected_rows_info const* selection);
 
   /**
    * @brief Fill in string and list offsets for rows covered by pruned data pages.
@@ -652,25 +679,6 @@ class reader_impl {
 
   // Whether flat fixed-width pages are decoded by the tile decode kernels.
   bool _tile_decode_enabled{false};
-
-  /**
-   * @brief Rows of the current output chunk that a row mask keeps, and the columns that store
-   * only those rows.
-   */
-  struct selected_rows_info {
-    // Per input column, whether its output holds the selected rows only, next to each other
-    std::vector<uint8_t> compacted_columns;
-    // One bit per row of the output chunk, set for the selected rows
-    std::unique_ptr<cuda::device_buffer<bitmask_type>> mask;
-    // Per word of `mask`, the number of selected rows before it, and the total at the end
-    cuda::device_buffer<uint32_t> rank;
-    // Number of selected rows
-    size_type num_selected;
-  };
-
-  // Set by a reader that knows the row mask of an output chunk before it decodes the chunk;
-  // empty otherwise.
-  std::optional<selected_rows_info> _selected_rows;
 };
 
 }  // namespace cudf::io::parquet::detail

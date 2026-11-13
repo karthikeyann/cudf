@@ -1092,7 +1092,8 @@ void reader_impl::preprocess_subpass_pages(read_mode mode, size_t chunk_read_lim
 void reader_impl::allocate_columns(read_mode mode,
                                    size_t skip_rows,
                                    size_t num_rows,
-                                   cudf::memory_resources mr)
+                                   cudf::memory_resources mr,
+                                   selected_rows_info const* selection)
 {
   CUDF_FUNC_RANGE();
 
@@ -1137,7 +1138,7 @@ void reader_impl::allocate_columns(read_mode mode,
     size_t const max_depth = input_col.nesting_depth();
     // A column that stores only the rows a row mask keeps is sized for them and is an output
     auto const stores_selected_rows =
-      _selected_rows and _selected_rows->compacted_columns[col_idx] != 0;
+      selection != nullptr and selection->compacted_columns[col_idx] != 0;
 
     auto* cols                 = &_output_buffers;
     bool has_nullable_ancestor = false;
@@ -1160,7 +1161,7 @@ void reader_impl::allocate_columns(read_mode mode,
         // we're going to start null mask as all valid and then turn bits off if necessary
         auto const out_buf_size =
           stores_selected_rows
-            ? static_cast<size_t>(_selected_rows->num_selected)
+            ? static_cast<size_t>(selection->num_selected)
             : (out_buf.type.id() == type_id::LIST && l_idx < max_depth ? num_rows + 1 : num_rows);
         CUDF_EXPECTS(out_buf_size <= std::numeric_limits<cudf::size_type>::max(),
                      "Number of rows exceeds cudf's column size limit",

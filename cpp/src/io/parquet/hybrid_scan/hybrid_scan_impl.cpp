@@ -980,7 +980,6 @@ void hybrid_scan_reader_impl::reset_internal_state()
   _reader_column_schema.reset();
 
   _row_mask_offset = 0;
-  _selected_rows.reset();
 
   _expr_conv = parquet_filter_normalizer{};
   _mr        = cudf::get_current_device_resource_ref();
@@ -1068,14 +1067,6 @@ table_with_metadata hybrid_scan_reader_impl::read_chunk_internal(read_mode mode,
                                                                  read_columns_mode columns_mode,
                                                                  RowMaskView row_mask)
 {
-  // A row selection belongs to the chunk read that prepared it. Drop it on every way out of
-  // this function, including an exception, and whatever an earlier read left behind.
-  _selected_rows.reset();
-  struct selection_scope {
-    std::optional<selected_rows_info>& selection;
-    ~selection_scope() { selection.reset(); }
-  } const selection_scope{_selected_rows};
-
   // Use the main reader's function for reading all columns
   if (columns_mode == read_columns_mode::ALL_COLUMNS) {
     auto result = reader_impl::read_chunk_internal(mode);
@@ -1114,7 +1105,7 @@ table_with_metadata hybrid_scan_reader_impl::read_chunk_internal(read_mode mode,
       std::vector<std::size_t>(_file_itm_data.num_rows_per_source.size(), 0);
 
     // Finalize output
-    return finalize_output(columns_mode, out_metadata, out_columns, row_mask, mr);
+    return finalize_output(columns_mode, out_metadata, out_columns, row_mask, mr, nullptr);
   }
 
   auto& pass            = *_pass_itm_data;
@@ -1140,18 +1131,21 @@ table_with_metadata hybrid_scan_reader_impl::read_chunk_internal(read_mode mode,
   // preprocess strings
   preprocess_chunk_strings(mode, read_info);
 
-  // The row mask of payload columns is known before they are decoded
+  // The row mask of payload columns is known before they are decoded. The selection lives for
+  // this chunk read only.
+  auto selection = std::optional<selected_rows_info>{};
   if constexpr (std::is_same_v<RowMaskView, cudf::column_view>) {
     if (columns_mode == read_columns_mode::PAYLOAD_COLUMNS and not row_mask.is_empty()) {
-      prepare_row_selection(row_mask, read_info);
+      selection = prepare_row_selection(row_mask, read_info);
     }
   }
+  auto const* const selected_rows = selection.has_value() ? &selection.value() : nullptr;
 
   // Allocate memory buffers for the output columns.
-  allocate_columns(mode, read_info.skip_rows, read_info.num_rows, mr);
+  allocate_columns(mode, read_info.skip_rows, read_info.num_rows, mr, selected_rows);
 
   // Parse data into the output buffers.
-  decode_page_data(mode, read_info.skip_rows, read_info.num_rows);
+  decode_page_data(mode, read_info.skip_rows, read_info.num_rows, selected_rows);
 
   // Create the final output cudf columns.
   for (std::size_t i = 0; i < _output_buffers.size(); ++i) {
@@ -1178,7 +1172,7 @@ table_with_metadata hybrid_scan_reader_impl::read_chunk_internal(read_mode mode,
   }
 
   // Add empty columns if needed. Filter output columns based on filter.
-  return finalize_output(columns_mode, out_metadata, out_columns, row_mask, mr);
+  return finalize_output(columns_mode, out_metadata, out_columns, row_mask, mr, selected_rows);
 }
 
 template <typename RowMaskView>
@@ -1187,7 +1181,8 @@ table_with_metadata hybrid_scan_reader_impl::finalize_output(
   table_metadata& out_metadata,
   std::vector<std::unique_ptr<column>>& out_columns,
   RowMaskView row_mask,
-  cudf::memory_resources mr)
+  cudf::memory_resources mr,
+  selected_rows_info const* selection)
 {
   // Create empty columns as needed (this can happen if we've ended up with no actual data to
   // read)
@@ -1249,8 +1244,9 @@ table_with_metadata hybrid_scan_reader_impl::finalize_output(
   }
 
   if constexpr (std::is_same_v<RowMaskView, cudf::column_view>) {
-    if (_selected_rows) {
-      return finalize_selected_output(out_metadata, out_columns, row_mask, read_info.num_rows);
+    if (selection != nullptr) {
+      return finalize_selected_output(
+        out_metadata, out_columns, row_mask, read_info.num_rows, *selection);
     }
   }
 
@@ -1320,14 +1316,14 @@ table_with_metadata hybrid_scan_reader_impl::finalize_output(
   }
 }
 
-void hybrid_scan_reader_impl::prepare_row_selection(
+std::optional<hybrid_scan_reader_impl::selected_rows_info>
+hybrid_scan_reader_impl::prepare_row_selection(
   cudf::column_view const& row_mask, cudf::io::parquet::detail::row_range const& read_info)
 {
-  _selected_rows.reset();
   // A decimal width cast replaces columns after decode, from the resources of the full-size ones
   if (not _tile_decode_enabled or read_info.num_rows == 0 or
       _options.decimal_width != type_id::EMPTY) {
-    return;
+    return std::nullopt;
   }
 
   auto const& pass     = *_pass_itm_data;
@@ -1367,7 +1363,9 @@ void hybrid_scan_reader_impl::prepare_row_selection(
     columns[column] = has_page[column] and not has_other_page[column] and
                       _input_columns[column].nesting_depth() == 1;
   }
-  if (std::ranges::none_of(columns, [](auto selected) { return selected != 0; })) { return; }
+  if (std::ranges::none_of(columns, [](auto selected) { return selected != 0; })) {
+    return std::nullopt;
+  }
 
   auto const num_rows = static_cast<size_type>(read_info.num_rows);
   CUDF_EXPECTS(_row_mask_offset + num_rows <= row_mask.size(),
@@ -1378,31 +1376,31 @@ void hybrid_scan_reader_impl::prepare_row_selection(
       : cudf::split(row_mask, {_row_mask_offset, _row_mask_offset + num_rows}, _stream)[1];
   auto [mask, num_dropped] = cudf::detail::bools_to_mask(chunk_mask, _stream, _mr.as_temporary());
   // Without a surviving row there is nothing to store at a new position
-  if (num_dropped == num_rows) { return; }
+  if (num_dropped == num_rows) { return std::nullopt; }
   // A pruned page is not decoded; the rows of it that the mask keeps are returned as nulls at
   // their place in a full-size column. That only happens when this mask keeps rows that the
   // mask the pages were pruned with did not.
   if (not pruned_rows.empty()) {
     auto const kept_pruned_rows = cudf::detail::segmented_count_set_bits(
       static_cast<bitmask_type const*>(mask->data()), pruned_rows, _stream, _mr.as_temporary());
-    if (std::ranges::any_of(kept_pruned_rows, [](auto count) { return count != 0; })) { return; }
+    if (std::ranges::any_of(kept_pruned_rows, [](auto count) { return count != 0; })) {
+      return std::nullopt;
+    }
   }
   // TODO: A mask that keeps every row needs no ranks: decode as usual into output memory.
   auto rank = parquet::detail::compute_selection_rank(
     {mask->data(), mask->size()}, num_rows, _stream, _mr.get_temporary_mr());
-  _selected_rows.emplace(selected_rows_info{
-    std::move(columns), std::move(mask), std::move(rank), num_rows - num_dropped});
+  return selected_rows_info{
+    std::move(columns), std::move(mask), std::move(rank), num_rows - num_dropped};
 }
 
 table_with_metadata hybrid_scan_reader_impl::finalize_selected_output(
   table_metadata& out_metadata,
   std::vector<std::unique_ptr<column>>& out_columns,
   cudf::column_view const& row_mask,
-  std::size_t num_rows)
+  std::size_t num_rows,
+  selected_rows_info const& selection)
 {
-  // The selection outlives the kernels that read it: the decode has been joined
-  auto const selection = std::exchange(_selected_rows, std::nullopt);
-
   auto const mask_offset = _row_mask_offset;
   _row_mask_offset += static_cast<size_type>(num_rows);
   _output_chunk_produced = true;
@@ -1413,7 +1411,7 @@ table_with_metadata hybrid_scan_reader_impl::finalize_selected_output(
   // Top-level output columns that hold the surviving rows already
   auto is_selected = std::vector<bool>(out_columns.size(), false);
   for (std::size_t column = 0; column < _input_columns.size(); ++column) {
-    if (selection->compacted_columns[column] != 0) {
+    if (selection.compacted_columns[column] != 0) {
       is_selected[_input_columns[column].nesting[0]] = true;
     }
   }
