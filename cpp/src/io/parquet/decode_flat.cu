@@ -143,6 +143,11 @@ __device__ value_section locate_value_section(PageInfo const& page,
       if (cur + 4 < end) {
         length       = cur[0] | (cur[1] << 8) | (cur[2] << 16) | (cur[3] << 24);
         levels_begin = cur + 4;
+        if (length < 0) {
+          // A negative length would move the walk in front of the page.
+          result.error |= static_cast<uint32_t>(decode_error::LEVEL_STREAM_OVERRUN);
+          length = 0;
+        }
         cur += length + 4;
       } else {
         result.error |= static_cast<uint32_t>(decode_error::LEVEL_STREAM_OVERRUN);
@@ -479,6 +484,8 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   uint32_t const num_tiles     = cudf::detail::div_rounding_up_safe(num_values, tile_rows);
   checkpoint* const first      = checkpoints + claim.first_checkpoint;
   value_section const section  = locate_value_section(page, chunk, is_dict);
+  // A malformed page is not decoded, so its checkpoints are never read: do not walk it.
+  if (section.error != 0) { return; }
   // With two rows of blocks the level stream and the index stream of a page are walked by
   // different blocks, so that the two walks overlap.
   bool const walks_levels = gridDim.y == 1 or blockIdx.y == 0;

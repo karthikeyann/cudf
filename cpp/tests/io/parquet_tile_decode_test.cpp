@@ -26,6 +26,8 @@
 #include <array>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <string>
@@ -437,6 +439,56 @@ TEST_F(ParquetTileDecodeTest, DictionaryIndexOutOfRange)
     }
   }
   EXPECT_EQ(num_changed, 1);
+}
+
+TEST_F(ParquetTileDecodeTest, MalformedLevelLength)
+{
+  // A V1 page stores the byte length of its definition levels in front of them. A length that
+  // points past the page, or in front of it, must fail the read.
+  constexpr cudf::size_type num_rows = 4'000;
+  std::vector<int32_t> values(num_rows);
+  std::vector<bool> valid(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    values[i] = 0x1100'0000 + i;
+    valid[i]  = i % 3 != 0;
+  }
+  cudf::test::fixed_width_column_wrapper<int32_t> column(
+    values.begin(), values.end(), valid.begin());
+  write_config config;
+  config.dictionary = cudf::io::dictionary_policy::NEVER;
+  auto const buffer = write_buffer(cudf::table_view{{column}}, config);
+
+  // The PLAIN values follow the levels: rows 1, 2 and 4 are the first three non-null rows.
+  std::array<int32_t, 3> const first_values{values[1], values[2], values[4]};
+  auto const* const pattern = reinterpret_cast<char const*>(first_values.data());
+  auto const found =
+    std::search(buffer.begin(), buffer.end(), pattern, pattern + sizeof(first_values));
+  ASSERT_NE(found, buffer.end());
+  auto const values_offset = static_cast<std::size_t>(std::distance(buffer.begin(), found));
+  // The length field is the one that reaches exactly to the values.
+  std::size_t length_offset = 0;
+  for (int32_t length = 1; length < 2'048 and length_offset == 0; ++length) {
+    int32_t stored;
+    std::memcpy(&stored, buffer.data() + values_offset - length - 4, sizeof(stored));
+    if (stored == length) { length_offset = values_offset - length - 4; }
+  }
+  ASSERT_NE(length_offset, 0);
+
+  auto const read = [](std::vector<char> const& file, bool use_tile_decode) {
+    return cudf::io::read_parquet(cudf::io::parquet_reader_options::builder(source_of(file))
+                                    .use_tile_decode(use_tile_decode)
+                                    .build());
+  };
+  auto const with_length = [&](int32_t length) {
+    auto file = buffer;
+    std::memcpy(file.data() + length_offset, &length, sizeof(length));
+    return file;
+  };
+  EXPECT_NO_THROW(read(buffer, true));
+  EXPECT_THROW(read(with_length(0x7fff'ff00), true), cudf::logic_error);
+  EXPECT_THROW(read(with_length(0x7fff'ff00), false), cudf::logic_error);
+  EXPECT_THROW(read(with_length(-1), true), cudf::logic_error);
+  EXPECT_THROW(read(with_length(-100'000), true), cudf::logic_error);
 }
 
 TEST_F(ParquetTileDecodeTest, TimestampsAndDates)
