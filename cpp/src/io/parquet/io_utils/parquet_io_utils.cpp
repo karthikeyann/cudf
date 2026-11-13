@@ -349,34 +349,47 @@ fetch_byte_ranges_to_device_async_impl(
         CUDF_CUDA_TRY(cudaMemsetAsync(buffer_data + buffer_size, 0, padding_size, stream.get()));
       }
 
+      // Lay the byte ranges out in the buffer in the order of their offsets in the source, not in
+      // the order of the request, so that ranges that are contiguous in the source are contiguous
+      // in the buffer too and can be read with a single IO request wherever they are in the
+      // request. Column chunks are requested in the order of the selected columns, which need not
+      // be their order in the file.
+      std::vector<std::size_t> source_order(byte_ranges.size());
+      std::iota(source_order.begin(), source_order.end(), std::size_t{0});
+      std::ranges::stable_sort(
+        source_order, {}, [&](auto range_idx) { return byte_ranges[range_idx].offset(); });
+
       // Build device spans for each byte range in this source
       auto& column_chunk_data = column_chunk_data_per_source[source_idx];
-      column_chunk_data.reserve(byte_ranges.size());
+      column_chunk_data.resize(byte_ranges.size());
       std::ignore = std::accumulate(
-        byte_ranges.begin(), byte_ranges.end(), std::size_t{0}, [&](auto acc, auto const& range) {
-          auto const data = buffer_data == nullptr ? nullptr : buffer_data + acc;
-          column_chunk_data.emplace_back(data, static_cast<size_t>(range.size()));
+        source_order.begin(), source_order.end(), std::size_t{0}, [&](auto acc, auto range_idx) {
+          auto const& range = byte_ranges[range_idx];
+          auto const data   = buffer_data == nullptr ? nullptr : buffer_data + acc;
+          column_chunk_data[range_idx] =
+            cudf::device_span<uint8_t const>{data, static_cast<size_t>(range.size())};
           return acc + range.size();
         });
 
-      // Coalesce contiguous byte ranges within this source into single IO request
-      for (size_t chunk = 0; chunk < byte_ranges.size();) {
-        auto const io_offset = static_cast<size_t>(byte_ranges[chunk].offset());
-        auto io_size         = static_cast<size_t>(byte_ranges[chunk].size());
-        size_t next_chunk    = chunk + 1;
-        while (next_chunk < byte_ranges.size()) {
-          size_t const next_offset = byte_ranges[next_chunk].offset();
-          if (next_offset != io_offset + io_size) { break; }
-          io_size += byte_ranges[next_chunk].size();
-          next_chunk++;
+      // Coalesce contiguous byte ranges within this source into single IO request. Empty byte
+      // ranges are not read and do not end a run of contiguous ranges.
+      auto const is_empty = [&](auto range_idx) { return byte_ranges[range_idx].size() == 0; };
+      auto run_begin      = std::ranges::find_if_not(source_order, is_empty);
+      while (run_begin != source_order.end()) {
+        auto const& first    = byte_ranges[*run_begin];
+        auto const io_offset = static_cast<size_t>(first.offset());
+        auto io_size         = static_cast<size_t>(first.size());
+        auto run_end = std::ranges::find_if_not(std::next(run_begin), source_order.end(), is_empty);
+        while (run_end != source_order.end() and
+               static_cast<size_t>(byte_ranges[*run_end].offset()) == io_offset + io_size) {
+          io_size += byte_ranges[*run_end].size();
+          run_end = std::ranges::find_if_not(std::next(run_end), source_order.end(), is_empty);
         }
-        if (io_size != 0) {
-          io_source_indices.push_back(source_idx);
-          io_offsets.push_back(io_offset);
-          io_sizes.push_back(io_size);
-          destinations.push_back(const_cast<uint8_t*>(column_chunk_data[chunk].data()));
-        }
-        chunk = next_chunk;
+        io_source_indices.push_back(source_idx);
+        io_offsets.push_back(io_offset);
+        io_sizes.push_back(io_size);
+        destinations.push_back(const_cast<uint8_t*>(column_chunk_data[*run_begin].data()));
+        run_begin = run_end;
       }
     });
 

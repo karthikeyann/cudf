@@ -125,6 +125,10 @@ enum class io_submission_policy : int8_t {
 /**
  * @brief Fetches a list of byte ranges from a datasource into device buffers
  *
+ * Byte ranges that are contiguous in the datasource are read together, whatever their order in
+ * `byte_ranges`. The i-th returned device span holds the data of the i-th byte range; where the
+ * spans are placed in the returned device buffers is unspecified.
+ *
  * @ingroup io_utils
  *
  * @param datasource Input datasource
@@ -148,6 +152,10 @@ fetch_byte_ranges_to_device_async(
 
 /**
  * @brief Fetches lists of byte ranges from multiple datasources into device buffers
+ *
+ * Byte ranges that are contiguous in a datasource are read together, whatever their order in the
+ * list of that datasource. The i-th returned device span of a datasource holds the data of its
+ * i-th byte range; where the spans are placed in the returned device buffers is unspecified.
  *
  * @ingroup io_utils
  *
