@@ -6,6 +6,7 @@
 #include "reader_impl.hpp"
 
 #include "column_path_helpers.hpp"
+#include "decode_flat.hpp"
 #include "error.hpp"
 #include "runtime/context.hpp"
 #include "synthetic_column_helpers.hpp"
@@ -483,6 +484,23 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
     decode_data(decode_kernel_mask::FIXED_WIDTH_DICT_NESTED);
   }
 
+  // launch the tile decoders for flat fixed width pages
+  if (BitAnd(kernel_mask, decode_kernel_mask::FLAT_TILES) != 0) {
+    std::vector<void*> column_data(_input_columns.size(), nullptr);
+    for (size_t c = 0; c < pass.chunks.size(); c++) {
+      column_data[pass.chunks[c].src_col_index] = chunk_nested_data.host_ptr(chunk_offsets[c])[0];
+    }
+    decode_flat_pages(*subpass.flat_decode,
+                      subpass.pages,
+                      pass.chunks,
+                      column_data,
+                      skip_rows,
+                      num_rows,
+                      error_code.data(),
+                      streams[s_idx++],
+                      _mr.as_temporary());
+  }
+
   // launch the catch-all page decoder
   if (BitAnd(kernel_mask, decode_kernel_mask::GENERAL) != 0) {
     detail::decode_page_data(subpass.pages,
@@ -601,6 +619,12 @@ void reader_impl::decode_page_data(read_mode mode, size_t skip_rows, size_t num_
   _stream.sync();
 }
 
+bool is_tile_decode_enabled(parquet_reader_options const& options)
+{
+  static bool const forced = cudf::detail::get_bool_env_or("LIBCUDF_PARQUET_TILE_DECODE", false);
+  return forced or options.is_enabled_use_tile_decode();
+}
+
 reader_impl::reader_impl()
   : _stream{cudaStream_t{cudaStreamDefault}},
     _mr{cudf::get_current_device_resource_ref()},
@@ -648,6 +672,8 @@ reader_impl::reader_impl(std::size_t chunk_read_limit,
     _output_chunk_read_limit{chunk_read_limit},
     _input_pass_read_limit{pass_read_limit}
 {
+  _tile_decode_enabled = is_tile_decode_enabled(options);
+
   // The direct parquet-dict → DICTIONARY32 transcode fast path only supports single-pass,
   // non-chunked reads.
   if (_options.output_dict_columns and (chunk_read_limit != 0 or pass_read_limit != 0)) {
