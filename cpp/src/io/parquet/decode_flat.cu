@@ -253,9 +253,9 @@ __device__ inline uint32_t count_valid_rows(hybrid_stream const& stream,
  * value `k * tile_rows`.
  */
 struct checkpoint_writer {
-  checkpoint* first;  ///< The page's first checkpoint entry
-  uint32_t stride;         ///< Entries per tile
-  uint32_t num_tiles;      ///< Tiles of the page
+  checkpoint* first;   ///< The page's first checkpoint entry
+  uint32_t stride;     ///< Entries per tile
+  uint32_t num_tiles;  ///< Tiles of the page
 
   /**
    * @brief Records the run at `offset` that holds values `[value, value + count)` for every
@@ -349,8 +349,7 @@ __device__ void walk_hybrid_stream(hybrid_stream const& section,
   };
   // Tiles past the end of the stream start where it ends.
   auto const finish = [&](walk_state const& state) {
-    for (uint64_t tile = (state.value + tile_rows - 1) >> tile_rows_log2;
-         tile < writer.num_tiles;
+    for (uint64_t tile = (state.value + tile_rows - 1) >> tile_rows_log2; tile < writer.num_tiles;
          ++tile) {
       writer.first[tile * writer.stride] = {
         section.size,
@@ -466,7 +465,7 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
   uint32_t const stride        = checkpoint_stride(is_dict, nullable);
   auto const num_values        = static_cast<uint32_t>(page.num_input_values);
   uint32_t const num_tiles     = cudf::detail::div_rounding_up_safe(num_values, tile_rows);
-  checkpoint* const first = checkpoints + claim.first_checkpoint;
+  checkpoint* const first      = checkpoints + claim.first_checkpoint;
   value_section const section  = locate_value_section(page, chunk, is_dict);
   // With two rows of blocks the level stream and the index stream of a page are walked by
   // different blocks, so that the two walks overlap.
@@ -502,10 +501,9 @@ CUDF_KERNEL void __launch_bounds__(prepare_block_size)
 
   if (walks_values and is_dict) {
     __syncthreads();
-    walk_hybrid_stream<windowed>(
-      hybrid_stream{section.values, section.size, section.bit_width},
-      checkpoint_writer{first, stride, num_tiles},
-      num_values);
+    walk_hybrid_stream<windowed>(hybrid_stream{section.values, section.size, section.bit_width},
+                                 checkpoint_writer{first, stride, num_tiles},
+                                 num_values);
   }
 }
 
@@ -556,7 +554,7 @@ CUDF_KERNEL void __launch_bounds__(page_block_size)
     // The tiles are listed even if the page turns out to be malformed; they then decode nothing.
     uint32_t const first_tile = ref.first_row / tile_rows;
     uint32_t const last_tile  = (ref.first_row + ref.num_rows - 1) / tile_rows;
-    tile_ref* const out  = tiles + tile_offsets[idx];
+    tile_ref* const out       = tiles + tile_offsets[idx];
     for (uint32_t tile = first_tile; tile <= last_tile; ++tile) {
       out[tile - first_tile] = {static_cast<uint32_t>(idx), tile};
     }
@@ -634,9 +632,8 @@ CUDF_KERNEL void __launch_bounds__(decode_flat_block_size)
                            int32_t* null_counts)
 {
   using level_source = cuda::std::conditional_t<nullable, optional_levels, required_levels>;
-  using value_source = cuda::std::conditional_t<is_dict,
-                                                dictionary_values<in_bytes, 32 * steps>,
-                                                plain_values<in_bytes>>;
+  using value_source = cuda::std::
+    conditional_t<is_dict, dictionary_values<in_bytes, 32 * steps>, plain_values<in_bytes>>;
   decode_tiles<level_source, value_source, steps>(
     pages, tiles, num_tiles, checkpoints, outputs, null_counts, store_value{});
 }
@@ -784,8 +781,8 @@ std::shared_ptr<flat_decode_plan> prepare_flat_decode(
   std::copy(claims.begin(), claims.end(), plan->claims.begin());
   plan->claims.host_to_device_async(stream);
   plan->tile_offsets = cudf::detail::hostdevice_vector<uint32_t>(claims.size(), stream, mr);
-  plan->checkpoints  = cuda::device_buffer<checkpoint>(
-    stream, mr.get_temporary_mr(), num_checkpoints, cuda::no_init);
+  plan->checkpoints =
+    cuda::device_buffer<checkpoint>(stream, mr.get_temporary_mr(), num_checkpoints, cuda::no_init);
   plan->page_refs =
     cuda::device_buffer<page_ref>(stream, mr.get_temporary_mr(), claims.size(), cuda::no_init);
   plan->null_counts =

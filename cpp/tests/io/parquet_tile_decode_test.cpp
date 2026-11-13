@@ -521,9 +521,8 @@ TEST_F(ParquetTileDecodeTest, ClaimsEligiblePagesOnly)
 
   {
     // Four columns of ten PLAIN pages each.
-    auto const eligible =
-      make_table(num_rows, value_pattern::RANDOM, null_pattern::SPARSE);
-    auto const buffer = write_buffer(eligible->view(), config);
+    auto const eligible = make_table(num_rows, value_pattern::RANDOM, null_pattern::SPARSE);
+    auto const buffer   = write_buffer(eligible->view(), config);
     EXPECT_EQ(read(buffer, true), 40);
     if (not forced) { EXPECT_EQ(read(buffer, false), 0); }
   }
@@ -536,8 +535,7 @@ TEST_F(ParquetTileDecodeTest, ClaimsEligiblePagesOnly)
       strings[i] = "s" + std::to_string(i % 91);
     }
     cudf::test::strings_column_wrapper string_column(strings.begin(), strings.end());
-    auto const buffer =
-      write_buffer(cudf::table_view{{*narrow, *bools, string_column}}, config);
+    auto const buffer = write_buffer(cudf::table_view{{*narrow, *bools, string_column}}, config);
     EXPECT_EQ(read(buffer, true), 0);
   }
 }
@@ -549,7 +547,7 @@ TEST_F(ParquetTileDecodeTest, ColumnWithClaimedAndGenericPages)
   // inside a word of the validity mask, which both sets of kernels then write.
   constexpr cudf::size_type plain_rows = 3'001;
   constexpr cudf::size_type other_rows = 2'003;
-  auto const write = [](cudf::table_view const& table, bool plain) {
+  auto const write                     = [](cudf::table_view const& table, bool plain) {
     cudf::io::table_input_metadata metadata(table);
     metadata.column_metadata[0].set_name("ints").set_encoding(
       plain ? cudf::io::column_encoding::PLAIN : cudf::io::column_encoding::DELTA_BINARY_PACKED);
@@ -605,9 +603,9 @@ TEST_F(ParquetTileDecodeTest, ColumnWithClaimedAndGenericPages)
     std::vector<cudf::host_span<std::byte const>> const sources{
       span_of(plain_first ? plain_buffer : other_buffer),
       span_of(plain_first ? other_buffer : plain_buffer)};
-    auto const expected = cudf::concatenate(std::vector<cudf::table_view>{
-      plain_first ? plain_table->view() : other_table->view(),
-      plain_first ? other_table->view() : plain_table->view()});
+    auto const expected = cudf::concatenate(
+      std::vector<cudf::table_view>{plain_first ? plain_table->view() : other_table->view(),
+                                    plain_first ? other_table->view() : plain_table->view()});
     auto const generic = read(sources, false);
     std::unique_ptr<cudf::table> tiles;
     EXPECT_EQ(count_claimed_pages([&] { tiles = read(sources, true); }), num_plain_pages);

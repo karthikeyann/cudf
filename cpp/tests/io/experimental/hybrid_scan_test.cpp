@@ -33,12 +33,12 @@
 #include <cudf/utilities/memory_resource.hpp>
 #include <cudf/utilities/span.hpp>
 
-#include <src/io/parquet/decode_flat.hpp>
-
 #include <rmm/aligned.hpp>
 #include <rmm/mr/aligned_resource_adaptor.hpp>
 
 #include <cuda/iterator>
+
+#include <src/io/parquet/decode_flat.hpp>
 
 #include <algorithm>
 #include <array>
